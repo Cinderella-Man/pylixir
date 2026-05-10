@@ -5,8 +5,9 @@
 - Generated Elixir code wraps everything in a `defmodule TranslatedCode do ... end` block.
 - Python function definitions become `defp` (private functions).
 - The module has a single `def run do ... end` public function that contains all top-level (non-function) statements from the Python source.
-- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct.
+- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. **Note:** In Elixir 1.17+, bitwise operators are available without import. If your minimum Elixir version target is 1.17+, this import can be omitted.
 - The generated code ends with `TranslatedCode.run()` to execute the entry point.
+- The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_len/1`, `py_in/2`, `py_int/1`, `py_bool_to_int/1`, `truthy?/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
 
 ### 13.2 The `convert/2` Function Pattern
 
@@ -65,6 +66,10 @@ end)
 - **One mutated external:** Use `Enum.reduce/3` with a simple accumulator: `Enum.reduce(items, initial, fn x, acc -> ... end)`.
 - **Multiple mutated externals:** Use `Enum.reduce/3` with a tuple accumulator: `Enum.reduce(items, {a, b, c}, fn x, {a, b, c} -> ... {a, b, c} end)`. Destructure the result after the reduce.
 
+**`continue` in for loops:** When `continue` appears inside a `for` loop body translated as `Enum.reduce`, it means "return the accumulator unchanged, skip the rest of the body." The transpiler emits the accumulator tuple as an early return from the anonymous function. See §11.26.
+
+**Nested for loops with shared mutation:** When nested `for` loops modify the same outer variable, the inner loop becomes a nested `Enum.reduce`. The inner reduce receives the outer accumulator as its initial value and returns the updated value. See §11.27.
+
 **Example with break:**
 
 ```python
@@ -100,7 +105,26 @@ items |> Enum.filter(&(&1 > 0)) |> Enum.map(&(&1 * 2))
 
 Both produce the same result, but the `for` comprehension is more idiomatic and can be more efficient for multiple generators.
 
-### 13.6 Error Handling
+### 13.6 Function Name Collection (Two-Pass)
+
+Before converting the module body, the converter performs a lightweight first pass to collect all function names defined at the module level:
+
+```elixir
+def collect_function_names(body) do
+  body
+  |> Enum.filter(fn node -> node["_type"] == "FunctionDef" end)
+  |> Enum.map(fn node -> node["name"] end)
+  |> MapSet.new()
+end
+```
+
+These names are stored in `context.known_functions`. When the converter encounters a `Call` to a `Name` that is not in the builtins table and not in the current scope, it checks `known_functions` before raising an error. If the name is in `known_functions`, the call is emitted as-is — the Elixir compiler will resolve it at compile time.
+
+This avoids false errors when a function is called before its definition in the source file (which is valid in Python, since Python resolves function names at call time, not definition time).
+
+For truly unknown names (not in builtins, not in scope, not in `known_functions`), the converter emits the call as-is and lets the Elixir compiler produce the error. This is simpler and more reliable than trying to reproduce Elixir's name resolution logic.
+
+### 13.7 Error Handling
 
 If a Python AST contains an unsupported node type, the converter should raise `UnsupportedNodeError` with a descriptive message including the node type and source location (if available):
 
@@ -117,61 +141,84 @@ defmodule Pylixir.Errors.UnsupportedNodeError do
     %__MODULE__{message: msg, node_type: node_type, source_line: source_line}
   end
 end
-
-defmodule Pylixir.Errors.UndefinedNameError do
-  defexception [:message, :name]
-
-  @impl true
-  def exception(opts) do
-    name = Keyword.fetch!(opts, :name)
-    %__MODULE__{message: "Undefined name: #{name}", name: name}
-  end
-end
 ```
 
-### 13.7 `while` Loop Implementation Detail
+### 13.8 `while` Loop Implementation Detail
 
-The `while` loop uses recursive helper functions for the loop body, with `try`/`throw`/`catch` for `break`:
+The `while` loop uses recursive helper functions for the loop body, with `try`/`throw`/`catch` for `break`. **Critically, the helper function must return its state so the caller can use the final values.**
 
 ```elixir
 # Python:
-# while x < 10:
-#     x += 1
-#     if x == 5: continue
-#     if x == 8: break
-#     print(x)
+# x = 1
+# while x < 100:
+#     x = x * 2
+# print(x)
 
 # Elixir:
 defp while_0(x) do
-  if x < 10 do
-    x = x + 1
-    if x == 5 do
-      while_0(x)  # continue: skip rest, recurse immediately
-    else
-      if x == 8 do
-        throw(:break)
-      else
-        IO.puts(to_string(x))
-        while_0(x)
-      end
-    end
+  if x < 100 do
+    x = x * 2
+    while_0(x)
+  else
+    {x}  # return final state as tuple
   end
 end
 
-try do
-  while_0(0)
+{x} = try do
+  while_0(1)
 catch
-  :break -> :ok
+  :break -> {:ok}  # break returns a default state — see note below
 end
+IO.puts(to_string(x))
 ```
 
 **Key points:**
 - Each `while` loop becomes a private function that threads mutable state via its arguments.
+- **The helper must return the final state as a tuple** when the loop condition becomes false. The caller destructures this tuple to rebind the variables.
 - `continue` is implemented by recursing immediately with the current state, skipping the remaining body.
-- `break` throws a `:break` tag caught by the enclosing `try`/`catch`.
+- `break` throws a `:break` tag caught by the enclosing `try`/`catch`. **When `break` is used, the caller must handle the fact that the state at break-time is lost.** The `break` throw can carry state: `throw({:break, {x}})`, caught as `{:break, state} -> state`.
 - The helper function body must call itself recursively to loop.
 
-### 13.8 Comparison Chain Conversion
+**While loop with `break` carrying state:**
+
+```elixir
+# Python:
+# count = 0
+# while count < 5:
+#     count += 1
+#     if count == 3:
+#         continue
+#     if count == 5:
+#         break
+#     print(count)
+
+# Elixir:
+defp while_0(count) do
+  if count < 5 do
+    count = count + 1
+    if count == 3 do
+      while_0(count)  # continue: skip rest, recurse immediately
+    else
+      if count == 5 do
+        throw({:break, {count}})  # break: carry state
+      else
+        IO.puts(to_string(count))
+        while_0(count)
+      end
+    end
+  else
+    {count}  # loop ended normally: return state
+  end
+end
+
+{count} = try do
+  while_0(0)
+catch
+  {:break, state} -> state
+end
+```
+
+### 13.9 Comparison Chain Conversion
 
 For `Compare` nodes with multiple operators, generate a left-associative `&&` chain:
 
@@ -196,7 +243,7 @@ end
 
 > **Key detail:** The accumulator threads `comp_ast` as `prev_left` into the next iteration. For `a < b < c`, this correctly produces `(a < b) && (b < c)`. The comparisons list is built in order via `acc ++ [comparison]`, then the left-associative `Enum.reduce/2` (no initial accumulator) folds them into nested `&&` tuples.
 
-### 13.9 The `AugAssign` Subscript Pattern
+### 13.10 The `AugAssign` Subscript Pattern
 
 When `AugAssign.target` is a `Subscript` node (e.g., `d[key] += 1`), the translation is a map update:
 
@@ -207,7 +254,7 @@ When `AugAssign.target` is a `Subscript` node (e.g., `d[key] += 1`), the transla
 
 The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it differently from simple variable augmentation.
 
-### 13.10 Comparison Operator AST Mapping
+### 13.11 Comparison Operator AST Mapping
 
 ```elixir
 @comparison_ops %{
@@ -226,52 +273,69 @@ The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Su
 
 **Note on `Is`/`IsNot`:** Python's `is` checks object identity, but in algorithmic code it is almost exclusively used as `x is None` or `x is not None`. Mapping `is` to `==` (value equality) is correct for this use case. The distinction between `==` and `===` in Elixir (`1 == 1.0` is `true`, `1 === 1.0` is `false`) is not relevant here — Python's `is` is never used to compare integers with floats.
 
-### 13.11 If-Elif-Else Chain Conversion
+### 13.12 If-Elif-Else Chain Conversion
+
+All `if`/`elif`/`else` chains are converted to `cond` blocks. This is simpler to implement (one code path instead of two) and produces cleaner output for multi-branch chains:
 
 ```elixir
 def convert(%{"_type" => "If"} = node, ctx) do
-  %{"test" => test, "body" => body, "orelse" => orelse} = node
-  {test_ast, ctx} = convert(test, ctx)
-  {body_ast, ctx} = convert_many(body, ctx)
+  branches = collect_if_elif_chain(node)
+  convert_to_cond(branches, ctx)
+end
 
+# Collect all branches into a flat list of {test, body} pairs
+defp collect_if_elif_chain(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}) do
   case orelse do
     [] ->
-      # Simple if (no else)
-      {{:if, [], [test_ast, [do: body_ast]]}, ctx}
+      [{test, body}]
 
     [%{"_type" => "If"} = elif_node] ->
-      # elif: convert as nested if
-      {elif_ast, ctx} = convert(elif_node, ctx)
-      {{:if, [], [test_ast, [do: body_ast, else: elif_ast]]}, ctx}
+      [{test, body} | collect_if_elif_chain(elif_node)]
+
+    else_body ->
+      [{test, body}, {:else, else_body}]
+  end
+end
+
+# Convert to cond AST
+defp convert_to_cond(branches, ctx) do
+  # For a simple if with no else, emit an if expression instead of cond:
+  case branches do
+    [{test, body}] ->
+      # Simple if, no else
+      {test_ast, ctx} = convert(test, ctx)
+      {body_ast, ctx} = convert_many(body, ctx)
+      {{:if, [], [test_ast, [do: body_ast]]}, ctx}
 
     _ ->
-      # else clause
-      {else_ast, ctx} = convert_many(orelse, ctx)
-      {{:if, [], [test_ast, [do: body_ast, else: else_ast]]}, ctx}
+      # cond block
+      {cond_clauses, ctx} = Enum.reduce(branches, {[], ctx}, fn
+        {:else, body}, {acc, ctx} ->
+          {body_ast, ctx} = convert_many(body, ctx)
+          clause = {:->, [], [[true], body_ast]}
+          {acc ++ [clause], ctx}
+
+        {test, body}, {acc, ctx} ->
+          {test_ast, ctx} = convert(test, ctx)
+          {body_ast, ctx} = convert_many(body, ctx)
+          clause = {:->, [], [[test_ast], body_ast]}
+          {acc ++ [clause], ctx}
+      end)
+
+      {{:cond, [], [[do: cond_clauses]]}, ctx}
   end
 end
 ```
 
-**Alternative:** For 3+ branches, use `cond` instead of nested `if`/`else`:
+**Why `cond` over nested `if/else`:** A single code path is simpler to implement and debug. `cond` produces flat, readable output for any number of branches. For a simple `if` with no `else`, the converter still emits `if` for readability.
 
-```elixir
-# Python: if a: ... elif b: ... elif c: ... else: ...
-# Elixir (cond is cleaner):
-cond do
-  a -> ...
-  b -> ...
-  c -> ...
-  true -> ...
-end
-```
-
-### 13.12 Statement-to-Expression Wrapping
+### 13.13 Statement-to-Expression Wrapping
 
 In Python, `if`, `for`, and `while` are statements (no return value). In Elixir, they are expressions (always return a value). When a Python `If` statement appears where a statement is expected (not an expression context), the transpiler can emit the Elixir `if` directly — its return value will be harmlessly ignored by the `__block__` wrapper.
 
 When a Python `If` expression appears inside another expression (e.g., `x = cond if test else other`), the `IfExp` node is used instead, which maps to Elixir's `if` as an expression naturally.
 
-### 13.13 `return` Inside Loops
+### 13.14 `return` Inside Loops
 
 When a Python function contains a `return` statement inside a `for` or `while` loop, the translation is complex because Elixir's `Enum.reduce` or `for` comprehension cannot "return" from the enclosing function.
 
@@ -300,7 +364,7 @@ end
 
 **Important:** The `return` value is wrapped in `{:return, value}` to distinguish it from other throws (like `:break`). The `catch` clause unwraps it. The `try`/`catch` wraps the entire function body, not just the loop — a single `try`/`catch` at the function level handles returns from any depth.
 
-### 13.14 Slicing Implementation
+### 13.15 Slicing Implementation
 
 When `Subscript.slice` is a `Slice` node, the converter inspects `lower`, `upper`, and `step` to determine the translation:
 
@@ -331,23 +395,20 @@ def convert_subscript_slice(value_ast, %{"_type" => "Slice"} = slice, ctx) do
 end
 ```
 
-### 13.15 String Concatenation Detection
+### 13.16 String Concatenation Detection (MVP)
 
-When converting `BinOp` with `Add`, the converter must determine whether to emit `+` or `<>`. The detection cascade:
-
-1. **Both operands are string `Constant` nodes** → emit `<>`
-2. **Either operand is a `Call` to `str()`** (mapped to `to_string/1`) → emit `<>`
-3. **Either operand is a variable known (via context) to be a string** → emit `<>`
-4. **Type is unknown** → emit `py_add(a, b)` helper call
-
-The `py_add` helper is included in the generated module when needed:
+For the MVP, the `BinOp` handler uses the runtime-dispatch helper `py_add/2` whenever the `Add` operator is encountered and the operand types are not statically obvious:
 
 ```elixir
 defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+defp py_add(a, b) when is_number(a) and is_number(b), do: a + b
+defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
 defp py_add(a, b), do: a + b
 ```
 
-### 13.16 Power Operator Dispatch
+**Static optimization:** When both operands are string `Constant` nodes, or either operand is a `Call` to `str()` (mapped to `to_string/1`), the converter emits `<>` directly without the helper. This covers the most common cases and produces cleaner output.
+
+### 13.17 Power Operator Dispatch
 
 The `Pow` operator in `BinOp` uses `:math.pow/2` by default, which always returns a float. When the exponent is a known non-negative integer literal, `Integer.pow/2` can be used instead to preserve integer types:
 
@@ -361,13 +422,16 @@ def convert_pow(base_ast, exp_ast, ctx) do
 end
 ```
 
-### 13.17 Formatter Pipeline
+### 13.18 Formatter Pipeline
 
 The final output pipeline must handle the `iodata` return type of `Code.format_string!/1`:
 
 ```elixir
 def to_source(python_ast) do
-  context = %Pylixir.Context{scopes: [MapSet.new()]}
+  context = %Pylixir.Context{
+    scopes: [MapSet.new()],
+    known_functions: collect_function_names(python_ast["body"] || [])
+  }
   {elixir_ast, _context} = convert(python_ast, context)
 
   elixir_ast
@@ -378,3 +442,65 @@ end
 ```
 
 Both `Macro.to_string/1` and the final `IO.iodata_to_binary/1` return binary strings. The intermediate `Code.format_string!/1` is the only step that returns iodata.
+
+### 13.19 Tuple Swap Evaluation Order
+
+Python evaluates the right-hand side of assignments completely before assigning. This matters for tuple swaps:
+
+```python
+a, b = b, a   # evaluates (b, a) first, then assigns
+```
+
+The transpiler must emit a tuple on the right side:
+
+```elixir
+{a, b} = {b, a}   # right side evaluated first — correct swap
+```
+
+**WRONG:** Sequential assignment (`a = b; b = a`) would set both variables to `b`'s original value. Always emit tuple assignment for tuple unpacking targets.
+
+### 13.20 Runtime Helpers Module
+
+The generated module includes helper functions for runtime type dispatch. These avoid the need for compile-time type inference:
+
+```elixir
+# Included in the generated TranslatedCode module:
+
+defp truthy?(nil), do: false
+defp truthy?(false), do: false
+defp truthy?(0), do: false
+defp truthy?(0.0), do: false
+defp truthy?(""), do: false
+defp truthy?([]), do: false
+defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
+defp truthy?(_), do: true
+
+defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+defp py_add(a, b) when is_number(a) and is_number(b), do: a + b
+defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
+defp py_add(a, b), do: a + b
+
+defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
+defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
+defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.flatten(List.duplicate(a, b))
+defp py_mult(a, b) when is_integer(a) and is_list(b), do: List.flatten(List.duplicate(b, a))
+defp py_mult(a, b), do: a * b
+
+defp py_len(x) when is_list(x), do: length(x)
+defp py_len(x) when is_binary(x), do: String.length(x)
+defp py_len(x) when is_map(x), do: map_size(x)
+defp py_len(x) when is_tuple(x), do: tuple_size(x)
+
+defp py_in(x, collection) when is_list(collection), do: x in collection
+defp py_in(x, collection) when is_binary(collection), do: String.contains?(collection, x)
+defp py_in(x, collection) when is_map(collection), do: Map.has_key?(collection, x)
+defp py_in(x, collection), do: Enum.member?(collection, x)
+
+defp py_int(x) when is_float(x), do: trunc(x)
+defp py_int(x) when is_integer(x), do: x
+defp py_int(x) when is_binary(x), do: String.to_integer(x)
+
+defp py_bool_to_int(true), do: 1
+defp py_bool_to_int(false), do: 0
+defp py_bool_to_int(x), do: x
+```

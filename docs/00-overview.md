@@ -1,4 +1,3 @@
-
 ---
 
 ## §1. Executive Summary
@@ -19,24 +18,43 @@ Pylixir.to_source(python_ast)
 # => "1 + 2"
 ```
 
-The library does not read files, does not call Python, does not do batch processing, does not run tests. It accepts a Python AST map, converts it to an Elixir AST (quoted expression tuples), and formats that AST into a source code string.
+The library does not read files, does not do batch processing, does not run tests. It accepts a Python AST map, converts it to an Elixir AST (quoted expression tuples), and formats that AST into a source code string.
 
-### 1.2 What "Working, Not Idiomatic" Means
+### 1.2 API Surface
+
+The library exposes two entry points:
+
+- **`Pylixir.to_source/1`** — the core API. Accepts a Python AST map (already decoded from JSON), returns an Elixir source code string. This is a pure function with no external dependencies.
+
+- **`Pylixir.transpile/1`** — a convenience wrapper for interactive use and testing. Accepts a Python source code string, shells out to `python3` to parse it via `ast.parse()` and serialize to JSON, decodes the JSON, then calls `to_source/1` on the result. **Requires Python 3.8+ on the system PATH.** Production callers should pre-parse their ASTs and use `to_source/1` directly.
+
+```elixir
+# Core API — no Python dependency
+Pylixir.to_source(%{"_type" => "Module", "body" => [...]})
+# => "defmodule TranslatedCode do ... end\n\nTranslatedCode.run()"
+
+# Convenience wrapper — requires Python 3.8+ on PATH
+Pylixir.transpile("def add(a, b): return a + b\nprint(add(3, 4))")
+# => "defmodule TranslatedCode do ... end\n\nTranslatedCode.run()"
+```
+
+### 1.3 What "Working, Not Idiomatic" Means
 
 The output is **working, not idiomatic** Elixir. The goal is correctness — code that compiles and produces the same results as the Python original. It will not be pretty. It will use `Enum.reduce` where a human would write `Enum.map`. It will generate helper functions for `while` loops. It will produce `{result}` tuple accumulators for single-variable loops. It is a mechanical translation, not a stylistic one.
 
 Performance characteristics may differ from the Python original (e.g., list indexing with `Enum.at/2` is O(n) rather than O(1)). This is acceptable — the goal is behavioral correctness, not algorithmic complexity preservation.
 
-### 1.3 Target Use Case
+### 1.4 Target Use Case
 
 This library targets **self-contained algorithmic code**: the kind of Python you'd find in coding challenges, algorithmic puzzles, and small utility functions. Typical translatable code includes sorting algorithms, dynamic programming solutions, graph traversals, mathematical computations, string manipulation functions, and similar standalone logic.
 
-### 1.4 Design Philosophy
+### 1.5 Design Philosophy
 
 1. **Correctness over elegance.** Every translated construct must produce the same result as the Python original, including edge cases (negative modulo, floor division, truthiness).
 2. **Explicit over implicit.** When Python and Elixir semantics diverge, the generated code makes the divergence explicit (e.g., `Integer.floor_div/2` instead of `div/2`).
-3. **Fail loudly on unsupported constructs.** Never produce silent wrong code. Raise `UnsupportedNodeError` for anything not handled.
-4. **No Python dependency at runtime.** The library receives pre-parsed ASTs as Elixir maps. Python is used only offline to produce the JSON.
+3. **Runtime dispatch over static type inference.** When the correct translation depends on operand type (e.g., `+` for numbers vs strings, `not` with Python vs Elixir truthiness), the generated code uses runtime-dispatching helpers (`py_add/2`, `truthy?/1`) rather than attempting compile-time type inference. This trades some performance for correctness and implementation simplicity.
+4. **Fail loudly on unsupported constructs.** Never produce silent wrong code. Raise `UnsupportedNodeError` for anything not handled.
+5. **No Python dependency at runtime.** The core `to_source/1` API receives pre-parsed ASTs as Elixir maps. Python is used only offline to produce the JSON (or via the optional `transpile/1` convenience wrapper).
 
 ---
 ---
@@ -60,6 +78,8 @@ Python source code
     → Pylixir.to_source/1
     → Elixir source code string
 ```
+
+The optional `Pylixir.transpile/1` wraps the entire pipeline into a single call, shelling out to Python for steps 1–3.
 
 ### 3.2 Why?
 

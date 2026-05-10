@@ -56,26 +56,31 @@ bool([1,2])   # True
 nil == false  # false — nil is falsy, but != false
 ```
 
-**Implication:** Code like `if my_list:` (meaning "if not empty") translates correctly to `if my_list do ... end` ONLY if we know `my_list` is a list (because `[]` is falsy in Python but truthy in Elixir).
+**Implication:** Code like `if my_list:` (meaning "if not empty") or `not 0` will produce wrong results if translated naively.
 
-**Solution:** The transpiler generates explicit checks:
-- `if my_list:` → `if my_list != [] do ... end` (when type is known to be list)
-- `if my_dict:` → `if map_size(my_dict) > 0 do ... end` (when type is known to be dict)
-- `if my_string:` → `if my_string != "" do ... end` (when type is known to be string)
-- `if x:` → `if x != nil && x != false do ... end` (when type is unknown — covers the common `None` check)
-
-**The `not`/`!` gap:** This same truthiness mismatch affects the `not` operator. Python's `not 0` → `True`, but Elixir's `!0` → `false`. Python's `not []` → `True`, but Elixir's `![]` → `false`. When the transpiler encounters `not x` and knows `x` could be `0`, `""`, `[]`, or `%{}`, it should generate `!Pylixir.Helpers.truthy?(x)` instead of `!x`. The `truthy?/1` helper implements Python's truthiness model:
+**Solution — runtime `truthy?/1` helper:** Rather than attempting compile-time type inference (which would be complex and fragile), the transpiler always uses a `truthy?/1` helper that implements Python's truthiness model:
 
 ```elixir
-def truthy?(nil), do: false
-def truthy?(false), do: false
-def truthy?(0), do: false
-def truthy?(0.0), do: false
-def truthy?(""), do: false
-def truthy?([]), do: false
-def truthy?(map) when map == %{}, do: false
-def truthy?(_), do: true
+defp truthy?(nil), do: false
+defp truthy?(false), do: false
+defp truthy?(0), do: false
+defp truthy?(0.0), do: false
+defp truthy?(""), do: false
+defp truthy?([]), do: false
+defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
+defp truthy?(_), do: true
 ```
+
+**Translation rules:**
+
+- `if x:` → `if truthy?(x) do ... end`
+- `not x` → `!truthy?(x)`
+- `x and y` → uses `&&` (Elixir's `&&` short-circuits on `nil`/`false`, which doesn't match Python when `x` is `0` or `""` — but for the MVP, this is an accepted limitation; wrap in `truthy?` if exact Python semantics are needed)
+- `while x:` → `if truthy?(x) do ... end` in the recursive helper
+
+**The `not`/`!` gap:** This truthiness mismatch is most dangerous with the `not` operator. Python's `not 0` → `True`, but Elixir's `!0` → `false`. The transpiler always generates `!truthy?(x)` for `not x`.
+
+**Known limitation for `and`/`or`:** Python's `and`/`or` return operand values (not booleans) and use Python truthiness for short-circuiting: `0 and 5` → `0`, `"" or "default"` → `"default"`. Elixir's `&&`/`||` also return operand values but use Elixir truthiness. This means `0 && 5` → `5` in Elixir (because `0` is truthy) but `0 and 5` → `0` in Python (because `0` is falsy). For code where `and`/`or` is used purely for boolean logic (the common case in algorithmic code), `&&`/`||` works correctly. For code that exploits Python's short-circuit value semantics with non-boolean operands, the translation will be wrong. Document as a known limitation.
 
 ### 11.4 Chained Comparisons
 
@@ -134,23 +139,27 @@ In Elixir, `fn` captures the value at creation time. This is a known semantic di
 
 ### 11.7 `enumerate` Argument Order
 
-**Problem:** Python's `enumerate` yields `(index, element)` tuples. Elixir's `Enum.with_index` yields `(element, index)` tuples.
+**Problem:** Python's `enumerate` yields `(index, element)` tuples. Elixir's `Enum.with_index` yields `{element, index}` tuples — the order is swapped.
 
 ```python
 for i, x in enumerate(["a", "b", "c"]):
     print(i, x)  # 0 "a", 1 "b", 2 "c"
 ```
 
-```elixir
-# WRONG (Enum.with_index returns {element, index}):
-Enum.with_index(["a", "b", "c"])  # [{"a", 0}, {"b", 1}, {"c", 2}]
+**Solution:** When `enumerate` appears as the iterator of a `for` loop with tuple unpacking, destructure the swapped order in the `fn` parameter. Do NOT add a separate `Enum.map` to swap — just bind correctly:
 
-# CORRECT:
-Enum.with_index(["a", "b", "c"])
-|> Enum.map(fn {x, i} -> {i, x} end)  # [{0, "a"}, {1, "b"}, {2, "c"}]
+```elixir
+# Python: for i, x in enumerate(items): body
+# Elixir:
+Enum.reduce(Enum.with_index(items), acc, fn {x, i}, acc ->
+  # body uses i and x correctly — they're just bound in the right order
+  ...
+end)
 ```
 
-**Solution:** The transpiler detects `enumerate` in the iterator of a `for` loop and generates code that swaps the tuple order.
+The key insight is that `Enum.with_index` returns `{element, index}`, so the `fn` parameter destructures as `{x, i}` even though the Python code writes `i, x`. No tuple-swapping step is needed.
+
+For `enumerate` with a start offset: `enumerate(items, 1)` → `Enum.with_index(items, 1)`.
 
 ### 11.8 Negative Indexing
 
@@ -162,7 +171,7 @@ Enum.at(my_list, -1)  # last element — works!
 
 **No special handling needed** — `Enum.at/2` handles negative indices correctly.
 
-**Performance note:** `Enum.at/2` is O(n) for linked lists, so `arr[mid]` in a binary search becomes an O(n) operation. This is an accepted trade-off — the goal is behavioral correctness, not algorithmic complexity preservation (see §1.2).
+**Performance note:** `Enum.at/2` is O(n) for linked lists, so `arr[mid]` in a binary search becomes an O(n) operation. This is an accepted trade-off — the goal is behavioral correctness, not algorithmic complexity preservation (see §1.3).
 
 ### 11.9 `sorted()` with `key` Function
 
@@ -180,7 +189,7 @@ Enum.sort_by(items, fn x -> Enum.at(x, 1) end)
 
 ### 11.11 Dictionary Key Access
 
-**Problem:** Python's `d[key]` raises `KeyError` if key is missing. Elixir's `d[key]` (for maps) or `Map.fetch!(d, key)` raises `KeyError`. However, `Map.get(d, key)` returns `nil` (no error). The `dict.get(key)` method returns `nil` by default.
+**Problem:** Python's `d[key]` raises `KeyError` if key is missing. The converter must use `Map.fetch!/2` (not `Map.get/2`) to match this behavior.
 
 ```python
 d[key]          # KeyError if missing
@@ -193,6 +202,8 @@ Map.fetch!(d, key)     # KeyError if missing — matches d[key]
 Map.get(d, key)        # nil if missing — matches d.get(key)
 Map.get(d, key, 0)     # 0 if missing — matches d.get(key, 0)
 ```
+
+**Important:** Do NOT use `Map.get/2` or `d[key]` (Elixir's Access syntax) for Python's `d[key]` — Elixir's `d[key]` returns `nil` for missing keys instead of raising, which would silently produce wrong results.
 
 ### 11.12 `str.strip(chars)` Semantic Mismatch
 
@@ -250,23 +261,25 @@ String.to_charlist("A") |> hd()  # 65
 ### 11.15 `hex()`, `oct()`, `bin()` Functions
 
 ```python
-hex(255)   # "0xff"
+hex(255)   # "0xff"   (lowercase!)
 oct(255)   # "0o377"
 bin(255)   # "0b11111111"
 ```
 
 ```elixir
-Integer.to_string(255, 16)  # "ff" — missing "0x" prefix
+Integer.to_string(255, 16)  # "FF" — WRONG CASE, missing "0x" prefix
 Integer.to_string(255, 8)   # "377" — missing "0o" prefix
 Integer.to_string(255, 2)   # "11111111" — missing "0b" prefix
 ```
 
-**Solution:** Generate helpers that add the prefix:
+**Solution:** Generate helpers that add the prefix and fix casing:
 ```elixir
-"0x" <> Integer.to_string(n, 16)
-"0o" <> Integer.to_string(n, 8)
-"0b" <> Integer.to_string(n, 2)
+"0x" <> String.downcase(Integer.to_string(n, 16))   # hex — Python uses lowercase
+"0o" <> Integer.to_string(n, 8)                       # oct
+"0b" <> Integer.to_string(n, 2)                       # bin
 ```
+
+**Important:** Python's `hex()` returns lowercase hex digits (`0xff`, not `0xFF`). Elixir's `Integer.to_string(n, 16)` returns uppercase (`FF`). The `String.downcase/1` call is required.
 
 ### 11.16 `input()` Function
 
@@ -276,7 +289,7 @@ Integer.to_string(255, 2)   # "11111111" — missing "0b" prefix
 IO.gets("") |> String.trim_trailing("\n")
 ```
 
-**Solution:** Map `input()` to `IO.gets("") |> String.trim_trailing("\n")`. Map `input(prompt)` to `IO.gets(prompt) |> String.trim_trailing("\n")`.
+**Solution:** Map `input()` to `IO.gets("") |> String.trim_trailing("\n")`. Map `input(prompt)` to `IO.gets(prompt) |> String.trim_trailing("\n")`. Note: `String.trim_trailing("\n")` specifically strips only the trailing newline, matching Python's `input()` behavior (which does not strip other whitespace).
 
 ### 11.17 `math` Module Functions
 
@@ -294,7 +307,9 @@ Python's `math` module provides `math.ceil`, `math.floor`, `math.sqrt`, `math.lo
 | `math.pow(x, n)` | `:math.pow(x, n)` |
 | `math.pi` | `:math.pi()` |
 | `math.e` | `:math.exp(1)` |
-| `math.inf` | `:infinity` |
+| `math.inf` | See note below |
+
+**`math.inf` has no safe Elixir equivalent.** Python's `math.inf` is an IEEE 754 positive infinity float. It participates in arithmetic (`1 + math.inf` → `inf`) and comparisons (`x < math.inf` → `True` for any finite `x`). Elixir's `:infinity` atom has no numeric semantics — `1 + :infinity` raises `ArithmeticError`, and `x < :infinity` uses atom comparison (different from numeric comparison). **Solution:** Raise `UnsupportedNodeError` when `math.inf` is encountered. If a future version needs to support it, use a large float sentinel (e.g., `1.0e308`) with a comment documenting the limitation, or define a helper module with custom comparison functions.
 
 ### 11.18 `print()` with Multiple Arguments
 
@@ -303,13 +318,21 @@ Python's `math` module provides `math.ceil`, `math.floor`, `math.sqrt`, `math.lo
 ```python
 print(a, b, c)     # "1 2 3"
 print(a, sep=",")  # "1,2,3"
+print()             # "" (prints empty line)
 ```
 
 ```elixir
+# Single argument:
+IO.puts(to_string(a))
+
+# Multiple arguments:
 IO.puts(Enum.join([to_string(a), to_string(b), to_string(c)], " "))
+
+# No arguments:
+IO.puts("")
 ```
 
-**Solution:** For `print(arg)` (single argument), map to `IO.puts(to_string(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([to_string(arg1), to_string(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
+**Solution:** For `print()` (no arguments), map to `IO.puts("")`. For `print(arg)` (single argument), map to `IO.puts(to_string(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([to_string(arg1), to_string(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
 
 ### 11.19 String Concatenation with `+` (Critical)
 
@@ -325,21 +348,52 @@ result = str(count) + " items found"   # "5 items found"
 # CORRECT: "hello" <> " " <> "world"
 ```
 
-**Solution:** The `BinOp` handler for `Add` must determine whether the operands are strings. Detection strategies:
-
-1. **Literal detection:** If both operands are `Constant` nodes with string values, emit `<>`.
-2. **Call detection:** If either operand is a call to `str()` (mapped to `to_string/1`), emit `<>`.
-3. **Context tracking:** If either operand is a variable known to be a string (from the context struct's type tracking), emit `<>`.
-4. **Fallback:** When the type is unknown at transpile time, generate a runtime helper that dispatches based on type:
+**Solution — runtime `py_add/2` helper:** Rather than attempting compile-time type inference, the transpiler uses a runtime-dispatching helper for all `Add` operations:
 
 ```elixir
 defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
 defp py_add(a, b), do: a + b
 ```
 
-**Recommendation:** For the MVP, implement strategies 1–3. When type is unknown and either operand could be a string, emit `py_add(a, b)` and include the helper in the generated module.
+All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids the complexity of tracking string types through the context struct. The `py_add` helper is unconditionally included in the generated module (it's a no-op if never called).
 
-### 11.20 Slicing
+**Optimization (optional):** When both operands are string `Constant` nodes, the converter can emit `<>` directly without the helper. This is a minor code-quality improvement, not a correctness requirement.
+
+### 11.20 String and List Repetition with `*` (Critical)
+
+**Problem:** Python uses `*` for both arithmetic multiplication, string repetition, and list repetition. In Elixir, `*` is arithmetic only.
+
+```python
+"abc" * 3           # "abcabcabc"
+[1, 2] * 3          # [1, 2, 1, 2, 1, 2]
+```
+
+```elixir
+# WRONG: "abc" * 3  → ArithmeticError
+# CORRECT:
+String.duplicate("abc", 3)             # "abcabcabc"
+List.duplicate([1, 2], 3) |> List.flatten()  # [1, 2, 1, 2, 1, 2]
+```
+
+**Solution — runtime `py_mult/2` helper:**
+
+```elixir
+defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
+defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
+defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, 1) |> List.flatten() |> Stream.cycle() |> Enum.take(length(a) * b)
+defp py_mult(a, b) when is_integer(a) and is_list(b), do: py_mult(b, a)
+defp py_mult(a, b), do: a * b
+```
+
+**Simpler list repetition alternative:** For the MVP, a cleaner list repetition is:
+
+```elixir
+defp py_mult(a, b) when is_list(a) and is_integer(b) do
+  Enum.flat_map(1..b, fn _ -> a end)
+end
+```
+
+### 11.21 Slicing
 
 **Problem:** Python's slice syntax is pervasive in algorithmic code (merge sort, string manipulation, array partitioning). Elixir has no built-in slice syntax.
 
@@ -370,7 +424,7 @@ items[1:5:2]    # elements at index 1, 3
 
 **The `Slice` AST node:** When `Subscript.slice` is a `Slice` node (rather than a `Constant` or expression), the converter must inspect `Slice.lower`, `Slice.upper`, and `Slice.step` (all optional) and emit the appropriate Elixir translation from the table above.
 
-### 11.21 `range()` with Negative Step
+### 11.22 `range()` with Negative Step
 
 **Problem:** The stop-boundary adjustment for `range()` depends on the step direction. Python's `range` always excludes the stop value.
 
@@ -401,7 +455,7 @@ Elixir ranges are **stop-inclusive**: `0..4` includes `4`. The conversion must a
 if step > 0, do: a..(b - 1)//step, else: a..(b + 1)//step
 ```
 
-### 11.22 Power Operator (`**`) with Float Exponents
+### 11.23 Power Operator (`**`) with Float Exponents
 
 **Problem:** Python's `**` operator works with both integer and float exponents. `2 ** 0.5` computes a square root. Elixir's `Integer.pow/2` only accepts non-negative integer exponents and raises `ArithmeticError` on floats or negative exponents.
 
@@ -425,3 +479,35 @@ if step > 0, do: a..(b - 1)//step, else: a..(b + 1)//step
 | `2 ** -1` | `:math.pow(2, -1)` → `0.5` |
 
 **Trade-off:** `:math.pow/2` always returns a float, so `2 ** 3` returns `8.0` instead of `8`. This can cause type mismatches downstream (e.g., using the result as a list index). When the exponent is a known positive integer literal, the converter may use `Integer.pow/2` instead to preserve the integer type. Otherwise, default to `:math.pow/2`.
+
+### 11.24 Boolean Values in Arithmetic (Critical)
+
+**Problem:** In Python, `bool` is a subclass of `int` — `True` is `1` and `False` is `0` in arithmetic contexts. Elixir's `true` and `false` are atoms with no numeric value.
+
+```python
+True + True       # 2
+False + 1         # 1
+sum([True, True, False])  # 2
+count = count + (x > 0)   # common idiom: adds 1 if x > 0, else 0
+```
+
+```elixir
+# WRONG: true + true  → ArithmeticError
+# WRONG: false + 1    → ArithmeticError
+```
+
+**Solution — runtime `py_add/2` already handles this partially**, but the `count + (x > 0)` idiom is especially common in competitive programming. The `py_add` helper should be extended:
+
+```elixir
+defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+defp py_add(a, b) when is_boolean(a), do: py_add(bool_to_int(a), b)
+defp py_add(a, b) when is_boolean(b), do: py_add(a, bool_to_int(b))
+defp py_add(a, b), do: a + b
+
+defp bool_to_int(true), do: 1
+defp bool_to_int(false), do: 0
+```
+
+**Note:** The `is_boolean` guard must come before `is_integer` in any guard chain, because `true` and `false` are not integers in Elixir. The `py_mult` helper should handle booleans similarly.
+
+**Failure mode:** Silent crash (`ArithmeticError`) in code that uses boolean-integer arithmetic. This pattern is common in competitive programming where `count += (condition)` is idiomatic Python.

@@ -81,6 +81,8 @@ Understanding the Python AST format is essential. This is what the library consu
 # Python: 3.14     → %{"_type" => "Constant", "value" => 3.14}
 ```
 
+**Triple-quoted strings:** Python triple-quoted strings (`"""..."""` or `'''...'''`) produce regular `Constant` nodes with embedded `\n` characters. After JSON serialization, these appear as normal string values with newlines. No special handling is needed — they are just string constants.
+
 **Gotcha — complex numbers and bytes:** Python `Constant` can hold complex numbers (`3+4j`) and bytes (`b"hello"`). These should raise `UnsupportedNodeError`. **Serialization caveat:** JSON has no native complex number type, so the serialized form depends entirely on the `ast2json` implementation used — some will produce a dict with `real`/`imag` keys, some will produce a string representation, some will error. Bare imaginary literals like `4j` are `Constant(value=4j)` in the AST. Compound expressions like `3+4j` appear as `BinOp(Constant(3), Add, Constant(4j))`. Detection heuristic: check if the JSON value is a map/object (for dict-serialized complex) or if the `kind` field or value type doesn't match any expected type (int, float, str, bool, None). Test with your chosen serializer.
 
 **Gotcha — float vs integer:** JSON does not distinguish between `1` and `1.0` in all cases. Python's AST does. After `Jason.decode!`, Elixir will have the correct type, so this should be fine. But test it.
@@ -132,7 +134,9 @@ Understanding the Python AST format is essential. This is what the library consu
 Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They never appear as standalone AST nodes. Each is a simple node with only `"_type"` and no other fields.
 
 **Binary operators** (used by `BinOp`):
-`Add`, `Sub`, `Mult`, `Div`, `FloorDiv`, `Mod`, `Pow`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, `MatMult`
+`Add`, `Sub`, `Mult`, `Div`, `FloorDiv`, `Mod`, `Pow`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`
+
+**Note:** `MatMult` also exists in the Python grammar but is **unsupported** — it raises `UnsupportedNodeError`. Elixir has no matrix multiplication operator, and this operation is not used in typical algorithmic code.
 
 **Unary operators** (used by `UnaryOp`):
 `UAdd`, `USub`, `Not`, `Invert`
@@ -185,7 +189,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 }
 ```
 
-**Conversion:** Fold the `values` list into nested `&&`/`||` expressions: `a and b and c` → `{:&&, [], [{:&&, [], [a, b]}, c]}`. **Use `&&`/`||`, not `and`/`or`** — see §9.6 and §11.
+**Conversion:** Fold the `values` list into nested `&&`/`||` expressions: `a and b and c` → `{:&&, [], [{:&&, [], [a, b]}, c]}`. **Use `&&`/`||`, not `and`/`or`** — see §9.7 and §11.3.
 
 **`Compare(left: expr, ops: cmpop*, comparators: expr*)`** — A comparison of two or more values. `left` is the first value, `ops` is a list of comparison operator nodes, `comparators` is a list of the remaining values. `ops` and `comparators` are always the same length.
 
@@ -335,6 +339,8 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 
 **Conversion for multiple targets:** Python evaluates the value once, then assigns to each target **left-to-right**. `a = b = 5` → `temp = 5; a = temp; b = temp`. For simple literal values this can be simplified to `a = 5; b = 5`, but when the value is a complex expression or function call, it must be evaluated once into a temporary variable first to preserve semantics.
 
+**Conversion for tuple unpacking:** `a, b = expr` becomes `{a, b} = expr`. **Critically, for swaps like `a, b = b, a`, Python evaluates the entire right-hand side before assigning.** The AST represents the right side as a `Tuple` node. The converter must emit the right-hand `Tuple` as an Elixir tuple literal `{b, a}` and destructure with pattern matching: `{a, b} = {b, a}`. This works correctly in Elixir because the right side is fully evaluated before the pattern match binds.
+
 **`AugAssign(target: expr, op: operator, value: expr)`** — Augmented assignment (e.g., `a += 1`). `target` is a **single** node (unlike `Assign`). `op` is the operator (e.g., `Add`). `value` is the right-hand side.
 
 ```elixir
@@ -351,7 +357,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 
 **`Expr(value: expr)`** — An expression used as a statement. Wraps function calls, method calls, or any expression whose return value is discarded. This is the node where mutation-method detection happens: `list.append(x)` appears as `Expr(value=Call(Attribute(Name("list"), "append"), [Name("x")]))`.
 
-**Conversion:** When the wrapped expression is a method call that mutates in-place (e.g., `list.append(x)`), convert to a reassignment: `list = list ++ [x]`. See §13.
+**Conversion:** When the wrapped expression is a method call that mutates in-place (e.g., `list.append(x)`), convert to a reassignment: `list = list ++ [x]`. See §9.
 
 **`If(test: expr, body: stmt*, orelse: stmt*)`** — An if statement. `test` is the condition, `body` is a list of statements for the true branch, `orelse` is a list for the else/elif branch. Python represents `elif` as a nested `If` inside `orelse`: if `orelse` contains exactly one `If` node, that's an `elif`.
 
@@ -431,9 +437,9 @@ The Python AST format is not stable across versions. While this library targets 
 #### Literals and Names (~5 nodes)
 `Constant`, `Name`, `List`, `Tuple`, `Dict`
 
-#### Operators (~29 nodes)
+#### Operators (~28 nodes)
 
-**Binary (13):** `Add`, `Sub`, `Mult`, `Div`, `FloorDiv`, `Mod`, `Pow`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, `MatMult`
+**Binary (12):** `Add`, `Sub`, `Mult`, `Div`, `FloorDiv`, `Mod`, `Pow`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`
 
 **Unary (4):** `UAdd`, `USub`, `Not`, `Invert`
 
@@ -441,9 +447,9 @@ The Python AST format is not stable across versions. While this library targets 
 
 **Comparison (10):** `Eq`, `NotEq`, `Lt`, `LtE`, `Gt`, `GtE`, `Is`, `IsNot`, `In`, `NotIn`
 
-Note: `MatMult`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` are listed for completeness but may raise `UnsupportedNodeError` initially. Most algorithmic code does not use matrix multiplication or bitwise shifts (though `BitAnd`, `BitOr`, `BitXor` do appear in some problems).
+Note: `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` are listed for completeness but may raise `UnsupportedNodeError` initially. Most algorithmic code does not use bitwise shifts (though `BitAnd`, `BitOr`, `BitXor` do appear in some problems).
 
-**Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `use Bitwise` or `import Bitwise`. The code generator should unconditionally emit `import Bitwise` at the top of the generated module. This is a no-op when no bitwise operators are used, and avoids the need to track usage through the context struct.
+**Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `use Bitwise` or `import Bitwise`. The code generator should unconditionally emit `import Bitwise` at the top of the generated module. This is a no-op when no bitwise operators are used, and avoids the need to track usage through the context struct. **Note:** In Elixir 1.17+, bitwise operators are available without import. If your minimum Elixir version is 1.17+, this import can be omitted.
 
 #### Expressions (~12 nodes)
 `BinOp`, `UnaryOp`, `Compare`, `BoolOp`, `Call`, `IfExp`, `Subscript`, `Attribute`, `ListComp`, `Lambda`, `Slice`, `Starred` (in function call arguments only — `*args` unpacking)
@@ -454,11 +460,11 @@ Note: `MatMult`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` a
 #### Auxiliary (~8 nodes)
 `arguments`, `arg`, `keyword`, `comprehension`, `Module`, `Load`, `Store`, `Del`
 
-**Total: ~66 node types**, of which ~29 are trivial operator nodes and ~3 are context markers (`Load`/`Store`/`Del`) that the converter ignores.
+**Total: ~65 node types**, of which ~28 are trivial operator nodes and ~3 are context markers (`Load`/`Store`/`Del`) that the converter ignores.
 
 ### 7.2 Explicitly Unsupported (raises `UnsupportedNodeError`)
 
-`ClassDef`, `AsyncFunctionDef`, `AsyncFor`, `AsyncWith`, `Import`, `ImportFrom`, `Try`, `TryStar`, `ExceptHandler`, `With`, `Raise`, `Global`, `Nonlocal`, `Yield`, `YieldFrom`, `Await`, `Match`, `match_case`, `Delete`, `AnnAssign`, `TypeAlias`, `GeneratorExp`, `SetComp`, `DictComp`, `FormattedValue`, `JoinedStr`, `TemplateStr`, `Interpolation`, `Set`, `NamedExpr`, `Starred` (in assignment target unpacking — `a, *b = ...`)
+`ClassDef`, `AsyncFunctionDef`, `AsyncFor`, `AsyncWith`, `Import`, `ImportFrom`, `Try`, `TryStar`, `ExceptHandler`, `With`, `Raise`, `Global`, `Nonlocal`, `Yield`, `YieldFrom`, `Await`, `Match`, `match_case`, `Delete`, `AnnAssign`, `TypeAlias`, `GeneratorExp`, `SetComp`, `DictComp`, `FormattedValue`, `JoinedStr`, `TemplateStr`, `Interpolation`, `Set`, `NamedExpr`, `Starred` (in assignment target unpacking — `a, *b = ...`), `MatMult` (matrix multiplication operator — no Elixir equivalent)
 
 **`GeneratorExp` interaction with builtins:** Note that `GeneratorExp` is common inside calls to mapped builtins: `sum(x**2 for x in items)`, `max(abs(x) for x in items)`, `min(len(s) for s in strings)`. These will crash on the `GeneratorExp` child node even though `sum`/`max`/`min` are in the builtins table. An implementer encountering this pattern should either (a) special-case `Call` nodes where the argument is a `GeneratorExp` and the function is a known builtin (converting to `Enum.sum(Enum.map(items, fn x -> x ** 2 end))` or a `for` comprehension), or (b) raise `UnsupportedNodeError` with a clear message like "GeneratorExp inside sum() — consider rewriting as a list comprehension."
 
@@ -486,7 +492,7 @@ Every non-literal expression in Elixir's AST is a three-element tuple:
 - Floats: `3.14`
 - Strings: `"hello"`
 - Lists: `[1, 2, 3]`
-- Two-element tuples: `{:a, :b}` (but 3+ element tuples use `:{}`)
+- Two-element tuples: `{:a, :b}` (but 3+ element tuples use `:{}``)
 
 ### 8.2 Variables
 
@@ -714,7 +720,7 @@ Source: `{a, b, c}`
 {:{}, [], [{:a, [], nil}, {:b, [], nil}, {:c, [], nil}]}
 ```
 
-Source: `{a, b}` (2-element tuple — special case, no `:{}`)
+Source: `{a, b}` (2-element tuple — special case, no `:{}``)
 
 ```elixir
 {{:a, [], nil}, {:b, [], nil}}
@@ -765,12 +771,12 @@ end
 For implementers who need to verify their AST construction, here's what `Macro.to_string/1` produces for various AST structures:
 
 | AST | `Macro.to_string` output |
-|-----|--------------------------|
+|-----|-----------------------------|
 | `{:+, [], [1, 2]}` | `"1 + 2"` |
 | `{:&&, [], [{:a, [], nil}, {:b, [], nil}]}` | `"a && b"` |
 | `{:==, [], [{:x, [], nil}, nil]}` | `"x == nil"` |
 | `{:fn, [], [{:->, [], [[{:x, [], nil}], {:+, [], [{:x, [], nil}, 1]}]}]}` | `"fn x -> x + 1 end"` |
-| `{:if, [], [{:cond, [], nil}, [do: {:a, [], nil}, else: {:b, [], nil}]]]}` | `"if cond, do: a, else: b"` |
+| `{:if, [], [{:cond, [], nil}, [do: {:a, [], nil}, else: {:b, [], nil}]]}` | `"if cond, do: a, else: b"` |
 | `{:__block__, [], [{:=, [], [{:x, [], nil}, 1]}, {:x, [], nil}]}` | `"x = 1\nx"` |
 | `{{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [{:list, [], nil}]}` | `"Enum.sort(list)"` |
 

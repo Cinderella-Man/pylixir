@@ -271,6 +271,56 @@
 }
 ```
 
+### A.8 String Repetition
+
+**Python:** `s = "abc" * 3`
+
+**AST JSON:**
+```json
+{
+  "_type": "Module",
+  "body": [
+    {
+      "_type": "Assign",
+      "targets": [{"_type": "Name", "id": "s", "ctx": {"_type": "Store"}}],
+      "value": {
+        "_type": "BinOp",
+        "left": {"_type": "Constant", "value": "abc"},
+        "op": {"_type": "Mult"},
+        "right": {"_type": "Constant", "value": 3}
+      }
+    }
+  ]
+}
+```
+
+### A.9 List Repetition (Array Initialization)
+
+**Python:** `dp = [0] * n`
+
+**AST JSON:**
+```json
+{
+  "_type": "Module",
+  "body": [
+    {
+      "_type": "Assign",
+      "targets": [{"_type": "Name", "id": "dp", "ctx": {"_type": "Store"}}],
+      "value": {
+        "_type": "BinOp",
+        "left": {
+          "_type": "List",
+          "elts": [{"_type": "Constant", "value": 0}],
+          "ctx": {"_type": "Load"}
+        },
+        "op": {"_type": "Mult"},
+        "right": {"_type": "Name", "id": "n", "ctx": {"_type": "Load"}}
+      }
+    }
+  ]
+}
+```
+
 ---
 
 ## Appendix B: Edge Case Quick Reference Card
@@ -281,34 +331,49 @@ A compact reference for the most common correctness traps.
 |---|------|-------|-------|---------|
 | 1 | Floor division | `div(a, b)` | `Integer.floor_div(a, b)` | §11.1 |
 | 2 | Modulo | `rem(a, b)` | `Integer.mod(a, b)` | §11.2 |
-| 3 | Truthiness | `if my_list do` | `if my_list != [] do` | §11.3 |
+| 3 | Truthiness | `if my_list do` | `if truthy?(my_list) do` | §11.3 |
 | 4 | Chained comparison | `a < b < c` | `a < b && b < c` | §11.4 |
 | 5 | Boolean operators | `a and b` | `a && b` | §9.7 |
-| 6 | `enumerate` order | `{i, x}` | `{x, i}` then swap | §11.7 |
+| 6 | `enumerate` order | `{i, x}` | `{x, i}` (destructure swapped) | §11.7 |
 | 7 | `strip(chars)` | `String.trim(s, chars)` | Regex-based helper | §11.12 |
 | 8 | `replace(s, o, n, 1)` | `String.replace(s, o, n)` | `String.replace(s, o, n, global: false)` | §11.13 |
-| 9 | `return` in loop | Direct return | `try`/`throw`/`catch` | §13.13 |
-| 10 | `continue` in while | Skip | Recursive call to helper | §13.7 |
-| 11 | `break` in while | No-op | `throw(:break)` | §13.7 |
+| 9 | `return` in loop | Direct return | `try`/`throw`/`catch` | §13.14 |
+| 10 | `continue` in while | Skip | Recursive call to helper | §13.8 |
+| 11 | `break` in while | No-op | `throw({:break, {state}})` | §13.8 |
 | 12 | `print(a, b)` | `IO.puts(a, b)` | `IO.puts(Enum.join(..., " "))` | §11.18 |
-| 13 | `len(s)` for strings | `length(s)` | `String.length(s)` | §9.10 |
-| 14 | `in` for sets | `x in set` | `MapSet.member?(set, x)` | §9.9 |
-| 15 | `not in` | `not x in items` | `!(x in items)` | §9.9 |
+| 13 | `len(s)` for strings | `length(s)` | `py_len(s)` (runtime helper) | §9.10 |
+| 14 | `in` for dicts/strings | `x in collection` | `py_in(x, collection)` | §9.9 |
+| 15 | `not in` | `not x in items` | `!py_in(x, items)` | §9.9 |
 | 16 | Closure capture | `fn -> x end` (captures value) | Document as known limitation | §11.6 |
-| 17 | `d[key]` missing | `d[key]` | `Map.fetch!(d, key)` | §11.11 |
+| 17 | `d[key]` missing | `Map.get(d, key)` | `Map.fetch!(d, key)` | §11.11 |
 | 18 | `Code.format_string!` | Returns string | Returns iodata; use `IO.iodata_to_binary/1` | §6.1.1 |
-| 19 | String concat with `+` | `"a" + "b"` | `"a" <> "b"` | §11.19 |
+| 19 | String concat with `+` | `"a" + "b"` | `py_add("a", "b")` or `"a" <> "b"` | §11.19 |
 | 20 | Slicing `x[1:3]` | No Elixir equivalent | `Enum.slice(x, 1..2)` | §11.20 |
 | 21 | `range` negative step | `a..(b-1)//s` | `a..(b+1)//s` when `s < 0` | §11.21 |
 | 22 | Power with floats | `Integer.pow(a, b)` | `:math.pow(a, b)` | §11.22 |
 | 23 | `not`/`!` truthiness | `!0` → `false` | `!truthy?(0)` → `true` | §11.3 |
-| 24 | `is` operator | `:===` | `:==` | §13.10 |
+| 24 | `is` operator | `===` | `==` | §13.11 |
 | 25 | For-loop mutation | `Enum.each` (loses state) | `Enum.reduce` with accumulator | §13.4 |
 | 26 | Multiple assignment | `a = 5; b = 5` (for calls) | `temp = expr; a = temp; b = temp` | §6.3.7 |
 | 27 | `min`/`max` single arg | `min(list)` | `Enum.min(list)` | §12.8 |
 | 28 | `int(x, base)` | `trunc(x)` | `String.to_integer(x, base)` | §12.8 |
 | 29 | `dict.items()` | Not handled | `Map.to_list(d)` | §9.5 |
+| 30 | String repetition `*` | `"abc" * 3` raises error | `String.duplicate("abc", 3)` | §11.23 |
+| 31 | List repetition `*` | `[0] * n` raises error | `List.duplicate(0, n)` | §11.24 |
+| 32 | Boolean arithmetic | `true + 1` raises error | `py_bool_to_int(true) + 1` | §11.25 |
+| 33 | `continue` in for | No equivalent | Return accumulator unchanged | §11.26 |
+| 34 | Nested for mutation | Inner scope lost | Nested `Enum.reduce` | §11.27 |
+| 35 | `sorted` with reverse | `Enum.sort_by(x, f)` (no order) | `Enum.sort_by(x, f, :desc)` | §11.28 |
+| 36 | `int()` no args | `trunc(nil)` crashes | `0` | §11.29 |
+| 37 | `hex()` casing | `Integer.to_string(n, 16)` → `"FF"` | `String.downcase(...)` → `"ff"` | §11.15 |
+| 38 | `math.inf` | `:infinity` (no numeric ops) | Raise `UnsupportedNodeError` | §11.17 |
+| 39 | `print()` no args | Not handled | `IO.puts("")` | §11.18 |
+| 40 | `pop()` no args | Not handled | `List.delete_at(list, -1)` | §9.6 |
+| 41 | `MatMult` operator | Silent wrong code | Raise `UnsupportedNodeError` | §7.1 |
+| 42 | While loop state lost | Helper returns `nil` | Helper returns `{state}` tuple | §13.8 |
+| 43 | Tuple swap order | `a = b; b = a` | `{a, b} = {b, a}` | §13.19 |
+| 44 | `truthy?` empty map | `map == %{}` | `map_size(map) == 0` | §11.3 |
 
 ---
 
-*End of RFC-001 v6*
+*End of RFC-001 v7*

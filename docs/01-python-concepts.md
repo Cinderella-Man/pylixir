@@ -76,7 +76,7 @@ Python treats many values as "falsy" in boolean contexts. The following values a
 | `{}` (empty dict) | **NOT falsy in Elixir** | Elixir treats `%{}` as truthy |
 | `set()` (empty set) | **NOT falsy in Elixir** | No direct equivalent |
 
-**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `Pylixir.Helpers.truthy?/1` helper function where exact Python truthiness is required. See §11 and §13.
+**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `Pylixir.Helpers.truthy?/1` helper function where exact Python truthiness is required. See §11.3.
 
 ### 2.7 Python's `and`/`or`/`not` vs Elixir's `and`/`or`/`not`
 
@@ -91,7 +91,7 @@ Elixir's `and`/`or`/`not` **require boolean operands** and raise `BadBooleanErro
 
 **Solution:** The transpiler uses `&&`/`||`/`!` which accept any value in Elixir, matching Python's flexibility (though with Elixir's truthiness model, not Python's).
 
-**`not`/`!` truthiness gap:** Python's `not` uses Python's truthiness: `not 0` → `True`, `not []` → `True`, `not ""` → `True`. Elixir's `!` uses Elixir's truthiness: `!0` → `false`, `![]` → `false`, `!""` → `false`. These disagree on `0`, `[]`, `""`, and `%{}`. When the operand is known to be a non-boolean type where Python and Elixir truthiness diverge, the transpiler should use `!Pylixir.Helpers.truthy?(x)` instead of `!x`. See §11.3.
+**`not`/`!` truthiness gap:** Python's `not` uses Python's truthiness: `not 0` → `True`, `not []` → `True`, `not ""` → `True`. Elixir's `!` uses Elixir's truthiness: `!0` → `false`, `![]` → `false`, `!""` → `false`. These disagree on `0`, `[]`, `""`, and `%{}`. The transpiler uses `!Pylixir.Helpers.truthy?(x)` instead of `!x` to ensure Python truthiness semantics. See §11.3.
 
 ### 2.8 Chained Comparisons
 
@@ -141,6 +141,8 @@ x, *rest = [1,2,3]  # x=1, rest=[2,3]
 
 This is similar to Elixir's pattern matching: `{a, b} = {1, 2}`.
 
+**Critical: evaluation order.** Python evaluates the entire right-hand side before any assignment. `a, b = b, a` works as a swap because the tuple `(b, a)` is fully constructed first, then destructured. In Elixir, `{a, b} = {b, a}` works the same way — the right side is evaluated before pattern matching. The transpiler must emit a tuple on the right side, not sequential assignments.
+
 ### 2.12 The `enumerate` Function
 
 Python's `enumerate` yields `(index, element)` tuples:
@@ -150,7 +152,7 @@ for i, x in enumerate(["a", "b"]):
     print(i, x)  # 0 "a", then 1 "b"
 ```
 
-Elixir's `Enum.with_index/1` yields `{element, index}` tuples — **the order is swapped**. The transpiler must account for this.
+Elixir's `Enum.with_index/1` yields `{element, index}` tuples — **the order is swapped**. The transpiler must account for this by destructuring with the swapped order: `fn {x, i} -> ... end`.
 
 Python's `enumerate` also accepts a `start` argument: `enumerate(items, 1)` starts indexing at 1. Elixir's `Enum.with_index/2` also accepts an offset: `Enum.with_index(items, 1)`.
 
@@ -166,7 +168,7 @@ Elixir ranges: `0..4//1`, `2..4//1`, `0..8//2` — stop is **inclusive**. The tr
 - Positive step: `range(a, b)` → `a..(b-1)//1`
 - Negative step: `range(a, b, -s)` → `a..(b+1)//-s`
 
-See §11.19 for the full conversion rules.
+See §11.21 for the full conversion rules.
 
 ### 2.14 Python's `in` Operator
 
@@ -267,3 +269,37 @@ greeting = "hello" + " " + "world"
 ```
 
 Elixir uses `<>` for string concatenation. The `+` operator on strings raises `ArithmeticError` in Elixir. The transpiler must detect when `+` is used on string operands and emit `<>` instead. See §11.19.
+
+### 2.25 String and List Repetition with `*`
+
+Python uses `*` to repeat strings and lists:
+
+```python
+"abc" * 3       # "abcabcabc"
+[1, 2] * 3      # [1, 2, 1, 2, 1, 2]
+[0] * 10        # [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] — common pattern for initializing arrays
+```
+
+This is a `BinOp` with `Mult` operator, where one operand is a string/list and the other is an integer. This pattern is **very common** in competitive programming for initializing arrays (e.g., `dp = [0] * n`, `visited = [False] * n`).
+
+Elixir equivalents:
+- `String.duplicate("abc", 3)` for strings
+- `List.duplicate(0, 10)` for single-element list repetition like `[0] * 10`
+- `List.flatten(List.duplicate([1, 2], 3))` for multi-element list repetition
+
+See §11.23 and §11.24 for the full translation rules.
+
+### 2.26 Boolean Arithmetic
+
+In Python, `bool` is a subclass of `int`. `True` is `1` and `False` is `0` in arithmetic contexts:
+
+```python
+True + True     # 2
+False + 1       # 1
+count += (x > 0)  # increment count if x > 0
+sum(x > 0 for x in items)  # count positive items
+```
+
+This is **common** in competitive programming for counting conditions. Elixir's `true + true` raises `ArithmeticError`.
+
+See §11.25 for the translation strategy.

@@ -6,6 +6,8 @@
 iex> Pylixir.transpile("def add(a, b): return a + b\n\nprint(add(3, 4))")
 ```
 
+> **Note:** `transpile/1` is a convenience wrapper that shells out to `python3` to parse the source and serialize it to JSON, then calls `to_source/1`. Production workflows should use `to_source/1` with pre-serialized ASTs (see §1.1).
+
 **Step 1: Input**
 
 ```python
@@ -131,28 +133,35 @@ defmodule TranslatedCode do
         while_0(count)  # continue: skip rest, recurse immediately
       else
         if count == 5 do
-          throw(:break)
+          throw({:break, {count}})  # break: carry state
         else
           IO.puts(to_string(count))
           while_0(count)
         end
       end
+    else
+      {count}  # loop ended normally: return final state as tuple
     end
   end
 
   def run do
-    try do
-      while_0(0)
+    count = 0
+    {count} = try do
+      while_0(count)
     catch
-      :break -> :ok
+      {:break, state} -> state
     end
+    # count is now available for use after the loop
+    count
   end
 end
 
 TranslatedCode.run()
 ```
 
-> **Design note:** Each `while` loop becomes a private function that threads mutable state via its arguments (see §13.7). `continue` is implemented by recursing immediately with the current state, skipping the remaining body. `break` throws a `:break` tag caught by the enclosing `try`. No process-based state is needed.
+> **Design note:** Each `while` loop becomes a private function that threads mutable state via its arguments (see §13.8). The helper **returns its state as a tuple** when the loop condition becomes false, so the caller can destructure the final values. `continue` is implemented by recursing immediately with the current state, skipping the remaining body. `break` throws a `{:break, {state}}` tuple carrying the state at break-time, caught by the enclosing `try`. No process-based state is needed.
+>
+> **Critical fix (v6→v7):** Earlier versions had the while helper return `nil` when the loop condition became false, losing all mutated state. The helper now returns `{count}` (or `{var1, var2, ...}` for multiple state variables), and the caller destructures it with `{count} = try do ... end`.
 
 **Console Output:**
 
@@ -242,11 +251,17 @@ print(result)
 defmodule TranslatedCode do
   import Bitwise
 
+  defp py_len(x) when is_list(x), do: length(x)
+  defp py_len(x) when is_binary(x), do: String.length(x)
+  defp py_len(x) when is_map(x), do: map_size(x)
+  defp py_len(x) when is_tuple(x), do: tuple_size(x)
+
   defp binary_search(arr, target) do
     try do
       left = 0
-      right = length(arr) - 1
-      while_0(arr, target, left, right)
+      right = py_len(arr) - 1
+      {left, right} = while_0(arr, target, left, right)
+      throw({:return, -1})
     catch
       {:return, result} -> result
     end
@@ -264,7 +279,7 @@ defmodule TranslatedCode do
           while_0(arr, target, left, mid - 1)
       end
     else
-      throw({:return, -1})
+      {left, right}  # return final state
     end
   end
 
@@ -284,9 +299,10 @@ TranslatedCode.run()
 ```
 
 **Key translation decisions in this example:**
-1. `(left + right) // 2` → `Integer.floor_div(left + right, 2)` (not `div/2` — see §11.1)
-2. `arr[mid]` → `Enum.at(arr, mid)` (list indexing — O(n) per access, see §11.8)
-3. `elif`/`else` → `cond` block (see §13.11)
-4. `return` inside `while` → `throw({:return, value})` + `try`/`catch` at the function level (see §13.13)
-5. `while` loop → recursive helper function threading state as arguments
-6. The `try`/`catch` wraps the entire function body — one layer handles both `return` from the loop and the default return after the loop. The `else` branch of the while condition throws `{:return, -1}` for the "not found" case.
+1. `len(arr)` → `py_len(arr)` — runtime helper dispatches to `length/1` for lists, `String.length/1` for strings, etc. (see §9.10)
+2. `(left + right) // 2` → `Integer.floor_div(left + right, 2)` (not `div/2` — see §11.1)
+3. `arr[mid]` → `Enum.at(arr, mid)` (list indexing — O(n) per access, see §11.8)
+4. `elif`/`else` → `cond` block (see §13.12)
+5. `return` inside `while` → `throw({:return, value})` + `try`/`catch` at the function level (see §13.14)
+6. `while` loop → recursive helper function threading state as arguments, **returning state as tuple** when the condition is false (see §13.8)
+7. The `try`/`catch` wraps the entire function body — one layer handles both `return` from the loop and the default return after the loop. The while helper returns `{left, right}` when the condition becomes false; the code after the while emits `throw({:return, -1})` for the "not found" case.

@@ -91,6 +91,17 @@ removed = Enum.at(my_list, 2)
 my_list = List.delete_at(my_list, 2)
 ```
 
+**`pop()` with no argument:** Python's `my_list.pop()` (no argument) pops the last element. The same two-part pattern applies:
+
+```python
+removed = my_list.pop()
+```
+
+```elixir
+removed = Enum.at(my_list, -1)
+my_list = List.delete_at(my_list, -1)
+```
+
 ### 9.7 Elixir's `&&`/`||`/`!` vs `and`/`or`/`not`
 
 When converting Python's `and`/`or`/`not` to Elixir, use `&&`/`||`/`!`, NOT `and`/`or`/`not`.
@@ -117,47 +128,46 @@ my_list = List.replace_at(my_list, i, new_value)
 
 ### 9.9 The `in` Operator
 
-Python's `in` operator checks membership in any collection. The Elixir translation depends on the collection type:
+Python's `in` operator checks membership in any collection. Since the transpiler does not perform type inference (see §1.5), it uses a runtime-dispatching helper for `in` checks where the collection type is unknown:
 
-| Python | Elixir |
-|---|---|
-| `x in my_list` | `x in my_list` |
-| `x in my_tuple` | `x in Tuple.to_list(my_tuple)` |
-| `x in my_set` | `MapSet.member?(my_set, x)` |
-| `x in my_dict` | `Map.has_key?(my_dict, x)` |
-| `x in "substring"` | `String.contains?("substring", x)` |
+```elixir
+defp py_in(elem, collection) when is_list(collection), do: elem in collection
+defp py_in(elem, collection) when is_map(collection), do: Map.has_key?(collection, elem)
+defp py_in(elem, collection) when is_binary(collection), do: String.contains?(collection, elem)
+defp py_in(elem, %MapSet{} = collection), do: MapSet.member?(collection, elem)
+```
 
-The `Compare` node handler must inspect the comparator to determine which translation to use. If the comparator is a `Name` node, the context struct can track the type of each variable (list, set, dict, string) to determine the correct translation. If the type is unknown, default to `x in collection` (which works for lists and ranges).
+When the collection is a literal list or range, the converter can emit `x in collection` directly. Otherwise, emit `py_in(x, collection)`.
 
 **Note:** `not in` is a single comparison operator `NotIn` in the AST — it is NOT `Not` wrapping `In`. This is because `not in` is a Python keyword pair, not the `not` operator applied to `in`.
 
 ```elixir
 # Python: x not in items
 # AST: Compare(left=Name("x"), ops=[NotIn], comparators=[Name("items")])
-# Elixir: !(x in items)
+# Elixir: !py_in(x, items)
 ```
 
 ### 9.10 The `len()` Function
 
-Python's `len()` works on lists, tuples, dicts, sets, and strings. The Elixir translation depends on the type:
+Python's `len()` works on lists, tuples, dicts, sets, and strings. Since the transpiler does not perform type inference, it uses a runtime-dispatching helper:
 
-| Python | Elixir |
-|---|---|
-| `len(my_list)` | `length(my_list)` |
-| `len(my_tuple)` | `tuple_size(my_tuple)` |
-| `len(my_dict)` | `map_size(my_dict)` |
-| `len(my_set)` | `MapSet.size(my_set)` |
-| `len(my_string)` | `String.length(my_string)` |
+```elixir
+defp py_len(x) when is_list(x), do: length(x)
+defp py_len(x) when is_binary(x), do: String.length(x)
+defp py_len(x) when is_map(x), do: map_size(x)
+defp py_len(x) when is_tuple(x), do: tuple_size(x)
+```
 
-If the type is unknown, `length/1` is the default (works for lists). For strings, `length/1` returns the number of bytes (wrong for UTF-8!), so `String.length/1` is needed.
+When the argument is a literal list or a variable assigned from a list literal in the same scope, the converter may emit `length(x)` directly as an optimization. Otherwise, emit `py_len(x)`.
+
+**Note on MapSet:** `MapSet` is a struct (map), so `map_size/1` returns the struct's internal map size, not the set element count. For `MapSet`, use `MapSet.size/1`. The `py_len` helper can be extended with a clause `defp py_len(%MapSet{} = x), do: MapSet.size(x)` placed before the `is_map` clause.
 
 ### 9.11 `not` Operator
 
-Python's `not` produces a boolean (`True`/`False`). Elixir's `!` also produces a boolean. However, their truthiness models differ: `not 0` → `True` in Python, `!0` → `false` in Elixir (because `0` is truthy in Elixir). When the operand might be `0`, `""`, `[]`, or `%{}`, use `!Pylixir.Helpers.truthy?(x)` instead of `!x`. See §11.3.
+Python's `not` produces a boolean (`True`/`False`). Elixir's `!` also produces a boolean. However, their truthiness models differ: `not 0` → `True` in Python, `!0` → `false` in Elixir (because `0` is truthy in Elixir). The transpiler always uses `!Pylixir.Helpers.truthy?(x)` instead of `!x` to match Python's truthiness model. See §11.3.
 
 ```python
-not x    →    !x          # safe when x is known to be boolean, nil, or non-empty
-not x    →    !truthy?(x) # needed when x could be 0, "", [], or %{}
+not x    →    !Pylixir.Helpers.truthy?(x)
 ```
 
 ---
@@ -174,12 +184,14 @@ defmodule Pylixir.Context do
   defstruct scopes: [],
             while_counter: 0,
             loop_nesting: 0,
+            function_names: MapSet.new(),
             pending_helpers: []
 
   @type t :: %__MODULE__{
     scopes: [MapSet.t(String.t())],
     while_counter: non_neg_integer(),
     loop_nesting: non_neg_integer(),
+    function_names: MapSet.t(String.t()),
     pending_helpers: [Macro.t()]
   }
 end
@@ -193,7 +205,7 @@ A stack of `MapSet`s, where each `MapSet` contains the variable names bound in t
 
 **Purpose:** Track which variables are bound at each scope level to:
 1. Avoid generating conflicting variable names (e.g., when a comprehension uses `x` that shadows an outer `x`)
-2. Know which variables need to be threaded through loop accumulators (see §13.14)
+2. Know which variables need to be threaded through loop accumulators (see §13.4)
 3. Generate correct `defp` signatures for helper functions
 
 **Operations:**
@@ -221,6 +233,10 @@ Tracks how many nested loops deep we are. This determines the return strategy fo
 
 - `loop_nesting == 0`: Simple `throw`/`catch` (not inside a loop)
 - `loop_nesting > 0`: `try`/`throw`/`catch` (inside a loop, where `throw` alone might be caught by the loop's `catch`)
+
+#### `function_names` — Collected Function Names for Forward References
+
+A `MapSet` of all function names defined at the top level. This is populated during a **pre-pass** over the `Module.body` before the main conversion begins. It allows the converter to recognize calls to functions defined later in the file without raising errors. See §13.20.
 
 #### `pending_helpers` — Deferred Helper Emission
 
