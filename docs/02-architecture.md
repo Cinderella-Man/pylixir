@@ -1,4 +1,3 @@
-
 ## §6. Architecture and Pipeline
 
 ### 6.1 Pipeline Overview
@@ -7,7 +6,7 @@
 Input map
   → Pylixir.Converter.convert/2 (recursive dispatch on "_type", threads context)
   → Elixir AST (tuples)
-  → Macro.to_string/1 (→ iodata, NOT a binary!)
+  → Macro.to_string/1 (→ binary string)
   → Code.format_string!/1 (→ iodata, NOT a binary!)
   → IO.iodata_to_binary/1 (→ final binary string)
 ```
@@ -16,16 +15,16 @@ Input map
 
 #### 6.1.1 The `iodata` Gotcha
 
-Both `Macro.to_string/1` and `Code.format_string!/1` return `iodata()` (deeply nested lists of binaries and integers), NOT flat binary strings. Calling `IO.puts/1` on iodata works fine (IO functions accept iodata), but string operations like `String.length/1`, `String.contains?/2`, or pattern matching will fail or produce wrong results.
+`Code.format_string!/1` returns `iodata()` (deeply nested lists of binaries and integers), NOT a flat binary string. `Macro.to_string/1` returns a binary string directly — this has always been the case. Calling `IO.puts/1` on iodata works fine (IO functions accept iodata), but string operations like `String.length/1`, `String.contains?/2`, or pattern matching will fail or produce wrong results on iodata.
 
 ```elixir
 # CORRECT pipeline:
 ast
-|> Macro.to_string()        # returns iodata
+|> Macro.to_string()        # returns binary string
 |> Code.format_string!()    # returns iodata (NOT binary!)
 |> IO.iodata_to_binary()    # returns binary string ← THIS STEP IS REQUIRED
 
-# WRONG (v4 had this):
+# WRONG:
 ast
 |> Macro.to_string()
 |> Code.format_string!()
@@ -273,7 +272,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 %{
   "_type" => "Lambda",
   "args" => %{"_type" => "arguments", "args" => [%{"_type" => "arg", "arg" => "x"}, ...], ...},
-  "body" => %{"_type" => "BinOp", "left" => Name("x"), "op" => Add, "right" => Name("y")}
+  "body" => %{"_type" => "BinOp", "left" => Name("x"), "op" => Mult, "right" => Name("y")}
 }
 ```
 
@@ -419,8 +418,6 @@ The Python AST format is not stable across versions. While this library targets 
 **The converter should treat version-dependent fields as optional.** Use `Map.get(node, "type_params", [])` rather than `node["type_params"]` to avoid `KeyError` on pre-3.12 ASTs. Similarly, `Map.get(node, "kind", nil)` for `Constant.kind`.
 
 **Serializer variations:** The JSON representation of the Python AST depends on the serializer used (`ast2json`, `ast.dump` with custom serialization, etc.). Key areas where serializers diverge: representation of complex numbers (no JSON type exists), representation of `bytes` literals, handling of `Ellipsis` constant, and whether metadata fields (`lineno`, `col_offset`, etc.) are included. The converter should be resilient to missing metadata fields and should not depend on any specific serializer's conventions for unserializable types.
-
-
 
 ---
 
@@ -667,7 +664,7 @@ Source: `def greet(name, greeting \\ "Hello") do ... end`
 {:def, [], [
   {:greet, [], [
     {:name, [], nil},
-    {:\\\\, [], [{:greeting, [], nil}, "Hello"]}
+    {:\\, [], [{:greeting, [], nil}, "Hello"]}
   ]},
   [do: body_ast]
 ]}
@@ -769,6 +766,4 @@ For implementers who need to verify their AST construction, here's what `Macro.t
 | `{:__block__, [], [{:=, [], [{:x, [], nil}, 1]}, {:x, [], nil}]}` | `"x = 1\nx"` |
 | `{{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [{:list, [], nil}]}` | `"Enum.sort(list)"` |
 
-**Important gotcha:** `Macro.to_string/1` returns **iodata**, NOT a binary string. To get a binary string, pipe through `IO.iodata_to_binary/1`. Similarly, `Code.format_string!/1` returns iodata, not a binary.
-
-
+**Important gotcha:** `Code.format_string!/1` returns **iodata**, NOT a binary string. To get a binary string, pipe through `IO.iodata_to_binary/1`. Note that `Macro.to_string/1` does return a binary string directly — the iodata gotcha applies only to `Code.format_string!/1`.

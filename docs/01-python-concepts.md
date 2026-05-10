@@ -221,4 +221,3 @@ my_list.append(5)  # the return value (None) is discarded
 ```
 
 This appears in the AST as an `Expr` node wrapping the expression. The transpiler uses this node to detect mutation methods like `append`, `extend`, `pop`, etc.
-

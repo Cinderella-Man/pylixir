@@ -1,4 +1,5 @@
 
+
 ## §20. References
 
 - **Python AST documentation**: https://docs.python.org/3/library/ast.html
@@ -43,4 +44,3 @@ This glossary explains Elixir-specific terms that appear throughout this documen
 | **`Agent`** | A simple state-holding process. Used for mutable variable simulation. |
 | **NIF** | Native Implemented Function. A way to call C/Rust code from Elixir. |
 | **Port** | A mechanism for communicating with external OS processes. |
-

@@ -184,11 +184,11 @@ For `Compare` nodes with multiple operators, generate an `&&` chain:
 def convert(%{"_type" => "Compare", "left" => left, "ops" => ops, "comparators" => comparators}, ctx) do
   {left_ast, ctx} = convert(left, ctx)
   pairs = Enum.zip(ops, comparators)
-  {comparisons, ctx} = Enum.reduce(pairs, {[], ctx}, fn {op, comp}, {acc, ctx} ->
+  {comparisons, _prev, ctx} = Enum.reduce(pairs, {[], left_ast, ctx}, fn {op, comp}, {acc, prev_left, ctx} ->
     {op_ast, ctx} = convert(op, ctx)
     {comp_ast, ctx} = convert(comp, ctx)
-    comparison = {op_ast, [], [left_ast, comp_ast]}
-    {[comparison | acc], ctx}
+    comparison = {op_ast, [], [prev_left, comp_ast]}
+    {[comparison | acc], comp_ast, ctx}
   end)
   comparisons = Enum.reverse(comparisons)
   # Chain with &&
@@ -196,6 +196,8 @@ def convert(%{"_type" => "Compare", "left" => left, "ops" => ops, "comparators" 
   {result, ctx}
 end
 ```
+
+> **Key detail:** The accumulator threads `comp_ast` as `prev_left` into the next iteration. For `a < b < c`, this correctly produces `(a < b) and (b < c)` instead of the incorrect `(a < b) and (a < c)`.
 
 ### 13.9 The `AugAssign` Subscript Pattern
 

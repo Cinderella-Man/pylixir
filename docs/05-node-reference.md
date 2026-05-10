@@ -396,4 +396,3 @@ The following builtins are recognized by the lookup table but raise `Unsupported
 #### Builtins Not in the Lookup Table
 
 Any function call where `func` is a `Name` node whose `id` is not in the lookup table and not bound in the current scope will raise `UndefinedNameError`.
-

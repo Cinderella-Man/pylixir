@@ -111,5 +111,3 @@ gen = (x * 2 for x in items if x > 0)
 ```elixir
 gen = items |> Stream.filter(&(&1 > 0)) |> Stream.map(&(&1 * 2))
 ```
-
----

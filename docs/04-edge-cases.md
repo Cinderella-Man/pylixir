@@ -199,7 +199,7 @@ Map.get(d, key, 0)     # 0 if missing — matches d.get(key, 0)
 String.trim("hello", "hlo")  # WRONG — this removes the string "hlo" as a prefix/suffix
 ```
 
-**Solution:** For `strip` with a character set, generate a regex-based helper or use `String.replace/3`:
+**Solution:** For `strip(chars)` with a character set, generate a regex-based helper or use `String.replace/3`:
 
 ```elixir
 # For strip(chars): remove characters from both ends
@@ -303,5 +303,3 @@ IO.puts(Enum.join([to_string(a), to_string(b), to_string(c)], " "))
 ```
 
 **Solution:** For `print(arg)` (single argument), map to `IO.puts(to_string(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([to_string(arg1), to_string(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
-
-

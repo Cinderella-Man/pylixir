@@ -82,13 +82,12 @@ print(add(3, 4))
       {:add, [], [{:a, [], nil}, {:b, [], nil}]},
       [do: {:+, [], [{:a, [], nil}, {:b, [], nil}]}]
     ]},
-   {:IO, [], :puts},
-   {:to_string, [],
-    [
-      {:add, [], [3, 4]}
-    ]}
+   {{:., [], [{:__aliases__, [], [:IO]}, :puts]}, [],
+    [{:to_string, [], [{:add, [], [3, 4]}]}]}
  ]}
 ```
+
+> **Note:** `IO.puts(to_string(add(3, 4)))` is a single AST node — a remote function call with a nested local call as its argument, not separate block-level expressions.
 
 **Step 4: Formatted Elixir Code**
 
@@ -123,35 +122,25 @@ while count < 5:
 
 ```elixir
 defmodule TranslatedCode do
-  use Agent
-
-  def start_link do
-    Agent.start_link(fn -> %{"count" => 0} end, name: __MODULE__)
-  end
-
-  defp get(var), do: Agent.get(__MODULE__, &Map.get(&1, var))
-  defp set(var, val), do: Agent.update(__MODULE__, &Map.put(&1, var, val))
-
-  defp while_0 do
-    if get("count") < 5 do
-      set("count", get("count") + 1)
-      if get("count") == 3 do
-        while_0()
+  defp while_0(count) do
+    if count < 5 do
+      count = count + 1
+      if count == 3 do
+        while_0(count)  # continue: skip rest, recurse immediately
       else
-        if get("count") == 5 do
+        if count == 5 do
           throw(:break)
         else
-          IO.puts(to_string(get("count")))
-          while_0()
+          IO.puts(to_string(count))
+          while_0(count)
         end
       end
     end
   end
 
   def run do
-    start_link()
     try do
-      while_0()
+      while_0(0)
     catch
       :break -> :ok
     end
@@ -160,6 +149,8 @@ end
 
 TranslatedCode.run()
 ```
+
+> **Design note:** Each `while` loop becomes a private function that threads mutable state via its arguments (see §13.7). `continue` is implemented by recursing immediately with the current state, skipping the remaining body. `break` throws a `:break` tag caught by the enclosing `try`. No `Agent` or process-based state is needed.
 
 **Console Output:**
 
@@ -246,4 +237,3 @@ TranslatedCode.run()
 3. `elif`/`else` → `cond` block (see §13.11)
 4. `return` inside `while` → `throw({:return, value})` + `try`/`catch` (see §13.13)
 5. `while` loop → recursive helper function with `try`/`catch` for `break`
-

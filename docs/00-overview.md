@@ -1,3 +1,5 @@
+
+
 ---
 
 ## §1. Executive Summary
@@ -153,4 +155,3 @@ The JSON representation of the Python AST depends on the serializer used (`ast2j
 - **Metadata fields:** Some serializers include `lineno`, `col_offset`, etc.; others strip them.
 
 The converter is resilient to missing metadata fields and does not depend on any specific serializer's conventions for unserializable types.
-
