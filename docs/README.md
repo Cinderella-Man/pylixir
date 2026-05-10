@@ -1,4 +1,4 @@
-# RFC-001: py2ex — Python AST to Elixir Transpiler Implementation Plan
+# RFC-001: pylixir — Python AST to Elixir Transpiler Implementation Plan
 
 **Status:** Draft → Implementation Plan (v5)
 **Created:** 2026-05-09

@@ -93,7 +93,7 @@ Both produce the same result, but the `for` comprehension is more idiomatic and 
 If a Python AST contains an unsupported node type, the converter should raise `UnsupportedNodeError` with a descriptive message including the node type and source location (if available):
 
 ```elixir
-defmodule Py2Ex.Errors.UnsupportedNodeError do
+defmodule Pylixir.Errors.UnsupportedNodeError do
   defexception [:message, :node_type, :source_line]
 
   @impl true
@@ -106,7 +106,7 @@ defmodule Py2Ex.Errors.UnsupportedNodeError do
   end
 end
 
-defmodule Py2Ex.Errors.UndefinedNameError do
+defmodule Pylixir.Errors.UndefinedNameError do
   defexception [:message, :name]
 
   @impl true

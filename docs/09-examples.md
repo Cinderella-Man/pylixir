@@ -3,7 +3,7 @@
 ### 18.1 Session Walkthrough
 
 ```
-iex> Py2Ex.transpile("def add(a, b): return a + b\n\nprint(add(3, 4))")
+iex> Pylixir.transpile("def add(a, b): return a + b\n\nprint(add(3, 4))")
 ```
 
 **Step 1: Input**

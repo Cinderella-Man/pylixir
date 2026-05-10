@@ -188,7 +188,7 @@ not x    →    !x
 The `Context` struct tracks state needed during conversion. It is threaded through every `convert/2` call via the accumulator pattern.
 
 ```elixir
-defmodule Py2Ex.Context do
+defmodule Pylixir.Context do
   @enforce_keys [:scopes]
   defstruct scopes: [],
             while_counter: 0,

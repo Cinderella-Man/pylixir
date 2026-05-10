@@ -76,7 +76,7 @@ Python treats many values as "falsy" in boolean contexts. The following values a
 | `{}` (empty dict) | **NOT falsy in Elixir** | Elixir treats `%{}` as truthy |
 | `set()` (empty set) | **NOT falsy in Elixir** | No direct equivalent |
 
-**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `Py2Ex.Helpers.truthy?/1` helper function where exact Python truthiness is required. See §11 and §13.
+**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `Pylixir.Helpers.truthy?/1` helper function where exact Python truthiness is required. See §11 and §13.
 
 ### 2.7 Python's `and`/`or`/`not` vs Elixir's `and`/`or`/`not`
 

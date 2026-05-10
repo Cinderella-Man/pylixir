@@ -2,9 +2,9 @@
 
 ## §1. Executive Summary
 
-### 1.1 What Is py2ex?
+### 1.1 What Is pylixir?
 
-`py2ex` is an Elixir library that converts Python Abstract Syntax Trees (ASTs) — represented as decoded JSON maps — into working Elixir source code. It is a pure function: map in, string out.
+`pylixir` is an Elixir library that converts Python Abstract Syntax Trees (ASTs) — represented as decoded JSON maps — into working Elixir source code. It is a pure function: map in, string out.
 
 ```elixir
 python_ast = %{
@@ -14,7 +14,7 @@ python_ast = %{
   "right" => %{"_type" => "Constant", "value" => 2}
 }
 
-Py2Ex.to_source(python_ast)
+Pylixir.to_source(python_ast)
 # => "1 + 2"
 ```
 
@@ -54,7 +54,7 @@ Python source code
     → JSON string
     → `Jason.decode!/1` (Elixir)
     → Elixir map (the input to this library)
-    → Py2Ex.to_source/1
+    → Pylixir.to_source/1
     → Elixir source code string
 ```
 
@@ -69,7 +69,7 @@ This library exists to bridge the gap between Python's algorithmic ecosystem and
 
 ### 3.3 What Success Looks Like
 
-A user takes a Python function (e.g., a binary search implementation), runs it through `ast.parse()` + `ast2json`, feeds the resulting JSON to `Py2Ex.to_source/1`, and gets Elixir code that:
+A user takes a Python function (e.g., a binary search implementation), runs it through `ast.parse()` + `ast2json`, feeds the resulting JSON to `Pylixir.to_source/1`, and gets Elixir code that:
 
 1. **Compiles** without errors
 2. **Produces the same results** as the Python original for all valid inputs

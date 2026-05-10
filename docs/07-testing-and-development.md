@@ -14,7 +14,7 @@ test "converts BinOp with Add operator" do
     "op" => %{"_type" => "Add"},
     "right" => %{"_type" => "Constant", "value" => 2}
   }
-  {result, _ctx} = Py2Ex.convert(python_ast, %Py2Ex.Context{scopes: [MapSet.new()]})
+  {result, _ctx} = Pylixir.convert(python_ast, %Pylixir.Context{scopes: [MapSet.new()]})
   assert result == {:+, [], [1, 2]}
 end
 ```
@@ -34,7 +34,7 @@ test "transpiles fibonacci function" do
   print(fib(10))
   """
 
-  elixir_code = Py2Ex.transpile(python_source)
+  elixir_code = Pylixir.transpile(python_source)
   assert {:ok, _} = Code.format_string(elixir_code)
   # Optionally: capture IO and verify output
 end
@@ -63,8 +63,8 @@ Verify that unsupported nodes raise `UnsupportedNodeError` with descriptive mess
 ```elixir
 test "ClassDef raises UnsupportedNodeError" do
   python_ast = %{"_type" => "ClassDef", "name" => "Foo", ...}
-  assert_raise Py2Ex.Errors.UnsupportedNodeError, ~r/ClassDef/, fn ->
-    Py2Ex.convert(python_ast, %Py2Ex.Context{scopes: [MapSet.new()]})
+  assert_raise Pylixir.Errors.UnsupportedNodeError, ~r/ClassDef/, fn ->
+    Pylixir.convert(python_ast, %Pylixir.Context{scopes: [MapSet.new()]})
   end
 end
 ```
@@ -142,10 +142,10 @@ Watch mode: `mix test.watch`
 ## §16. Project Structure
 
 ```
-py2ex/
+pylixir/
 ├── lib/
-│   ├── py2ex.ex                  # Main API (transpile/1, transpile_file/1)
-│   ├── py2ex/
+│   ├── pylixir.ex                  # Main API (transpile/1, transpile_file/1)
+│   ├── pylixir/
 │   │   ├── context.ex            # Context struct definition
 │   │   ├── converter.ex          # Main convert/2 dispatch
 │   │   ├── nodes/
@@ -158,13 +158,13 @@ py2ex/
 │   │   ├── scope.ex              # Scope management utilities
 │   │   ├── formatter.ex          # Elixir code formatting (Code.format_string!/1)
 │   │   └── errors.ex             # UnsupportedNodeError, UndefinedNameError
-│   └── py2ex/
+│   └── pylixir/
 │       └── helpers.ex            # Generated helper functions
 ├── priv/
 │   └── python/
 │       └── serialize.py          # Python AST serialization script
 ├── test/
-│   ├── py2ex_test.exs            # Integration tests
+│   ├── pylixir_test.exs            # Integration tests
 │   ├── nodes/
 │   │   ├── literals_test.exs
 │   │   ├── operators_test.exs

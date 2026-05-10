@@ -5,7 +5,7 @@
 
 ```
 Input map
-  → Py2Ex.Converter.convert/2 (recursive dispatch on "_type", threads context)
+  → Pylixir.Converter.convert/2 (recursive dispatch on "_type", threads context)
   → Elixir AST (tuples)
   → Macro.to_string/1 (→ iodata, NOT a binary!)
   → Code.format_string!/1 (→ iodata, NOT a binary!)
@@ -45,7 +45,7 @@ ast
 The function signature:
 
 ```elixir
-@spec convert(node :: map(), context :: Py2Ex.Context.t()) :: {Macro.t(), Py2Ex.Context.t()}
+@spec convert(node :: map(), context :: Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
 def convert(%{"_type" => type} = node, context) do
   # dispatch to type-specific clause
 end
