@@ -1,5 +1,4 @@
 
-
 ---
 
 ## §1. Executive Summary
@@ -25,6 +24,8 @@ The library does not read files, does not call Python, does not do batch process
 ### 1.2 What "Working, Not Idiomatic" Means
 
 The output is **working, not idiomatic** Elixir. The goal is correctness — code that compiles and produces the same results as the Python original. It will not be pretty. It will use `Enum.reduce` where a human would write `Enum.map`. It will generate helper functions for `while` loops. It will produce `{result}` tuple accumulators for single-variable loops. It is a mechanical translation, not a stylistic one.
+
+Performance characteristics may differ from the Python original (e.g., list indexing with `Enum.at/2` is O(n) rather than O(1)). This is acceptable — the goal is behavioral correctness, not algorithmic complexity preservation.
 
 ### 1.3 Target Use Case
 
@@ -88,12 +89,12 @@ The following are explicitly out of scope. Each includes a brief explanation of 
 | **OOP** | Classes, inheritance, decorators, `@staticmethod`, `@classmethod`, `super()` | No Elixir equivalent; would require a full object system |
 | **Async** | `async def`, `await`, `async for`, `async with` | No direct Elixir equivalent (Elixir uses processes/GenServer, not async/await) |
 | **Imports** | `import`, `from X import Y`, `import X as Z` | Module systems are fundamentally different; would need a mapping table for every Python module |
-| **I/O** | `open()`, `read()`, `write()`, `input()`, file operations | Beyond algorithmic translation scope |
+| **I/O** | `open()`, `read()`, `write()`, file operations | Beyond algorithmic translation scope |
 | **Exceptions** | `try`/`except`/`finally`, `raise` with custom types, exception chaining | While `try`/`rescue` exists in Elixir, mapping Python's exception hierarchy is a separate project |
 | **Generators** | `yield`, `yield from`, generator expressions, `send()`, `throw()` on generators | No direct Elixir equivalent; would require coroutine emulation |
 | **Context managers** | `with` statement, `__enter__`/`__exit__` | No direct Elixir equivalent |
 | **Metaclasses** | `type()`, `__metaclass__`, `__new__` | Deep Python internals with no Elixir parallel |
-| **Standard library** | `os`, `sys`, `json`, `re`, `math` (partial), `collections`, `itertools`, etc. | Would need per-module mapping; only basic builtins are supported |
+| **Standard library** | `os`, `sys`, `json`, `re`, `collections`, `itertools`, etc. | Would need per-module mapping; only basic builtins are supported |
 | **Global/nonlocal** | `global x`, `nonlocal x` | Scope manipulation that doesn't translate |
 | **Delete** | `del x`, `del x[i]` | No Elixir equivalent for mutable deletion |
 | **AnnAssign** | `x: int = 5` (annotated assignment) | Type annotations are not part of Elixir's runtime |
@@ -112,6 +113,8 @@ Self-contained algorithmic code that uses:
 - **Control flow:** `if`/`elif`/`else`, `for` loops, `while` loops, `break`, `continue`, `pass`
 - **Functions:** `def`, `return`, default arguments, `lambda`
 - **Comprehensions:** list comprehensions (with filters)
+- **Slicing:** `x[1:3]`, `x[::-1]`, `x[::2]` and similar slice expressions
+- **Dict iteration:** `dict.items()`, `dict.keys()`, `dict.values()`
 - **Builtins:** `len`, `range`, `abs`, `min`, `max`, `sorted`, `sum`, `enumerate`, `zip`, `int`, `float`, `str`, `print`, `list.append`, `dict.get`, string methods, etc.
 - **Nested functions:** inner `def` converted to anonymous functions
 - **Early returns:** `return` inside `if` blocks (via `try`/`throw`/`catch`)

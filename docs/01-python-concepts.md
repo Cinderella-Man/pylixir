@@ -91,6 +91,8 @@ Elixir's `and`/`or`/`not` **require boolean operands** and raise `BadBooleanErro
 
 **Solution:** The transpiler uses `&&`/`||`/`!` which accept any value in Elixir, matching Python's flexibility (though with Elixir's truthiness model, not Python's).
 
+**`not`/`!` truthiness gap:** Python's `not` uses Python's truthiness: `not 0` → `True`, `not []` → `True`, `not ""` → `True`. Elixir's `!` uses Elixir's truthiness: `!0` → `false`, `![]` → `false`, `!""` → `false`. These disagree on `0`, `[]`, `""`, and `%{}`. When the operand is known to be a non-boolean type where Python and Elixir truthiness diverge, the transpiler should use `!Pylixir.Helpers.truthy?(x)` instead of `!x`. See §11.3.
+
 ### 2.8 Chained Comparisons
 
 Python supports chained comparisons that have no Elixir equivalent:
@@ -111,13 +113,13 @@ Python's `//` operator always floors toward negative infinity:
 Elixir's `div/2` truncates toward zero:
 - `div(-7, 2)` → `-3` (different from Python!)
 
-**Solution:** Use `Integer.floor_div/2` (available since Elixir 1.12.0), which floors toward negative infinity.
+**Solution:** Use `Integer.floor_div/2`, which floors toward negative infinity.
 
 Similarly, Python's `%` uses floored modulo:
 - `-7 % 2` → `1` (Python)
 - `rem(-7, 2)` → `-1` (Elixir `rem/2` — different!)
 
-**Solution:** Use `Integer.mod/2` (available since Elixir 1.12.0).
+**Solution:** Use `Integer.mod/2`.
 
 ### 2.10 Negative Indexing
 
@@ -150,14 +152,21 @@ for i, x in enumerate(["a", "b"]):
 
 Elixir's `Enum.with_index/1` yields `{element, index}` tuples — **the order is swapped**. The transpiler must account for this.
 
+Python's `enumerate` also accepts a `start` argument: `enumerate(items, 1)` starts indexing at 1. Elixir's `Enum.with_index/2` also accepts an offset: `Enum.with_index(items, 1)`.
+
 ### 2.13 The `range` Function
 
 Python's `range` generates integer sequences:
 - `range(5)` → `[0, 1, 2, 3, 4]` (stop is exclusive)
 - `range(2, 5)` → `[2, 3, 4]` (start inclusive, stop exclusive)
 - `range(0, 10, 2)` → `[0, 2, 4, 6, 8]` (with step)
+- `range(10, 0, -1)` → `[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]` (negative step, stop exclusive)
 
-Elixir ranges: `0..4//1`, `2..4//1`, `0..8//2` — stop is **inclusive**. The transpiler must adjust: `range(a, b)` → `a..(b-1)//1`.
+Elixir ranges: `0..4//1`, `2..4//1`, `0..8//2` — stop is **inclusive**. The transpiler must adjust the stop boundary based on the step direction:
+- Positive step: `range(a, b)` → `a..(b-1)//1`
+- Negative step: `range(a, b, -s)` → `a..(b+1)//-s`
+
+See §11.19 for the full conversion rules.
 
 ### 2.14 Python's `in` Operator
 
@@ -221,3 +230,40 @@ my_list.append(5)  # the return value (None) is discarded
 ```
 
 This appears in the AST as an `Expr` node wrapping the expression. The transpiler uses this node to detect mutation methods like `append`, `extend`, `pop`, etc.
+
+### 2.22 Slicing
+
+Python supports extracting sub-sequences with slice notation:
+
+```python
+items[1:3]     # elements at index 1, 2 (stop is exclusive)
+items[:3]      # first 3 elements
+items[2:]      # from index 2 to end
+items[::2]     # every other element
+items[::-1]    # reversed copy
+items[1:5:2]   # elements at index 1, 3
+```
+
+Elixir has no built-in slice syntax. The transpiler maps these to `Enum.slice/2`, `Enum.slice/3`, `Enum.take_every/2`, `Enum.reverse/1`, or combinations thereof. See §11.20 for the full translation table.
+
+### 2.23 Dictionary Iteration Methods
+
+Python dicts have methods for iterating over their contents:
+
+```python
+for k, v in my_dict.items():    # iterate key-value pairs
+for k in my_dict.keys():        # iterate keys (same as `for k in my_dict`)
+for v in my_dict.values():      # iterate values
+```
+
+These are common in algorithmic code (graph traversals, frequency counting, etc.) and map to Elixir's `Map.to_list/1`, `Map.keys/1`, and `Map.values/1`.
+
+### 2.24 String Concatenation with `+`
+
+Python uses `+` to concatenate strings:
+
+```python
+greeting = "hello" + " " + "world"
+```
+
+Elixir uses `<>` for string concatenation. The `+` operator on strings raises `ArithmeticError` in Elixir. The transpiler must detect when `+` is used on string operands and emit `<>` instead. See §11.19.

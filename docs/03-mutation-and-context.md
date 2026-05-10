@@ -14,7 +14,7 @@ Elixir has no mutable variables. Python does. Every Python construct that mutate
 | `x /= n` | `AugAssign(target=Name("x"), op=Div, value=n)` | `x = x / n` |
 | `x //= n` | `AugAssign(target=Name("x"), op=FloorDiv, value=n)` | `x = Integer.floor_div(x, n)` |
 | `x %= n` | `AugAssign(target=Name("x"), op=Mod, value=n)` | `x = Integer.mod(x, n)` |
-| `x **= n` | `AugAssign(target=Name("x"), op=Pow, value=n)` | `x = Integer.pow(x, n)` |
+| `x **= n` | `AugAssign(target=Name("x"), op=Pow, value=n)` | `x = :math.pow(x, n)` (see §11.22) |
 | `x <<= n` | `AugAssign(target=Name("x"), op=LShift, value=n)` | `x = x <<< n` |
 | `x >>= n` | `AugAssign(target=Name("x"), op=RShift, value=n)` | `x = x >>> n` |
 | `x \|= n` | `AugAssign(target=Name("x"), op=BitOr, value=n)` | `x = x \|\|\| n` |
@@ -58,7 +58,19 @@ Python lists and dicts have methods that mutate in place. When called as stateme
 | `my_set.update(items)` | `Expr(value=Call(Attribute(Name("my_set"), "update"), [Name("items")]))` | `my_set = MapSet.union(my_set, MapSet.new(items))` |
 | `my_set.clear()` | `Expr(value=Call(Attribute(Name("my_set"), "clear"), []))` | `my_set = MapSet.new()` |
 
-### 9.5 `del` and `pop` — List Mutation Behavior
+### 9.5 Dictionary Iteration Methods
+
+Python dicts have methods that return views over their contents. These are commonly used as iterators in `for` loops:
+
+| Python Method | Elixir Translation |
+|---|---|
+| `my_dict.items()` | `Map.to_list(my_dict)` (returns `[{key, value}, ...]`) |
+| `my_dict.keys()` | `Map.keys(my_dict)` |
+| `my_dict.values()` | `Map.values(my_dict)` |
+
+**Note on `items()` tuple order:** Python's `dict.items()` yields `(key, value)` tuples. Elixir's `Map.to_list/1` also returns `{key, value}` tuples. The order matches, so no swapping is needed (unlike `enumerate`).
+
+### 9.6 `del` and `pop` — List Mutation Behavior
 
 **`del` statement is unsupported** (`raise UnsupportedNodeError`). However, `del` can be worked around by using `pop()` instead:
 
@@ -79,7 +91,7 @@ removed = Enum.at(my_list, 2)
 my_list = List.delete_at(my_list, 2)
 ```
 
-### 9.6 Elixir's `&&`/`||`/`!` vs `and`/`or`/`not`
+### 9.7 Elixir's `&&`/`||`/`!` vs `and`/`or`/`not`
 
 When converting Python's `and`/`or`/`not` to Elixir, use `&&`/`||`/`!`, NOT `and`/`or`/`not`.
 
@@ -91,7 +103,7 @@ When converting Python's `and`/`or`/`not` to Elixir, use `&&`/`||`/`!`, NOT `and
 | `a or b` | `a \|\| b` | `a or b` ← crashes if `a` is not boolean |
 | `not a` | `!a` | `not a` ← crashes if `a` is not boolean |
 
-### 9.7 `Enum.at/2` for Index Access
+### 9.8 `Enum.at/2` for Index Access
 
 Python uses `my_list[i]` for indexing. Elixir uses `Enum.at(list, index)`. However, `Enum.at/2` does **not** support assignment (Elixir is immutable). For mutation at an index:
 
@@ -103,7 +115,7 @@ my_list[i] = new_value
 my_list = List.replace_at(my_list, i, new_value)
 ```
 
-### 9.8 The `in` Operator
+### 9.9 The `in` Operator
 
 Python's `in` operator checks membership in any collection. The Elixir translation depends on the collection type:
 
@@ -125,7 +137,7 @@ The `Compare` node handler must inspect the comparator to determine which transl
 # Elixir: !(x in items)
 ```
 
-### 9.9 The `len()` Function
+### 9.10 The `len()` Function
 
 Python's `len()` works on lists, tuples, dicts, sets, and strings. The Elixir translation depends on the type:
 
@@ -139,44 +151,13 @@ Python's `len()` works on lists, tuples, dicts, sets, and strings. The Elixir tr
 
 If the type is unknown, `length/1` is the default (works for lists). For strings, `length/1` returns the number of bytes (wrong for UTF-8!), so `String.length/1` is needed.
 
-### 9.10 `type()` Function
+### 9.11 `not` Operator
 
-Python's `type(x)` returns the type of a value. For type-checking patterns:
-
-```python
-if type(x) == int:
-    ...
-if type(x) == list:
-    ...
-if type(x) == str:
-    ...
-```
-
-The translation depends on the type being checked:
-
-| Python | Elixir |
-|---|---|
-| `type(x) == int` | `is_integer(x)` |
-| `type(x) == float` | `is_float(x)` |
-| `type(x) == str` | `is_binary(x)` |
-| `type(x) == bool` | `is_boolean(x)` |
-| `type(x) == list` | `is_list(x)` |
-| `type(x) == dict` | `is_map(x)` |
-| `type(x) == type(None)` | `x == nil` |
-
-### 9.11 `isinstance()` Function
+Python's `not` produces a boolean (`True`/`False`). Elixir's `!` also produces a boolean. However, their truthiness models differ: `not 0` → `True` in Python, `!0` → `false` in Elixir (because `0` is truthy in Elixir). When the operand might be `0`, `""`, `[]`, or `%{}`, use `!Pylixir.Helpers.truthy?(x)` instead of `!x`. See §11.3.
 
 ```python
-isinstance(x, int)     → is_integer(x)
-isinstance(x, (int, float)) → is_number(x)
-```
-
-### 9.12 `not` Operator
-
-Python's `not` produces a boolean (`True`/`False`). Elixir's `!` preserves truthiness semantics (returns `false` for falsy, `true` for truthy). This is close enough for most algorithmic code.
-
-```python
-not x    →    !x
+not x    →    !x          # safe when x is known to be boolean, nil, or non-empty
+not x    →    !truthy?(x) # needed when x could be 0, "", [], or %{}
 ```
 
 ---
@@ -193,15 +174,13 @@ defmodule Pylixir.Context do
   defstruct scopes: [],
             while_counter: 0,
             loop_nesting: 0,
-            pending_helpers: [],
-            uses_bitwise: false
+            pending_helpers: []
 
   @type t :: %__MODULE__{
     scopes: [MapSet.t(String.t())],
     while_counter: non_neg_integer(),
     loop_nesting: non_neg_integer(),
-    pending_helpers: [Macro.t()],
-    uses_bitwise: boolean()
+    pending_helpers: [Macro.t()]
   }
 end
 ```
@@ -214,7 +193,7 @@ A stack of `MapSet`s, where each `MapSet` contains the variable names bound in t
 
 **Purpose:** Track which variables are bound at each scope level to:
 1. Avoid generating conflicting variable names (e.g., when a comprehension uses `x` that shadows an outer `x`)
-2. Know which variables need to be threaded through loop accumulators
+2. Know which variables need to be threaded through loop accumulators (see §13.14)
 3. Generate correct `defp` signatures for helper functions
 
 **Operations:**
@@ -246,7 +225,3 @@ Tracks how many nested loops deep we are. This determines the return strategy fo
 #### `pending_helpers` — Deferred Helper Emission
 
 When a `While` loop is encountered, its helper function AST is appended to `pending_helpers`. At the `Module` level, these helpers are prepended to the module body.
-
-#### `uses_bitwise` — Bitwise Import Detection
-
-Set to `true` when any bitwise operator node is encountered. At `Module` level, if `true`, prepend `import Bitwise` to the generated code.

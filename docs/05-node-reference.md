@@ -52,6 +52,9 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 ```elixir
 # Python: a + b
 # Elixir: {:+, [], [a, b]}
+
+# Python: "hello" + " world"  (string concatenation — see §11.19)
+# Elixir: {:<>, [], ["hello", " world"]}
 ```
 
 **`UnaryOp`** — unary operations.
@@ -73,7 +76,7 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 # Elixir: {:||, [], [a, b]}
 ```
 
-**CRITICAL:** Use `&&`/`||`, NOT `and`/`or`. See §9.6 and §11.3.
+**CRITICAL:** Use `&&`/`||`, NOT `and`/`or`. See §9.7 and §11.3.
 
 **`Compare`** — comparison operations. Supports chaining.
 
@@ -90,6 +93,9 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 
 # Python: x not in items
 # Elixir: {:!, [], [{:in, [], [x, items]}]}
+
+# Python: x is None
+# Elixir: {:==, [], [x, nil]}
 ```
 
 **`Call`** — function calls. `func` can be a `Name` (local call) or `Attribute` (remote call).
@@ -116,19 +122,21 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 **`Subscript`** — indexing and slicing.
 
 ```elixir
-# Python: x[i]
-# Elixir: {{:., [], [{:__aliases__, [], [:Access]}, :get]}, [], [x, i]}
-# OR (better for generated code):
-# Enum.at(x, i)  — for lists
-# Map.get(x, i)  — for maps/dicts
+# Python: x[i]  (simple index)
+# Elixir: Enum.at(x, i)  — for lists
+#         Map.get(x, i)   — for maps/dicts
+
+# Python: x[1:3]  (slice — Subscript.slice is a Slice node)
+# Elixir: Enum.slice(x, 1..2)
+# See §11.20 for full slice translation table
 ```
 
 **`Attribute`** — attribute access.
 
 ```elixir
 # Python: obj.attr
-# Elixir: {:obj, [], nil}.attr  → this doesn't work in Elixir AST
 # The Attribute node is typically part of a Call: obj.method(args) → Module.function(obj, args)
+# For dict methods: d.items() → Map.to_list(d), d.keys() → Map.keys(d), d.values() → Map.values(d)
 ```
 
 **`ListComp`** — list comprehensions.
@@ -182,7 +190,8 @@ For multiple generators, each generator becomes a `<-` clause:
 # AST: {:=, [], [{:x, [], nil}, 5]}
 
 # Python: a = b = 5  (multiple targets)
-# Elixir: a = 5; b = 5
+# Elixir: temp = 5; a = temp; b = temp
+# (For simple literals, can be simplified to: a = 5; b = 5)
 ```
 
 **`AugAssign`** — augmented assignment.
@@ -200,7 +209,7 @@ For multiple generators, each generator becomes a `<-` clause:
 # Elixir: value  (last expression in function body)
 ```
 
-If the function has early returns (non-tail `return`), the converter emits `try`/`throw`/`catch`. See §11.19 for details.
+If the function has early returns (non-tail `return`), the converter emits `try`/`throw`/`catch`. See §13.13 for details.
 
 **`Expr`** — expression used as statement (e.g., function calls whose return value is discarded).
 
@@ -223,46 +232,31 @@ When the wrapped expression is a mutation method call (e.g., `list.append(x)`), 
 
 **`For`** — for loop.
 
-```elixir
-# Python: for x in items: body
-# Elixir: for x <- items do body end
-
-# Python: for x in range(n): body
-# Elixir: for x <- Enum.to_list(0..n-1) do body end
-# OR: for x <- 0..(n-1) do body end
-```
-
-**`While`** — while loop. Uses `try`/`throw`/`catch` pattern with a recursive helper.
+The translation depends on whether the loop body mutates variables defined outside the loop. See §13.14 for the full accumulator detection strategy.
 
 ```elixir
+# Case 1: No external mutation (pure side effects like print, or building a new list)
+# Python: for x in items: print(x)
+# Elixir: Enum.each(items, fn x -> IO.puts(to_string(x)) end)
+
+# Case 2: External mutation (loop body modifies variables from outer scope)
 # Python:
-# while condition:
-#     body
-#     if break_cond: break
-#     if continue_cond: continue
-#     post_check
-# else:
-#     else_body  ← UNSUPPORTED (raises UnsupportedNodeError if non-empty)
+#   total = 0
+#   for x in items:
+#       total += x
+# Elixir:
+#   total = Enum.reduce(items, 0, fn x, total -> total + x end)
 
-# Elixir (using try/throw/catch for break):
-# defp while_0 do
-#   if condition do
-#     body
-#     if break_cond, do: throw(:break)
-#     if continue_cond, do: while_0()  # skip to next iteration
-#     post_check
-#     while_0()  # loop back
-#   end
-# end
-#
-# try do
-#   while_0()
-# catch
-#   :break -> :ok
-# end
+# Case 3: Iterating with range
+# Python: for x in range(n): body
+# Elixir: Enum.reduce(0..(n-1), acc, fn x, acc -> ... end)
 ```
 
-**Important:** The helper function body must call itself recursively to loop. `continue` is implemented by returning early from the current iteration (calling the helper again before executing remaining statements). `break` is implemented by throwing `:break`. The enclosing `try`/`catch` catches the throw.
+**`While`** — while loop. Uses recursive helper function with `try`/`throw`/`catch` for break.
+
+```elixir
+# See §13.7 for the full while loop translation pattern
+```
 
 **`Pass`** — no-op statement. Produces nothing (empty AST or `nil`).
 
@@ -319,7 +313,7 @@ The following node types raise `UnsupportedNodeError`:
 | **Formatted strings** | `FormattedValue`, `JoinedStr`, `TemplateStr`, `Interpolation` |
 | **Other expressions** | `NamedExpr` (walrus operator `:=`), `Starred` (in assignment targets) |
 | **Other statements** | `Delete`, `AnnAssign`, `TypeAlias` |
-| **Pattern matching** | `Match` |
+| **Pattern matching** | `Match`, `match_case` |
 | **Loop else** | `For.orelse`, `While.orelse` (when non-empty) |
 | **Complex/bytes** | `Constant` with `complex` or `bytes` value |
 
@@ -329,32 +323,48 @@ The following node types raise `UnsupportedNodeError`:
 
 | Python Builtin | Elixir Equivalent |
 |---|---|
-| `len(x)` | `length(x)` (lists), `map_size(x)` (dicts), `tuple_size(x)` (tuples) |
-| `range(n)` | `Enum.to_list(0..(n-1))` or `0..(n-1)` |
-| `range(start, stop)` | `Enum.to_list(start..(stop-1))` |
-| `range(start, stop, step)` | `Enum.to_list(start..(stop-1)//step)` |
+| `len(x)` | `length(x)` (lists), `map_size(x)` (dicts), `tuple_size(x)` (tuples), `String.length(x)` (strings) |
+| `range(n)` | `0..(n-1)//1` |
+| `range(start, stop)` | `start..(stop-1)//1` |
+| `range(start, stop, step)` | See §11.21 for step-direction-dependent formula |
 | `sorted(x)` | `Enum.sort(x)` |
+| `sorted(x, reverse=True)` | `Enum.sort(x, :desc)` |
 | `sorted(x, key=f)` | `Enum.sort_by(x, f)` |
 | `sorted(x, key=f, reverse=True)` | `Enum.sort_by(x, f, :desc)` |
 | `reversed(x)` | `Enum.reverse(x)` |
 | `enumerate(x)` | `Enum.with_index(x)` — NOTE: tuple order is swapped! See §11.7 |
+| `enumerate(x, start)` | `Enum.with_index(x, start)` — NOTE: tuple order is still swapped |
 | `zip(a, b)` | `Enum.zip([a, b])` |
 | `map(f, x)` | `Enum.map(x, f)` |
 | `filter(f, x)` | `Enum.filter(x, f)` |
 | `sum(x)` | `Enum.sum(x)` |
 | `min(a, b)` | `min(a, b)` |
+| `min(iterable)` | `Enum.min(iterable)` |
 | `max(a, b)` | `max(a, b)` |
+| `max(iterable)` | `Enum.max(iterable)` |
 | `abs(x)` | `abs(x)` |
-| `int(x)` | `trunc(x)` or `String.to_integer(x)` |
-| `float(x)` | `x / 1` or `String.to_float(x)` |
+| `int(x)` | `trunc(x)` (for numbers) or `String.to_integer(x)` (for strings) |
+| `int(x, base)` | `String.to_integer(x, base)` |
+| `float(x)` | `x / 1` (for integers) or `String.to_float(x)` (for strings) |
 | `str(x)` | `to_string(x)` |
 | `bool(x)` | `!!x` |
 | `list(x)` | `Enum.to_list(x)` |
 | `tuple(x)` | `List.to_tuple(Enum.to_list(x))` |
 | `set(x)` | `MapSet.new(Enum.to_list(x))` |
 | `dict(x)` | `Map.new(Enum.to_list(x))` |
-| `type(x)` | See §9.10 |
-| `isinstance(x, t)` | See §9.11 |
+| `type(x) == int` | `is_integer(x)` |
+| `type(x) == float` | `is_float(x)` |
+| `type(x) == str` | `is_binary(x)` |
+| `type(x) == bool` | `is_boolean(x)` |
+| `type(x) == list` | `is_list(x)` |
+| `type(x) == dict` | `is_map(x)` |
+| `isinstance(x, int)` | `is_integer(x)` |
+| `isinstance(x, float)` | `is_float(x)` |
+| `isinstance(x, str)` | `is_binary(x)` |
+| `isinstance(x, bool)` | `is_boolean(x)` |
+| `isinstance(x, list)` | `is_list(x)` |
+| `isinstance(x, dict)` | `is_map(x)` |
+| `isinstance(x, (int, float))` | `is_number(x)` |
 | `print(x)` | `IO.puts(to_string(x))` |
 | `print(a, b, c)` | `IO.puts(Enum.join([to_string(a), to_string(b), to_string(c)], " "))` |
 | `input()` | `IO.gets("") \|> String.trim_trailing("\n")` |
@@ -364,12 +374,6 @@ The following node types raise `UnsupportedNodeError`:
 | `hex(n)` | `"0x" <> Integer.to_string(n, 16)` |
 | `oct(n)` | `"0o" <> Integer.to_string(n, 8)` |
 | `bin(n)` | `"0b" <> Integer.to_string(n, 2)` |
-| `isinstance(x, int)` | `is_integer(x)` |
-| `isinstance(x, float)` | `is_float(x)` |
-| `isinstance(x, str)` | `is_binary(x)` |
-| `isinstance(x, bool)` | `is_boolean(x)` |
-| `isinstance(x, list)` | `is_list(x)` |
-| `isinstance(x, dict)` | `is_map(x)` |
 | `math.ceil(x)` | `ceil(x)` |
 | `math.floor(x)` | `floor(x)` |
 | `math.sqrt(x)` | `:math.sqrt(x)` |
@@ -381,6 +385,20 @@ The following node types raise `UnsupportedNodeError`:
 | `math.pi` | `:math.pi()` |
 | `math.e` | `:math.exp(1)` |
 | `math.inf` | `:infinity` |
+
+**`min`/`max` dispatch rule:** Python's `min` and `max` accept either two arguments (`min(a, b)`) or a single iterable (`min([1, 2, 3])`). The converter must check argument count: one argument → `Enum.min/1` or `Enum.max/1`; two or more arguments → Elixir's built-in `min/2` or `max/2`.
+
+#### Dictionary Methods (Non-Mutating)
+
+These are called as expressions (not statements) and return values:
+
+| Python | Elixir |
+|---|---|
+| `d.items()` | `Map.to_list(d)` |
+| `d.keys()` | `Map.keys(d)` |
+| `d.values()` | `Map.values(d)` |
+| `d.get(key)` | `Map.get(d, key)` |
+| `d.get(key, default)` | `Map.get(d, key, default)` |
 
 #### Builtins That Raise `UnsupportedNodeError`
 

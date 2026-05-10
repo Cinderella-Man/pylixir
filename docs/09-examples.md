@@ -122,6 +122,8 @@ while count < 5:
 
 ```elixir
 defmodule TranslatedCode do
+  import Bitwise
+
   defp while_0(count) do
     if count < 5 do
       count = count + 1
@@ -150,7 +152,7 @@ end
 TranslatedCode.run()
 ```
 
-> **Design note:** Each `while` loop becomes a private function that threads mutable state via its arguments (see §13.7). `continue` is implemented by recursing immediately with the current state, skipping the remaining body. `break` throws a `:break` tag caught by the enclosing `try`. No `Agent` or process-based state is needed.
+> **Design note:** Each `while` loop becomes a private function that threads mutable state via its arguments (see §13.7). `continue` is implemented by recursing immediately with the current state, skipping the remaining body. `break` throws a `:break` tag caught by the enclosing `try`. No process-based state is needed.
 
 **Console Output:**
 
@@ -159,6 +161,56 @@ TranslatedCode.run()
 2
 4
 ```
+
+### 18.3 For Loop with Accumulator Example
+
+**Python Input:**
+
+```python
+def sum_evens(items):
+    total = 0
+    count = 0
+    for x in items:
+        if x % 2 == 0:
+            total += x
+            count += 1
+    return total, count
+
+result = sum_evens([1, 2, 3, 4, 5, 6])
+print(result)
+```
+
+**Elixir Output:**
+
+```elixir
+defmodule TranslatedCode do
+  import Bitwise
+
+  defp sum_evens(items) do
+    total = 0
+    count = 0
+    {total, count} = Enum.reduce(items, {total, count}, fn x, {total, count} ->
+      if Integer.mod(x, 2) == 0 do
+        total = total + x
+        count = count + 1
+        {total, count}
+      else
+        {total, count}
+      end
+    end)
+    {total, count}
+  end
+
+  def run do
+    result = sum_evens([1, 2, 3, 4, 5, 6])
+    IO.puts(to_string(result))
+  end
+end
+
+TranslatedCode.run()
+```
+
+> **Design note:** The `for` loop mutates `total` and `count` from the outer scope, so the converter uses `Enum.reduce/3` with a tuple accumulator `{total, count}`. The accumulator is destructured after the reduce. See §13.4 for the detection strategy.
 
 ---
 
@@ -188,15 +240,13 @@ print(result)
 
 ```elixir
 defmodule TranslatedCode do
+  import Bitwise
+
   defp binary_search(arr, target) do
     try do
       left = 0
       right = length(arr) - 1
-      try do
-        while_0(arr, target, left, right)
-      catch
-        {:return, result} -> result
-      end
+      while_0(arr, target, left, right)
     catch
       {:return, result} -> result
     end
@@ -213,6 +263,8 @@ defmodule TranslatedCode do
         true ->
           while_0(arr, target, left, mid - 1)
       end
+    else
+      throw({:return, -1})
     end
   end
 
@@ -233,7 +285,8 @@ TranslatedCode.run()
 
 **Key translation decisions in this example:**
 1. `(left + right) // 2` → `Integer.floor_div(left + right, 2)` (not `div/2` — see §11.1)
-2. `arr[mid]` → `Enum.at(arr, mid)` (list indexing)
+2. `arr[mid]` → `Enum.at(arr, mid)` (list indexing — O(n) per access, see §11.8)
 3. `elif`/`else` → `cond` block (see §13.11)
-4. `return` inside `while` → `throw({:return, value})` + `try`/`catch` (see §13.13)
-5. `while` loop → recursive helper function with `try`/`catch` for `break`
+4. `return` inside `while` → `throw({:return, value})` + `try`/`catch` at the function level (see §13.13)
+5. `while` loop → recursive helper function threading state as arguments
+6. The `try`/`catch` wraps the entire function body — one layer handles both `return` from the loop and the default return after the loop. The `else` branch of the while condition throws `{:return, -1}` for the "not found" case.

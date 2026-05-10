@@ -263,6 +263,9 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 
 # Python: x[::2]
 # Subscript.slice = %{"_type" => "Slice", "lower" => nil, "upper" => nil, "step" => Constant(2)}
+
+# Python: x[::-1]
+# Subscript.slice = %{"_type" => "Slice", "lower" => nil, "upper" => nil, "step" => Constant(-1)}
 ```
 
 **`Lambda(args: arguments, body: expr)`** — An anonymous function. `args` uses the same `arguments` node as `FunctionDef`. `body` is a **single expression** (not a statement list like `FunctionDef`).
@@ -330,7 +333,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 }
 ```
 
-**Conversion for multiple targets:** Python evaluates the value once, then assigns to each target **left-to-right**. `a = b = 5` → `a = 5; b = 5`. Both targets receive the same value. For simple values the order is irrelevant, but for expressions with side effects (e.g., subscript targets involving function calls), left-to-right evaluation order matters. The generated Elixir should assign the evaluated value to each target in left-to-right order.
+**Conversion for multiple targets:** Python evaluates the value once, then assigns to each target **left-to-right**. `a = b = 5` → `temp = 5; a = temp; b = temp`. For simple literal values this can be simplified to `a = 5; b = 5`, but when the value is a complex expression or function call, it must be evaluated once into a temporary variable first to preserve semantics.
 
 **`AugAssign(target: expr, op: operator, value: expr)`** — Augmented assignment (e.g., `a += 1`). `target` is a **single** node (unlike `Assign`). `op` is the operator (e.g., `Add`). `value` is the right-hand side.
 
@@ -440,7 +443,7 @@ The Python AST format is not stable across versions. While this library targets 
 
 Note: `MatMult`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` are listed for completeness but may raise `UnsupportedNodeError` initially. Most algorithmic code does not use matrix multiplication or bitwise shifts (though `BitAnd`, `BitOr`, `BitXor` do appear in some problems).
 
-**IMPORTANT — Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `use Bitwise` or `import Bitwise`. The code generator must detect when any bitwise operator is used and emit `import Bitwise` at the top of the generated code. Without this, generated code using bitwise operators will fail to compile. Detection: set `context.uses_bitwise = true` when any bitwise operator node is encountered; at `Module` level, if the flag is true, prepend `import Bitwise` to the output.
+**Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `use Bitwise` or `import Bitwise`. The code generator should unconditionally emit `import Bitwise` at the top of the generated module. This is a no-op when no bitwise operators are used, and avoids the need to track usage through the context struct.
 
 #### Expressions (~12 nodes)
 `BinOp`, `UnaryOp`, `Compare`, `BoolOp`, `Call`, `IfExp`, `Subscript`, `Attribute`, `ListComp`, `Lambda`, `Slice`, `Starred` (in function call arguments only — `*args` unpacking)
@@ -455,7 +458,7 @@ Note: `MatMult`, `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` a
 
 ### 7.2 Explicitly Unsupported (raises `UnsupportedNodeError`)
 
-`ClassDef`, `AsyncFunctionDef`, `AsyncFor`, `AsyncWith`, `Import`, `ImportFrom`, `Try`, `TryStar`, `ExceptHandler`, `With`, `Raise`, `Global`, `Nonlocal`, `Yield`, `YieldFrom`, `Await`, `Match`, `Delete`, `AnnAssign`, `TypeAlias`, `GeneratorExp`, `SetComp`, `DictComp`, `FormattedValue`, `JoinedStr`, `TemplateStr`, `Interpolation`, `Set`, `NamedExpr`, `Starred` (in assignment target unpacking — `a, *b = ...`)
+`ClassDef`, `AsyncFunctionDef`, `AsyncFor`, `AsyncWith`, `Import`, `ImportFrom`, `Try`, `TryStar`, `ExceptHandler`, `With`, `Raise`, `Global`, `Nonlocal`, `Yield`, `YieldFrom`, `Await`, `Match`, `match_case`, `Delete`, `AnnAssign`, `TypeAlias`, `GeneratorExp`, `SetComp`, `DictComp`, `FormattedValue`, `JoinedStr`, `TemplateStr`, `Interpolation`, `Set`, `NamedExpr`, `Starred` (in assignment target unpacking — `a, *b = ...`)
 
 **`GeneratorExp` interaction with builtins:** Note that `GeneratorExp` is common inside calls to mapped builtins: `sum(x**2 for x in items)`, `max(abs(x) for x in items)`, `min(len(s) for s in strings)`. These will crash on the `GeneratorExp` child node even though `sum`/`max`/`min` are in the builtins table. An implementer encountering this pattern should either (a) special-case `Call` nodes where the argument is a `GeneratorExp` and the function is a known builtin (converting to `Enum.sum(Enum.map(items, fn x -> x ** 2 end))` or a `for` comprehension), or (b) raise `UnsupportedNodeError` with a clear message like "GeneratorExp inside sum() — consider rewriting as a list comprehension."
 
@@ -556,6 +559,11 @@ Source: `a || b` → `{:||, [], [a_ast, b_ast]}`
 Source: `!a`     → `{:!, [], [a_ast]}`
 
 **CRITICAL: Use `&&`/`||`/`!`, NOT `and`/`or`/`not`.** Elixir's `and`/`or`/`not` are strict boolean operators that raise `BadBooleanError` on non-boolean values (like `0`, `""`, `[]`). Python's `and`/`or`/`not` accept any value. Since `&&`/`||`/`!` accept any truthy/falsy value in Elixir, they're the correct mapping.
+
+#### String concatenation
+Source: `a <> b` → `{:<>, [], [a_ast, b_ast]}`
+
+This is used when the `BinOp` `Add` operator is applied to string operands. See §11.19.
 
 #### Bitwise (requires `import Bitwise`)
 Source: `a <<< b` → `{:<<<, [], [a_ast, b_ast]}`
