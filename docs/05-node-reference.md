@@ -136,12 +136,16 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 # See §11.21 for full slice translation table
 ```
 
-**Note on `Subscript` dispatch:** When the `Subscript.slice` is a `Slice` node, always use the slice translation table (§11.21). When it is a simple expression (integer index or key), the converter uses `Enum.at/2` for lists and `Map.fetch!/2` for dicts. Since the transpiler does not track types, it uses a runtime-dispatching helper:
+**Note on `Subscript` dispatch:** When the `Subscript.slice` is a `Slice` node, always use the slice translation table (§11.21). When it is a simple expression (integer index or key), the converter uses `Enum.at/2` for lists, `String.at/2` for strings, and `Map.fetch!/2` for dicts. Since the transpiler does not track types, it uses a runtime-dispatching helper:
 
 ```elixir
 defp py_getitem(collection, key) when is_list(collection), do: Enum.at(collection, key)
+defp py_getitem(collection, key) when is_binary(collection), do: String.at(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, key)
 defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
 ```
+
+**Note on MapSet:** `MapSet` is a struct (map), so the `is_map` clause would match MapSets. This is acceptable because `MapSet` does not support subscript access in Python (sets are not subscriptable), so this case should not arise in valid translated code.
 
 **`Attribute`** — attribute access.
 
@@ -344,9 +348,12 @@ The following node types raise `UnsupportedNodeError`:
 | `range(start, stop)` | `start..(stop-1)//1` |
 | `range(start, stop, step)` | See §11.22 for step-direction-dependent formula |
 | `sorted(x)` | `Enum.sort(x)` |
-| `sorted(x, reverse=True)` | `Enum.sort(x, :desc)` — **requires Elixir 1.13+**; for older versions use `Enum.sort(x) \|> Enum.reverse()` |
+| `sorted(x, reverse=True)` | `Enum.sort(x, :desc)` — **requires Elixir 1.10+**; for older versions use `Enum.sort(x) \|> Enum.reverse()` |
 | `sorted(x, key=f)` | `Enum.sort_by(x, f)` |
-| `sorted(x, key=f, reverse=True)` | `Enum.sort_by(x, f, :desc)` — **requires Elixir 1.13+**; for older versions use `Enum.sort_by(x, f) \|> Enum.reverse()` |
+| `sorted(x, key=f, reverse=True)` | `Enum.sort_by(x, f, :desc)` — **requires Elixir 1.10+**; for older versions use `Enum.sort_by(x, f) \|> Enum.reverse()` |
+
+**`sorted` keyword argument detection:** The `key` and `reverse` arguments appear as `keyword` nodes in the AST's `Call.keywords` list. The converter must inspect `keywords` for entries with `arg: "key"` and `arg: "reverse"`. When `reverse` is present and its `value` is `Constant(value=true)`, use `:desc`. When `key` is present, switch from `Enum.sort` to `Enum.sort_by`. When both are present, use `Enum.sort_by(x, f, :desc)`.
+
 | `reversed(x)` | `Enum.reverse(x)` |
 | `enumerate(x)` | `Enum.with_index(x)` — NOTE: tuple order is swapped! See §11.7 |
 | `enumerate(x, start)` | `Enum.with_index(x, start)` — NOTE: tuple order is still swapped |
@@ -362,7 +369,8 @@ The following node types raise `UnsupportedNodeError`:
 | `int()` | `0` (no arguments — Python returns 0) |
 | `int(x)` | `trunc(x)` (for numbers) or `String.to_integer(x)` (for strings) — use runtime dispatch |
 | `int(x, base)` | `String.to_integer(x, base)` |
-| `float(x)` | `x / 1` (for integers) or `String.to_float(x)` (for strings) |
+| `float()` | `0.0` (no arguments — Python returns 0.0) |
+| `float(x)` | `x / 1` (for integers) or `String.to_float(x)` (for strings) — use runtime dispatch |
 | `str(x)` | `to_string(x)` |
 | `bool(x)` | `Pylixir.Helpers.truthy?(x)` |
 | `list(x)` | `Enum.to_list(x)` |

@@ -285,7 +285,7 @@ This is a `BinOp` with `Mult` operator, where one operand is a string/list and t
 Elixir equivalents:
 - `String.duplicate("abc", 3)` for strings
 - `List.duplicate(0, 10)` for single-element list repetition like `[0] * 10`
-- `List.flatten(List.duplicate([1, 2], 3))` for multi-element list repetition
+- `List.duplicate([1, 2], 3) |> Enum.concat()` for multi-element list repetition
 
 See §11.23 and §11.24 for the full translation rules.
 

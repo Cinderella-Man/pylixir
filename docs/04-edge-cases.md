@@ -17,6 +17,8 @@
 
 **Failure mode:** Silent wrong answer. No compilation error, no runtime crash. The sign of the result is wrong for negative dividends.
 
+**Limitation — float operands:** Python's `//` and `%` also work on floats: `7.5 // 2.0` → `3.0`, `-7.5 % 2.0` → `0.5`. `Integer.floor_div/2` and `Integer.mod/2` only accept integers and will raise `ArithmeticError` on floats. For the MVP, document this as a known limitation. A future version could use runtime dispatch: `if is_float(a) or is_float(b), do: :math.floor(a / b)` for float floor division.
+
 ### 11.2 Integer Modulo (`%`)
 
 **Problem:** Python's `%` uses floored modulo. Elixir's `rem/2` uses truncated remainder.
@@ -352,12 +354,13 @@ result = str(count) + " items found"   # "5 items found"
 
 ```elixir
 defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
 defp py_add(a, b), do: a + b
 ```
 
-All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids the complexity of tracking string types through the context struct. The `py_add` helper is unconditionally included in the generated module (it's a no-op if never called).
+This handles both string concatenation (`"hello" + " world"`) and list concatenation (`[1, 2] + [3, 4]` → `[1, 2, 3, 4]`), which are both valid uses of `+` in Python. All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids the complexity of tracking string types through the context struct. The `py_add` helper is unconditionally included in the generated module (it's a no-op if never called).
 
-**Optimization (optional):** When both operands are string `Constant` nodes, the converter can emit `<>` directly without the helper. This is a minor code-quality improvement, not a correctness requirement.
+See §11.24 for the extended version of `py_add` that also handles boolean operands.
 
 ### 11.20 String and List Repetition with `*` (Critical)
 
@@ -372,7 +375,7 @@ All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids
 # WRONG: "abc" * 3  → ArithmeticError
 # CORRECT:
 String.duplicate("abc", 3)             # "abcabcabc"
-List.duplicate([1, 2], 3) |> List.flatten()  # [1, 2, 1, 2, 1, 2]
+List.duplicate([1, 2], 3) |> Enum.concat()  # [1, 2, 1, 2, 1, 2]
 ```
 
 **Solution — runtime `py_mult/2` helper:**
@@ -380,18 +383,20 @@ List.duplicate([1, 2], 3) |> List.flatten()  # [1, 2, 1, 2, 1, 2]
 ```elixir
 defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
 defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
-defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, 1) |> List.flatten() |> Stream.cycle() |> Enum.take(length(a) * b)
+defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
 defp py_mult(a, b) when is_integer(a) and is_list(b), do: py_mult(b, a)
 defp py_mult(a, b), do: a * b
 ```
 
-**Simpler list repetition alternative:** For the MVP, a cleaner list repetition is:
+**CRITICAL: Use `Enum.concat/1`, NOT `List.flatten/1`.** `Enum.concat/1` flattens exactly one level of nesting, which is correct. `List.flatten/1` recursively flattens ALL levels, which would corrupt nested list repetition:
 
 ```elixir
-defp py_mult(a, b) when is_list(a) and is_integer(b) do
-  Enum.flat_map(1..b, fn _ -> a end)
-end
+# Python: [[1, 2]] * 3  →  [[1, 2], [1, 2], [1, 2]]
+List.duplicate([[1, 2]], 3) |> Enum.concat()     # [[1, 2], [1, 2], [1, 2]] ✓
+List.duplicate([[1, 2]], 3) |> List.flatten()     # [1, 2, 1, 2, 1, 2] ✗ WRONG
 ```
+
+**Static optimization (optional):** When the AST shows a single-element list literal like `[0] * n`, the converter can emit `List.duplicate(0, n)` directly (unwrapping the element), which is cleaner and avoids the `Enum.concat` step. This is common in competitive programming for initializing arrays (`dp = [0] * n`, `visited = [False] * n`).
 
 ### 11.21 Slicing
 
@@ -415,12 +420,15 @@ items[1:5:2]    # elements at index 1, 3
 | `x[a:]` (to end) | `Enum.drop(x, a)` |
 | `x[:]` (full copy) | `x` (Elixir data is immutable, no copy needed) |
 | `x[::n]` (every n-th, positive) | `Enum.take_every(x, n)` |
+| `x[a::n]` (from offset, every n-th) | `Enum.drop(x, a) \|> Enum.take_every(n)` |
 | `x[::-1]` (reverse) | `Enum.reverse(x)` |
 | `x[a:b:n]` (general step) | `Enum.slice(x, a..(b-1)) \|> Enum.take_every(n)` |
 
 **Negative indices in slices:** Python slices support negative indices. `x[-3:]` means "last 3 elements." Elixir's `Enum.slice/2` supports negative indices in ranges, so `Enum.slice(x, -3..-1)` works.
 
 **String slicing:** Python strings support the same slice syntax. For string operands, use `String.slice/2` and `String.slice/3` instead of `Enum.slice`. `s[::-1]` → `String.reverse(s)`.
+
+**String character access:** Python's `s[i]` on a string returns a single-character string. This must use `String.at(s, i)` in Elixir, NOT `Enum.at/2` (which would iterate over bytes/graphemes incorrectly). Since the transpiler does not track types, the `py_getitem` runtime helper must include a `is_binary` clause. See §12.5.
 
 **The `Slice` AST node:** When `Subscript.slice` is a `Slice` node (rather than a `Constant` or expression), the converter must inspect `Slice.lower`, `Slice.upper`, and `Slice.step` (all optional) and emit the appropriate Elixir translation from the table above.
 
@@ -508,6 +516,6 @@ defp bool_to_int(true), do: 1
 defp bool_to_int(false), do: 0
 ```
 
-**Note:** The `is_boolean` guard must come before `is_integer` in any guard chain, because `true` and `false` are not integers in Elixir. The `py_mult` helper should handle booleans similarly.
+**Note:** The `is_boolean` clauses must come before the catch-all `py_add(a, b), do: a + b` clause, since `a + b` would crash on boolean operands. (In Elixir, `is_integer(true)` returns `false`, so there is no guard-ordering conflict between `is_boolean` and `is_number`/`is_integer` — they don't overlap.) The `py_mult` helper should handle booleans similarly.
 
 **Failure mode:** Silent crash (`ArithmeticError`) in code that uses boolean-integer arithmetic. This pattern is common in competitive programming where `count += (condition)` is idiomatic Python.

@@ -359,7 +359,7 @@ A compact reference for the most common correctness traps.
 | 28 | `int(x, base)` | `trunc(x)` | `String.to_integer(x, base)` | §12.8 |
 | 29 | `dict.items()` | Not handled | `Map.to_list(d)` | §9.5 |
 | 30 | String repetition `*` | `"abc" * 3` raises error | `String.duplicate("abc", 3)` | §11.23 |
-| 31 | List repetition `*` | `[0] * n` raises error | `List.duplicate(0, n)` | §11.24 |
+| 31 | List repetition `*` | `List.flatten(List.duplicate(a, n))` | `List.duplicate(a, n) \|> Enum.concat()` | §11.24 |
 | 32 | Boolean arithmetic | `true + 1` raises error | `py_bool_to_int(true) + 1` | §11.25 |
 | 33 | `continue` in for | No equivalent | Return accumulator unchanged | §11.26 |
 | 34 | Nested for mutation | Inner scope lost | Nested `Enum.reduce` | §11.27 |
@@ -373,7 +373,12 @@ A compact reference for the most common correctness traps.
 | 42 | While loop state lost | Helper returns `nil` | Helper returns `{state}` tuple | §13.8 |
 | 43 | Tuple swap order | `a = b; b = a` | `{a, b} = {b, a}` | §13.19 |
 | 44 | `truthy?` empty map | `map == %{}` | `map_size(map) == 0` | §11.3 |
+| 45 | String char access | `Enum.at(s, i)` | `py_getitem(s, i)` dispatches to `String.at` | §12.5 |
+| 46 | `float()` no args | Not handled | `0.0` | §12.8 |
+| 47 | List concat with `+` | `[1,2] + [3,4]` raises error | `py_add([1,2], [3,4])` → `a ++ b` | §11.19 |
+| 48 | Float floor div/mod | `Integer.floor_div` on floats crashes | Document as known limitation | §11.1 |
+| 49 | `^^^` deprecation | `a ^^^ b` emits warning (Elixir 1.12+) | Use `Bitwise.bxor(a, b)` or accept warnings | §7.1 |
 
 ---
 
-*End of RFC-001 v7*
+*End of RFC-001 v8*

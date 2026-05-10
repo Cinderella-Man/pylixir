@@ -82,7 +82,12 @@ end
 
 test "multi-element list repetition with *" do
   # Python: [1, 2] * 3 == [1, 2, 1, 2, 1, 2]
-  assert List.flatten(List.duplicate([1, 2], 3)) == [1, 2, 1, 2, 1, 2]
+  assert List.duplicate([1, 2], 3) |> Enum.concat() == [1, 2, 1, 2, 1, 2]
+end
+
+test "nested list repetition preserves nesting" do
+  # Python: [[1, 2]] * 3 == [[1, 2], [1, 2], [1, 2]]
+  assert List.duplicate([[1, 2]], 3) |> Enum.concat() == [[1, 2], [1, 2], [1, 2]]
 end
 
 test "boolean arithmetic — True + True == 2" do
@@ -127,6 +132,18 @@ end
 test "int() with no arguments returns 0" do
   # Python: int() == 0
   assert 0 == 0
+end
+
+test "float() with no arguments returns 0.0" do
+  # Python: float() == 0.0
+  assert 0.0 == 0.0
+end
+
+test "string character access with String.at" do
+  # Python: "hello"[1] == "e"
+  assert String.at("hello", 1) == "e"
+  # Python: "hello"[-1] == "o"
+  assert String.at("hello", -1) == "o"
 end
 
 test "print() with no arguments outputs empty line" do
@@ -276,7 +293,7 @@ pylixir/
 │       │   └── functions.ex        # FunctionDef, arguments, arg
 │       ├── builtins.ex             # Built-in function mapping table
 │       ├── scope.ex                # Scope management utilities
-│       ├── helpers.ex              # Runtime helpers (py_add, py_mult, py_len, py_in, py_int, py_bool_to_int, truthy?)
+│       ├── helpers.ex              # Runtime helpers (py_add, py_mult, py_len, py_in, py_getitem, py_int, py_bool_to_int, truthy?)
 │       ├── formatter.ex            # Elixir code formatting (Macro.to_string + Code.format_string! + IO.iodata_to_binary)
 │       └── errors.ex               # UnsupportedNodeError
 ├── priv/
@@ -328,8 +345,7 @@ defmodule Pylixir.Converter do
   defp convert_module(%{"_type" => "Module", "body" => body}, context) do
     context = %{context | known_functions: collect_function_names(body)}
     {stmts, context} = convert_many(body, context)
-    helpers = context.pending_helpers
-    body = [quote(do: import Bitwise)] ++ helpers ++ stmts
+    body = [quote(do: import Bitwise)] ++ stmts
     {{:__block__, [], body}, context}
   end
 

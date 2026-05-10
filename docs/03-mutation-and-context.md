@@ -184,15 +184,13 @@ defmodule Pylixir.Context do
   defstruct scopes: [],
             while_counter: 0,
             loop_nesting: 0,
-            function_names: MapSet.new(),
-            pending_helpers: []
+            known_functions: MapSet.new()
 
   @type t :: %__MODULE__{
     scopes: [MapSet.t(String.t())],
     while_counter: non_neg_integer(),
     loop_nesting: non_neg_integer(),
-    function_names: MapSet.t(String.t()),
-    pending_helpers: [Macro.t()]
+    known_functions: MapSet.t(String.t())
   }
 end
 ```
@@ -204,9 +202,8 @@ end
 A stack of `MapSet`s, where each `MapSet` contains the variable names bound in that scope. The top of the stack is the current scope.
 
 **Purpose:** Track which variables are bound at each scope level to:
-1. Avoid generating conflicting variable names (e.g., when a comprehension uses `x` that shadows an outer `x`)
-2. Know which variables need to be threaded through loop accumulators (see §13.4)
-3. Generate correct `defp` signatures for helper functions
+1. Know which variables need to be threaded through loop accumulators (see §13.4)
+2. Generate correct `defp` signatures for helper functions
 
 **Operations:**
 - `push_scope(context)` — push a new empty `MapSet` onto the stack
@@ -234,10 +231,10 @@ Tracks how many nested loops deep we are. This determines the return strategy fo
 - `loop_nesting == 0`: Simple `throw`/`catch` (not inside a loop)
 - `loop_nesting > 0`: `try`/`throw`/`catch` (inside a loop, where `throw` alone might be caught by the loop's `catch`)
 
-#### `function_names` — Collected Function Names for Forward References
+#### `known_functions` — Collected Function Names for Forward References
 
-A `MapSet` of all function names defined at the top level. This is populated during a **pre-pass** over the `Module.body` before the main conversion begins. It allows the converter to recognize calls to functions defined later in the file without raising errors. See §13.20.
+A `MapSet` of all function names defined at the top level. This is populated during a **pre-pass** over the `Module.body` before the main conversion begins. It allows the converter to recognize calls to functions defined later in the file without raising errors. See §13.6.
 
-#### `pending_helpers` — Deferred Helper Emission
+#### While Loop Helpers — Emitted Inline
 
-When a `While` loop is encountered, its helper function AST is appended to `pending_helpers`. At the `Module` level, these helpers are prepended to the module body.
+When a `while` loop is encountered, its helper `defp` function is emitted inline within the module body, immediately before the code that calls it. Elixir does not care about function definition order within a module, so there is no need to collect helpers and prepend them — just emit them where the `while` loop appears.

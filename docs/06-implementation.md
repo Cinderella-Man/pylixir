@@ -5,23 +5,24 @@
 - Generated Elixir code wraps everything in a `defmodule TranslatedCode do ... end` block.
 - Python function definitions become `defp` (private functions).
 - The module has a single `def run do ... end` public function that contains all top-level (non-function) statements from the Python source.
-- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. **Note:** In Elixir 1.17+, bitwise operators are available without import. If your minimum Elixir version target is 1.17+, this import can be omitted.
+- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. **Note:** `use Bitwise` is deprecated; use `import Bitwise` instead. See §7.1 for the `^^^` deprecation note.
 - The generated code ends with `TranslatedCode.run()` to execute the entry point.
-- The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_len/1`, `py_in/2`, `py_int/1`, `py_bool_to_int/1`, `truthy?/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
+- The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_len/1`, `py_in/2`, `py_getitem/2`, `py_int/1`, `py_bool_to_int/1`, `truthy?/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
 
 ### 13.2 The `convert/2` Function Pattern
 
 ```elixir
 def convert(%{"_type" => "Module", "body" => body}, %Context{} = context) do
   {stmts, context} = convert_many(body, context)
-  helpers = context.pending_helpers
   bitwise_import = [quote do: import Bitwise]
-  body = bitwise_import ++ helpers ++ stmts
-  {:__block__, [], body}
+  body = bitwise_import ++ stmts
+  {{:__block__, [], body}, context}
 end
 ```
 
 **Pattern:** Match on the `_type` field. Return `{elixir_ast, updated_context}`.
+
+**Note on while loop helpers:** While-loop helper `defp` functions are emitted inline within the statement list by the `While` handler. Elixir does not require function definitions to appear before their callers within a module, so no special ordering or deferred collection is needed.
 
 ### 13.3 String-Binary Equivalence
 
@@ -164,11 +165,8 @@ defp while_0(x) do
   end
 end
 
-{x} = try do
-  while_0(1)
-catch
-  :break -> {:ok}  # break returns a default state — see note below
-end
+# No break in this loop, so no try/catch needed:
+{x} = while_0(1)
 IO.puts(to_string(x))
 ```
 
@@ -176,7 +174,8 @@ IO.puts(to_string(x))
 - Each `while` loop becomes a private function that threads mutable state via its arguments.
 - **The helper must return the final state as a tuple** when the loop condition becomes false. The caller destructures this tuple to rebind the variables.
 - `continue` is implemented by recursing immediately with the current state, skipping the remaining body.
-- `break` throws a `:break` tag caught by the enclosing `try`/`catch`. **When `break` is used, the caller must handle the fact that the state at break-time is lost.** The `break` throw can carry state: `throw({:break, {x}})`, caught as `{:break, state} -> state`.
+- **When the loop body contains `break`:** wrap the call in `try`/`catch`. The `break` throw carries state: `throw({:break, {x}})`, caught as `{:break, state} -> state`. See the example below.
+- **When the loop body does NOT contain `break`:** no `try`/`catch` is needed — just call the helper directly and destructure the result.
 - The helper function body must call itself recursively to loop.
 
 **While loop with `break` carrying state:**
@@ -476,23 +475,32 @@ defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
 defp truthy?(_), do: true
 
 defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+defp py_add(a, b) when is_boolean(a), do: py_add(py_bool_to_int(a), b)
+defp py_add(a, b) when is_boolean(b), do: py_add(a, py_bool_to_int(b))
 defp py_add(a, b) when is_number(a) and is_number(b), do: a + b
 defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
 defp py_add(a, b), do: a + b
 
 defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
 defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
-defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.flatten(List.duplicate(a, b))
-defp py_mult(a, b) when is_integer(a) and is_list(b), do: List.flatten(List.duplicate(b, a))
+defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
+defp py_mult(a, b) when is_integer(a) and is_list(b), do: List.duplicate(b, a) |> Enum.concat()
 defp py_mult(a, b), do: a * b
 
 defp py_len(x) when is_list(x), do: length(x)
 defp py_len(x) when is_binary(x), do: String.length(x)
+defp py_len(%MapSet{} = x), do: MapSet.size(x)
 defp py_len(x) when is_map(x), do: map_size(x)
 defp py_len(x) when is_tuple(x), do: tuple_size(x)
 
+defp py_getitem(collection, key) when is_list(collection), do: Enum.at(collection, key)
+defp py_getitem(collection, key) when is_binary(collection), do: String.at(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, key)
+defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
+
 defp py_in(x, collection) when is_list(collection), do: x in collection
 defp py_in(x, collection) when is_binary(collection), do: String.contains?(collection, x)
+defp py_in(x, %MapSet{} = collection), do: MapSet.member?(collection, x)
 defp py_in(x, collection) when is_map(collection), do: Map.has_key?(collection, x)
 defp py_in(x, collection), do: Enum.member?(collection, x)
 
