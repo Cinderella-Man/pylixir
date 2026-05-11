@@ -141,7 +141,8 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 ```elixir
 defp py_getitem(collection, key) when is_list(collection), do: Enum.at(collection, key)
 defp py_getitem(collection, key) when is_binary(collection), do: String.at(collection, key)
-defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection) and key >= 0, do: elem(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, tuple_size(collection) + key)
 defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
 ```
 
@@ -357,7 +358,8 @@ The following node types raise `UnsupportedNodeError`:
 | `reversed(x)` | `Enum.reverse(x)` |
 | `enumerate(x)` | `Enum.with_index(x)` — NOTE: tuple order is swapped! See §11.7 |
 | `enumerate(x, start)` | `Enum.with_index(x, start)` — NOTE: tuple order is still swapped |
-| `zip(a, b)` | `Enum.zip([a, b])` |
+| `zip(a, b)` | `Enum.zip(a, b)` |
+| `zip(a, b, c, ...)` | `Enum.zip([a, b, c, ...])` (3+ args use the list form) |
 | `map(f, x)` | `Enum.map(x, f)` |
 | `filter(f, x)` | `Enum.filter(x, f)` |
 | `sum(x)` | `Enum.sum(x)` |
@@ -367,11 +369,11 @@ The following node types raise `UnsupportedNodeError`:
 | `max(iterable)` | `Enum.max(iterable)` |
 | `abs(x)` | `abs(x)` |
 | `int()` | `0` (no arguments — Python returns 0) |
-| `int(x)` | `trunc(x)` (for numbers) or `String.to_integer(x)` (for strings) — use runtime dispatch |
-| `int(x, base)` | `String.to_integer(x, base)` |
+| `int(x)` | `py_int(x)` — runtime dispatch (see helpers in §13.20) |
+| `int(x, base)` | `String.to_integer(String.trim(x), base)` |
 | `float()` | `0.0` (no arguments — Python returns 0.0) |
-| `float(x)` | `x / 1` (for integers) or `String.to_float(x)` (for strings) — use runtime dispatch |
-| `str(x)` | `to_string(x)` |
+| `float(x)` | `py_float(x)` — runtime dispatch (see helpers in §13.20) |
+| `str(x)` | `py_str(x)` — NOT `to_string(x)` (see §11.18 for True/False/None divergence) |
 | `bool(x)` | `Pylixir.Helpers.truthy?(x)` |
 | `list(x)` | `Enum.to_list(x)` |
 | `tuple(x)` | `List.to_tuple(Enum.to_list(x))` |
@@ -391,8 +393,8 @@ The following node types raise `UnsupportedNodeError`:
 | `isinstance(x, dict)` | `is_map(x)` |
 | `isinstance(x, (int, float))` | `is_number(x)` |
 | `print()` | `IO.puts("")` (no arguments — prints empty line) |
-| `print(x)` | `IO.puts(to_string(x))` |
-| `print(a, b, c)` | `IO.puts(Enum.join([to_string(a), to_string(b), to_string(c)], " "))` |
+| `print(x)` | `IO.puts(py_str(x))` — use `py_str`, NOT `to_string` (see §11.18) |
+| `print(a, b, c)` | `IO.puts(Enum.join([py_str(a), py_str(b), py_str(c)], " "))` |
 | `input()` | `IO.gets("") \|> String.trim_trailing("\n")` |
 | `input(prompt)` | `IO.gets(prompt) \|> String.trim_trailing("\n")` |
 | `chr(n)` | `List.to_string([n])` |
@@ -407,12 +409,31 @@ The following node types raise `UnsupportedNodeError`:
 | `math.log2(x)` | `:math.log2(x)` |
 | `math.log10(x)` | `:math.log10(x)` |
 | `math.gcd(a, b)` | `Integer.gcd(a, b)` |
+| `math.gcd(a, b, c, ...)` | `Enum.reduce([a, b, c, ...], &Integer.gcd/2)` (Python 3.9+) |
 | `math.pow(x, n)` | `:math.pow(x, n)` |
 | `math.pi` | `:math.pi()` |
 | `math.e` | `:math.exp(1)` |
 | `math.inf` | **RAISES UnsupportedNodeError** — no safe Elixir equivalent (see §11.17) |
 
 **`min`/`max` dispatch rule:** Python's `min` and `max` accept either two arguments (`min(a, b)`) or a single iterable (`min([1, 2, 3])`). The converter must check argument count: one argument → `Enum.min/1` or `Enum.max/1`; two or more arguments → Elixir's built-in `min/2` or `max/2`.
+
+#### String Methods (Non-Mutating)
+
+These are method calls on string objects. See §9.5.1 for the full table. The most commonly encountered in algorithmic code:
+
+| Python Method | Elixir Translation |
+|---|---|
+| `s.lower()` | `String.downcase(s)` |
+| `s.upper()` | `String.upcase(s)` |
+| `s.strip()` | `String.trim(s)` |
+| `s.split()` / `s.split(sep)` | `String.split(s)` / `String.split(s, sep)` |
+| `sep.join(items)` | `Enum.join(items, sep)` |
+| `s.startswith(p)` | `String.starts_with?(s, p)` |
+| `s.endswith(p)` | `String.ends_with?(s, p)` |
+| `s.find(sub)` | `py_str_find(s, sub)` — returns `-1` on not found (see §9.5.1) |
+| `s.count(sub)` | `py_str_count(s, sub)` (see §9.5.1) |
+| `s.replace(old, new)` | `String.replace(s, old, new)` |
+| `list.index(x)` | `py_list_index(list, x)` — raises on not found (see §9.5.1) |
 
 #### Dictionary Methods (Non-Mutating)
 

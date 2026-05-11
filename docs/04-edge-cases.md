@@ -69,9 +69,12 @@ defp truthy?(0), do: false
 defp truthy?(0.0), do: false
 defp truthy?(""), do: false
 defp truthy?([]), do: false
+defp truthy?(%MapSet{} = s), do: MapSet.size(s) > 0
 defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
 defp truthy?(_), do: true
 ```
+
+**Note on `MapSet` ordering:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. Without the explicit `%MapSet{}` clause, `map_size(MapSet.new())` would return `2` (for `__struct__` and `map` internal keys), incorrectly making `truthy?(MapSet.new())` return `true`. Python's `set()` is falsy, so the explicit `MapSet.size/1` check is required.
 
 **Translation rules:**
 
@@ -306,6 +309,7 @@ Python's `math` module provides `math.ceil`, `math.floor`, `math.sqrt`, `math.lo
 | `math.log2(x)` | `:math.log2(x)` |
 | `math.log10(x)` | `:math.log10(x)` |
 | `math.gcd(a, b)` | `Integer.gcd(a, b)` |
+| `math.gcd(a, b, c, ...)` | Reduce: `Enum.reduce([a, b, c, ...], &Integer.gcd/2)` (Python 3.9+) |
 | `math.pow(x, n)` | `:math.pow(x, n)` |
 | `math.pi` | `:math.pi()` |
 | `math.e` | `:math.exp(1)` |
@@ -334,7 +338,19 @@ IO.puts(Enum.join([to_string(a), to_string(b), to_string(c)], " "))
 IO.puts("")
 ```
 
-**Solution:** For `print()` (no arguments), map to `IO.puts("")`. For `print(arg)` (single argument), map to `IO.puts(to_string(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([to_string(arg1), to_string(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
+**Solution:** For `print()` (no arguments), map to `IO.puts("")`. For `print(arg)` (single argument), map to `IO.puts(py_str(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([py_str(arg1), py_str(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
+
+**Critical: `to_string/1` does NOT match Python's `str()` for booleans and `None`.** Python's `print(True)` outputs `True` (capital T), `print(False)` outputs `False` (capital F), and `print(None)` outputs `None`. Elixir's `to_string(true)` returns `"true"` (lowercase), `to_string(false)` returns `"false"` (lowercase), and `to_string(nil)` returns `""` (empty string). Use a `py_str/1` helper instead of `to_string/1`:
+
+```elixir
+defp py_str(true), do: "True"
+defp py_str(false), do: "False"
+defp py_str(nil), do: "None"
+defp py_str(x) when is_atom(x), do: Atom.to_string(x)
+defp py_str(x), do: to_string(x)
+```
+
+**Failure mode:** Silent wrong output. Any test that captures IO and compares against Python's output will fail on `True`/`False`/`None` values.
 
 ### 11.19 String Concatenation with `+` (Critical)
 
@@ -385,8 +401,12 @@ defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, 
 defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
 defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
 defp py_mult(a, b) when is_integer(a) and is_list(b), do: py_mult(b, a)
+defp py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
+defp py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
 defp py_mult(a, b), do: a * b
 ```
+
+**Note on boolean handling in `py_mult`:** Python's `True * 3` returns `3` and `False * 5` returns `0` because `bool` is a subclass of `int`. In Elixir, `true * 3` raises `ArithmeticError`. The `is_boolean` clauses convert booleans to integers before dispatching. These clauses must appear before the catch-all `a * b` clause but after the `is_binary`/`is_list` clauses (a boolean operand with a string or list would be a `TypeError` in Python too, so the ordering doesn't matter for those cases).
 
 **CRITICAL: Use `Enum.concat/1`, NOT `List.flatten/1`.** `Enum.concat/1` flattens exactly one level of nesting, which is correct. `List.flatten/1` recursively flattens ALL levels, which would corrupt nested list repetition:
 

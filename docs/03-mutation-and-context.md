@@ -31,8 +31,10 @@ d[key] += 1
 ```
 
 ```elixir
-d = Map.put(d, key, Map.get(d, key, 0) + 1)
+d = Map.put(d, key, Map.fetch!(d, key) + 1)
 ```
+
+**Note:** Python's `d[key] += 1` raises `KeyError` if `key` is missing — it does NOT silently default to `0`. Using `Map.fetch!/2` (not `Map.get/3` with a default) preserves this behavior. A common Python idiom for safe increment is `d[key] = d.get(key, 0) + 1`, which uses an explicit `Assign` with `d.get(key, 0)` — that pattern is handled separately via the `dict.get` builtin mapping.
 
 The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it as a map mutation rather than a variable rebinding.
 
@@ -45,10 +47,14 @@ Python lists and dicts have methods that mutate in place. When called as stateme
 | `my_list.append(x)` | `Expr(value=Call(Attribute(Name("my_list"), "append"), [Name("x")]))` | `my_list = my_list ++ [x]` |
 | `my_list.extend(items)` | `Expr(value=Call(Attribute(Name("my_list"), "extend"), [Name("items")]))` | `my_list = my_list ++ items` |
 | `my_list.sort()` | `Expr(value=Call(Attribute(Name("my_list"), "sort"), []))` | `my_list = Enum.sort(my_list)` |
+| `my_list.sort(key=f)` | `Expr(value=Call(Attribute(Name("my_list"), "sort"), [], [keyword("key", f)]))` | `my_list = Enum.sort_by(my_list, f)` |
+| `my_list.sort(reverse=True)` | `Expr(value=Call(Attribute(Name("my_list"), "sort"), [], [keyword("reverse", True)]))` | `my_list = Enum.sort(my_list, :desc)` |
+| `my_list.sort(key=f, reverse=True)` | (both keywords present) | `my_list = Enum.sort_by(my_list, f, :desc)` |
 | `my_list.reverse()` | `Expr(value=Call(Attribute(Name("my_list"), "reverse"), []))` | `my_list = Enum.reverse(my_list)` |
 | `my_list.pop()` | `Expr(value=Call(Attribute(Name("my_list"), "pop"), []))` | `my_list = List.delete_at(my_list, -1)` |
 | `my_list.pop(i)` | `Expr(value=Call(Attribute(Name("my_list"), "pop"), [Constant(i)]))` | `my_list = List.delete_at(my_list, i)` |
 | `my_list.insert(i, x)` | `Expr(value=Call(Attribute(Name("my_list"), "insert"), [Constant(i), Name("x")]))` | `my_list = List.insert_at(my_list, i, x)` |
+| `my_list.remove(x)` | `Expr(value=Call(Attribute(Name("my_list"), "remove"), [Name("x")]))` | `my_list = List.delete(my_list, x)` |
 | `my_list.clear()` | `Expr(value=Call(Attribute(Name("my_list"), "clear"), []))` | `my_list = []` |
 | `my_dict.update(other)` | `Expr(value=Call(Attribute(Name("my_dict"), "update"), [Name("other")]))` | `my_dict = Map.merge(my_dict, other)` |
 | `my_dict.pop(key)` | `Expr(value=Call(Attribute(Name("my_dict"), "pop"), [Name("key")]))` | `my_dict = Map.delete(my_dict, key)` |
@@ -57,6 +63,10 @@ Python lists and dicts have methods that mutate in place. When called as stateme
 | `my_set.discard(x)` | `Expr(value=Call(Attribute(Name("my_set"), "discard"), [Name("x")]))` | `my_set = MapSet.delete(my_set, x)` |
 | `my_set.update(items)` | `Expr(value=Call(Attribute(Name("my_set"), "update"), [Name("items")]))` | `my_set = MapSet.union(my_set, MapSet.new(items))` |
 | `my_set.clear()` | `Expr(value=Call(Attribute(Name("my_set"), "clear"), []))` | `my_set = MapSet.new()` |
+
+**Note on `list.sort()` keywords:** The `key` and `reverse` arguments use the same detection logic as `sorted()` — see §12.8 for details. The mutation form reassigns the variable; the expression form (`sorted()`) returns a new list.
+
+**Note on `list.remove(x)`:** Python's `list.remove(x)` removes the **first** occurrence of `x` and raises `ValueError` if not found. Elixir's `List.delete(list, x)` also removes the first occurrence, but returns the unchanged list if not found (no error). This is a minor semantic difference — document as a known limitation.
 
 ### 9.5 Dictionary Iteration Methods
 
@@ -69,6 +79,60 @@ Python dicts have methods that return views over their contents. These are commo
 | `my_dict.values()` | `Map.values(my_dict)` |
 
 **Note on `items()` tuple order:** Python's `dict.items()` yields `(key, value)` tuples. Elixir's `Map.to_list/1` also returns `{key, value}` tuples. The order matches, so no swapping is needed (unlike `enumerate`).
+
+### 9.5.1 String Methods (Non-Mutating, Expression-Level)
+
+Python strings are immutable, so string methods always return new values. These are called as expressions and map directly to Elixir `String` module functions:
+
+| Python Method | Elixir Translation |
+|---|---|
+| `s.lower()` | `String.downcase(s)` |
+| `s.upper()` | `String.upcase(s)` |
+| `s.strip()` | `String.trim(s)` |
+| `s.lstrip()` | `String.trim_leading(s)` |
+| `s.rstrip()` | `String.trim_trailing(s)` |
+| `s.startswith(prefix)` | `String.starts_with?(s, prefix)` |
+| `s.endswith(suffix)` | `String.ends_with?(s, suffix)` |
+| `s.split()` | `String.split(s)` |
+| `s.split(sep)` | `String.split(s, sep)` |
+| `s.split(sep, maxsplit)` | `String.split(s, sep, parts: maxsplit + 1)` |
+| `sep.join(items)` | `Enum.join(items, sep)` |
+| `s.replace(old, new)` | `String.replace(s, old, new)` |
+| `s.replace(old, new, 1)` | `String.replace(s, old, new, global: false)` |
+| `s.find(sub)` | `py_str_find(s, sub)` — see helper below |
+| `s.count(sub)` | `py_str_count(s, sub)` — see helper below |
+| `s.isdigit()` | `Regex.match?(~r/^\d+$/, s)` |
+| `s.isalpha()` | `Regex.match?(~r/^\p{L}+$/u, s)` |
+| `s.isalnum()` | `Regex.match?(~r/^[\p{L}\d]+$/u, s)` |
+| `s.index(x)` | `py_str_index(s, x)` — raises on not found (same as `list.index`) |
+| `s.zfill(width)` | `String.pad_leading(s, width, "0")` |
+
+**Note on `join` argument order:** Python's `join` is a method on the separator: `", ".join(items)`. In the AST, `func` is `Attribute(value=Constant(", "), attr="join")`. The converter must detect this pattern and emit `Enum.join(items, sep)` with the arguments swapped.
+
+**Helpers for `find` and `count`:**
+
+```elixir
+# s.find(sub) — returns index or -1 (not nil)
+defp py_str_find(s, sub) do
+  case :binary.match(s, sub) do
+    {pos, _len} -> pos
+    :nomatch -> -1
+  end
+end
+
+# s.count(sub) — count non-overlapping occurrences
+defp py_str_count(s, sub) do
+  length(String.split(s, sub)) - 1
+end
+
+# list.index(x) — returns index or raises ValueError equivalent
+defp py_list_index(list, x) do
+  case Enum.find_index(list, fn v -> v == x end) do
+    nil -> raise RuntimeError, "#{inspect(x)} is not in list"
+    idx -> idx
+  end
+end
+```
 
 ### 9.6 `del` and `pop` — List Mutation Behavior
 

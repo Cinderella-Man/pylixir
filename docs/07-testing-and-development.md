@@ -151,7 +151,7 @@ test "print() with no arguments outputs empty line" do
   assert capture_io(fn -> IO.puts("") end) == "\n"
 end
 
-test "truthy? uses map_size for empty map check" do
+test "truthy? handles empty map and empty MapSet correctly" do
   truthy? = fn
     nil -> false
     false -> false
@@ -159,11 +159,83 @@ test "truthy? uses map_size for empty map check" do
     0.0 -> false
     "" -> false
     [] -> false
+    %MapSet{} = s -> MapSet.size(s) > 0
     map when is_map(map) and map_size(map) == 0 -> false
     _ -> true
   end
   assert truthy?.(%{}) == false
   assert truthy?.(%{a: 1}) == true
+  assert truthy?.(MapSet.new()) == false
+  assert truthy?.(MapSet.new([1])) == true
+end
+
+test "py_int handles booleans" do
+  # Python: int(True) == 1, int(False) == 0
+  py_int = fn
+    true -> 1
+    false -> 0
+    x when is_float(x) -> trunc(x)
+    x when is_integer(x) -> x
+    x when is_binary(x) -> String.trim(x) |> String.to_integer()
+  end
+  assert py_int.(true) == 1
+  assert py_int.(false) == 0
+end
+
+test "py_int strips whitespace from strings" do
+  # Python: int("  42  ") == 42
+  assert String.trim("  42  ") |> String.to_integer() == 42
+end
+
+test "py_float handles integer-formatted strings" do
+  # Python: float("3") == 3.0
+  {f, ""} = Float.parse("3")
+  assert f == 3.0
+end
+
+test "py_str matches Python str() for booleans and None" do
+  # Python: str(True) == "True", str(False) == "False", str(None) == "None"
+  py_str = fn
+    true -> "True"
+    false -> "False"
+    nil -> "None"
+    x -> to_string(x)
+  end
+  assert py_str.(true) == "True"
+  assert py_str.(false) == "False"
+  assert py_str.(nil) == "None"
+  assert py_str.(42) == "42"
+end
+
+test "py_mult handles boolean operands" do
+  # Python: True * 3 == 3, False * 5 == 0
+  py_bool_to_int = fn true -> 1; false -> 0; x -> x end
+  assert py_bool_to_int.(true) * 3 == 3
+  assert py_bool_to_int.(false) * 5 == 0
+end
+
+test "py_getitem handles negative tuple indices" do
+  # Python: (1, 2, 3)[-1] == 3
+  t = {1, 2, 3}
+  key = -1
+  result = if key >= 0, do: elem(t, key), else: elem(t, tuple_size(t) + key)
+  assert result == 3
+end
+
+test "py_list_index finds first occurrence" do
+  # Python: [10, 20, 30].index(20) == 1
+  assert Enum.find_index([10, 20, 30], fn v -> v == 20 end) == 1
+end
+
+test "string methods — lower, upper, split, join" do
+  # Python: "Hello".lower() == "hello"
+  assert String.downcase("Hello") == "hello"
+  # Python: "hello".upper() == "HELLO"
+  assert String.upcase("hello") == "HELLO"
+  # Python: "a,b,c".split(",") == ["a", "b", "c"]
+  assert String.split("a,b,c", ",") == ["a", "b", "c"]
+  # Python: ",".join(["a", "b", "c"]) == "a,b,c"
+  assert Enum.join(["a", "b", "c"], ",") == "a,b,c"
 end
 ```
 
@@ -293,7 +365,7 @@ pylixir/
 │       │   └── functions.ex        # FunctionDef, arguments, arg
 │       ├── builtins.ex             # Built-in function mapping table
 │       ├── scope.ex                # Scope management utilities
-│       ├── helpers.ex              # Runtime helpers (py_add, py_mult, py_len, py_in, py_getitem, py_int, py_bool_to_int, truthy?)
+│       ├── helpers.ex              # Runtime helpers (py_add, py_mult, py_len, py_in, py_getitem, py_int, py_float, py_str, py_bool_to_int, truthy?, py_str_find, py_str_count, py_list_index)
 │       ├── formatter.ex            # Elixir code formatting (Macro.to_string + Code.format_string! + IO.iodata_to_binary)
 │       └── errors.ex               # UnsupportedNodeError
 ├── priv/

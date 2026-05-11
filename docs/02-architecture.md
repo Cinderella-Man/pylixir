@@ -494,7 +494,7 @@ Every non-literal expression in Elixir's AST is a three-element tuple:
 - Floats: `3.14`
 - Strings: `"hello"`
 - Lists: `[1, 2, 3]`
-- Two-element tuples: `{:a, :b}` (but 3+ element tuples use `:{}``)
+- Two-element tuples: `{:a, :b}` (but 3+ element tuples use `:{}`)
 
 ### 8.2 Variables
 
@@ -722,7 +722,7 @@ Source: `{a, b, c}`
 {:{}, [], [{:a, [], nil}, {:b, [], nil}, {:c, [], nil}]}
 ```
 
-Source: `{a, b}` (2-element tuple — special case, no `:{}``)
+Source: `{a, b}` (2-element tuple — special case, no `:{}`)
 
 ```elixir
 {{:a, [], nil}, {:b, [], nil}}

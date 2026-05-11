@@ -56,10 +56,32 @@ end)
 
 **Detection strategy:** The converter must determine which variables inside the loop body are "external" (defined before the loop and used/modified inside it). The algorithm:
 
-1. **Before converting the loop body**, record the current scope's bound variables.
-2. **Walk the loop body** and collect all variables that are assigned to (`Assign`, `AugAssign` targets).
-3. **Intersect** the assigned variables with the pre-loop scope. Variables in the intersection are "mutated externals" — they must be threaded through the accumulator.
-4. **Also include** variables assigned inside the loop that are used after the loop (these need to be returned from the reduce).
+1. **Before converting the loop body**, snapshot the current scope's bound variables as `pre_loop_vars`.
+2. **Walk the loop body AST** (without converting) and collect two sets:
+   - `assigned_vars`: all variable names that appear as `Assign.targets` or `AugAssign.target` (recursing into `Tuple.elts` for unpacking targets, and into nested `If`/`While` bodies — a variable assigned in any branch counts).
+   - `read_vars`: all variable names that appear as `Name` with `ctx: Load` anywhere in the body.
+3. **Compute mutated externals:** `mutated_externals = assigned_vars ∩ pre_loop_vars`. These are pre-existing variables that the loop body reassigns.
+4. **Compute new variables used post-loop:** This requires look-ahead. Scan the statements AFTER the `For` node in the parent body for `Name` nodes with `ctx: Load`. Any name in `assigned_vars` (but not in `pre_loop_vars`) that is read post-loop must also be included in the accumulator. **Simplification for MVP:** Conservatively include ALL `assigned_vars` (not just externals) in the accumulator. This over-captures but is always correct.
+
+```elixir
+defp collect_assigned_vars(%{"_type" => "Assign", "targets" => targets}, acc) do
+  Enum.reduce(targets, acc, &collect_target_names/2)
+end
+defp collect_assigned_vars(%{"_type" => "AugAssign", "target" => target}, acc) do
+  collect_target_names(target, acc)
+end
+defp collect_assigned_vars(%{"_type" => "If", "body" => body, "orelse" => orelse}, acc) do
+  acc = Enum.reduce(body, acc, &collect_assigned_vars/2)
+  Enum.reduce(orelse, acc, &collect_assigned_vars/2)
+end
+defp collect_assigned_vars(_, acc), do: acc
+
+defp collect_target_names(%{"_type" => "Name", "id" => name}, acc), do: MapSet.put(acc, name)
+defp collect_target_names(%{"_type" => "Tuple", "elts" => elts}, acc) do
+  Enum.reduce(elts, acc, &collect_target_names/2)
+end
+defp collect_target_names(_, acc), do: acc
+```
 
 **Translation rules:**
 
@@ -274,12 +296,23 @@ The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Su
 
 ### 13.12 If-Elif-Else Chain Conversion
 
-All `if`/`elif`/`else` chains are converted to `cond` blocks. This is simpler to implement (one code path instead of two) and produces cleaner output for multi-branch chains:
+All `if`/`elif`/`else` chains are converted to `cond` blocks. This is simpler to implement (one code path instead of two) and produces cleaner output for multi-branch chains.
+
+**Critical: Condition wrapping with `truthy?/1`.** Python's `if my_list:` means "if not empty" — it uses Python truthiness. The converter must wrap conditions in `truthy?/1` to preserve this behavior. As an optimization, conditions that are already comparison (`Compare`) or boolean (`BoolOp`) nodes can skip the wrapping since they always produce `true`/`false`. For all other condition types (bare `Name`, `Call`, `Subscript`, etc.), the wrapping is required.
 
 ```elixir
 def convert(%{"_type" => "If"} = node, ctx) do
   branches = collect_if_elif_chain(node)
   convert_to_cond(branches, ctx)
+end
+
+# Wrap condition in truthy? unless it's already a boolean-producing node
+defp wrap_truthy(%{"_type" => type} = test, ctx) when type in ~w[Compare BoolOp] do
+  convert(test, ctx)
+end
+defp wrap_truthy(test, ctx) do
+  {test_ast, ctx} = convert(test, ctx)
+  {{{:., [], [{:__aliases__, [], [:Pylixir, :Helpers]}, :truthy?]}, [], [test_ast]}, ctx}
 end
 
 # Collect all branches into a flat list of {test, body} pairs
@@ -302,7 +335,7 @@ defp convert_to_cond(branches, ctx) do
   case branches do
     [{test, body}] ->
       # Simple if, no else
-      {test_ast, ctx} = convert(test, ctx)
+      {test_ast, ctx} = wrap_truthy(test, ctx)
       {body_ast, ctx} = convert_many(body, ctx)
       {{:if, [], [test_ast, [do: body_ast]]}, ctx}
 
@@ -315,7 +348,7 @@ defp convert_to_cond(branches, ctx) do
           {acc ++ [clause], ctx}
 
         {test, body}, {acc, ctx} ->
-          {test_ast, ctx} = convert(test, ctx)
+          {test_ast, ctx} = wrap_truthy(test, ctx)
           {body_ast, ctx} = convert_many(body, ctx)
           clause = {:->, [], [[test_ast], body_ast]}
           {acc ++ [clause], ctx}
@@ -471,6 +504,7 @@ defp truthy?(0), do: false
 defp truthy?(0.0), do: false
 defp truthy?(""), do: false
 defp truthy?([]), do: false
+defp truthy?(%MapSet{} = s), do: MapSet.size(s) > 0
 defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
 defp truthy?(_), do: true
 
@@ -485,6 +519,8 @@ defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, 
 defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
 defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
 defp py_mult(a, b) when is_integer(a) and is_list(b), do: List.duplicate(b, a) |> Enum.concat()
+defp py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
+defp py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
 defp py_mult(a, b), do: a * b
 
 defp py_len(x) when is_list(x), do: length(x)
@@ -495,7 +531,8 @@ defp py_len(x) when is_tuple(x), do: tuple_size(x)
 
 defp py_getitem(collection, key) when is_list(collection), do: Enum.at(collection, key)
 defp py_getitem(collection, key) when is_binary(collection), do: String.at(collection, key)
-defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection) and key >= 0, do: elem(collection, key)
+defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, tuple_size(collection) + key)
 defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
 
 defp py_in(x, collection) when is_list(collection), do: x in collection
@@ -504,11 +541,47 @@ defp py_in(x, %MapSet{} = collection), do: MapSet.member?(collection, x)
 defp py_in(x, collection) when is_map(collection), do: Map.has_key?(collection, x)
 defp py_in(x, collection), do: Enum.member?(collection, x)
 
+defp py_int(true), do: 1
+defp py_int(false), do: 0
 defp py_int(x) when is_float(x), do: trunc(x)
 defp py_int(x) when is_integer(x), do: x
-defp py_int(x) when is_binary(x), do: String.to_integer(x)
+defp py_int(x) when is_binary(x), do: String.trim(x) |> String.to_integer()
+
+defp py_float(x) when is_integer(x), do: x / 1
+defp py_float(x) when is_float(x), do: x
+defp py_float(x) when is_binary(x) do
+  trimmed = String.trim(x)
+  case Float.parse(trimmed) do
+    {f, ""} -> f
+    _ -> raise ArgumentError, "could not convert string to float: #{inspect(x)}"
+  end
+end
+
+defp py_str(true), do: "True"
+defp py_str(false), do: "False"
+defp py_str(nil), do: "None"
+defp py_str(x), do: to_string(x)
 
 defp py_bool_to_int(true), do: 1
 defp py_bool_to_int(false), do: 0
 defp py_bool_to_int(x), do: x
+
+# s.find(sub) — returns index or -1 (not nil)
+defp py_str_find(s, sub) do
+  case :binary.match(s, sub) do
+    {pos, _len} -> pos
+    :nomatch -> -1
+  end
+end
+
+# s.count(sub) — count non-overlapping occurrences
+defp py_str_count(s, sub), do: length(String.split(s, sub)) - 1
+
+# list.index(x) — returns index or raises
+defp py_list_index(list, x) do
+  case Enum.find_index(list, fn v -> v == x end) do
+    nil -> raise RuntimeError, "#{inspect(x)} is not in list"
+    idx -> idx
+  end
+end
 ```
