@@ -2,9 +2,9 @@
 
 After the core transpiler is functional, these enhancements can be considered:
 
-### 17.1 String Similarity
+### 17.1 Better Error Messages with String Similarity
 
-Python strings use Levenshtein distance for fuzzy matching. For candidate sorting by string similarity:
+When the converter encounters an unknown function name (not in the builtins table, not in `known_functions`), it currently emits the call as-is and lets the Elixir compiler produce the error. A future enhancement could use string similarity (e.g., Levenshtein distance) to suggest the closest known builtin or function name in the `UnsupportedNodeError` message — e.g., "Unknown function `sorded`. Did you mean `sorted`?"
 
 ```elixir
 # Option 1: Pure Elixir (no dependencies)
@@ -195,21 +195,21 @@ print(add(3, 4))
    {:defp, [],
     [
       {:add, [], [{:a, [], nil}, {:b, [], nil}]},
-      [do: {:+, [], [{:a, [], nil}, {:b, [], nil}]}]
+      [do: {:py_add, [], [{:a, [], nil}, {:b, [], nil}]}]
     ]},
    {{:., [], [{:__aliases__, [], [:IO]}, :puts]}, [],
-    [{:to_string, [], [{:add, [], [3, 4]}]}]}
+    [{:py_str, [], [{:add, [], [3, 4]}]}]}
  ]}
 ```
 
-> **Note:** `IO.puts(to_string(add(3, 4)))` is a single AST node — a remote function call with a nested local call as its argument, not separate block-level expressions.
+> **Note:** `IO.puts(py_str(add(3, 4)))` is a single AST node — a remote function call with a nested local call as its argument, not separate block-level expressions. `py_add` is used instead of bare `+` because the operand types are not statically known (see §11.19). `py_str` is used instead of `to_string` to match Python's string representation (see §11.18).
 
 **Step 4: Formatted Elixir Code**
 
 ```elixir
-defp add(a, b), do: a + b
+defp add(a, b), do: py_add(a, b)
 
-IO.puts(to_string(add(3, 4)))
+IO.puts(py_str(add(3, 4)))
 ```
 
 **Step 5: Console Output**
@@ -844,7 +844,7 @@ A compact reference for the most common correctness traps. **Severity key:** �
 | 46 | 🟡 | `float()` no args | Not handled | `0.0` | §12.8 |
 | 47 | 🟡 | List concat with `+` | `[1,2] + [3,4]` raises error | `py_add([1,2], [3,4])` → `a ++ b` | §11.19 |
 | 48 | 🟡 | Float floor div/mod | `Integer.floor_div` on floats crashes | Document as known limitation | §11.1 |
-| 49 | 🟢 | `^^^` deprecation | `a ^^^ b` emits warning (Elixir 1.12+) | Use `Bitwise.bxor(a, b)` or accept warnings | §7.1 |
+| 49 | 🟢 | `^^^` deprecation | `a ^^^ b` emits warning | Use `Bitwise.bxor(a, b)` or accept warnings | §7.1 |
 | 50 | 🔴 | `print(True)` casing | `to_string(true)` → `"true"` | `py_str(true)` → `"True"` | §11.18 |
 | 51 | 🔴 | `print(None)` output | `to_string(nil)` → `""` | `py_str(nil)` → `"None"` | §11.18 |
 | 52 | 🟡 | `int(True)` / `int(False)` | `py_int(true)` crashes | Add boolean clauses to `py_int` | §13.20 |

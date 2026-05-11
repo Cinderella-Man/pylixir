@@ -149,16 +149,9 @@ Self-contained algorithmic code that uses:
 
 The library consumes a **parsed Python AST** represented as an Elixir map. The input is a `Module` node (the root of any Python AST) that has already been parsed by Python's `ast` module and serialized to JSON.
 
-**Python version target:** The library targets the AST format produced by `ast.parse()` in Python **3.8 and later**. The Python AST format is not frozen — it changes between versions. Key version-dependent behaviors:
+**Python version target:** The library targets the AST format produced by `ast.parse()` in Python **3.8 and later**. The Python AST format is not frozen — it changes between versions. Fields may appear or disappear across Python releases (`type_params` was added in 3.12, old literal nodes like `Num`/`Str` were removed in 3.14, `Match` was added in 3.10, etc.).
 
-| Feature | Python 3.8–3.9 | Python 3.10–3.11 | Python 3.12+ |
-|---|---|---|---|
-| `Constant.kind` field | Present (`"u"` or `nil`) | Present (`"u"` or `nil`) | Present (still in grammar) |
-| `FunctionDef.type_params` | **Does not exist** | **Does not exist** | Present (list of type parameter nodes) |
-| Old literal nodes (`Num`, `Str`, `Bytes`, `NameConstant`, `Ellipsis`) | Deprecated but still produced by some tools | Deprecated but still produced by some tools | Emit `DeprecationWarning` (3.12–3.13); **removed in 3.14** |
-| `Match` statement | Does not exist | Present (Python 3.10+, PEP 634) | Present |
-
-**The converter treats version-dependent fields as optional.** Use `Map.get(node, "type_params", [])` rather than `node["type_params"]` to avoid `KeyError` on pre-3.12 ASTs. Similarly, `Map.get(node, "kind", nil)` for `Constant.kind`.
+**The converter treats version-dependent fields as optional.** Use `Map.get(node, "type_params", [])` rather than `node["type_params"]` to avoid `KeyError` on older ASTs. Similarly, `Map.get(node, "kind", nil)` for `Constant.kind`.
 
 ### 5.2 Metadata Stripping
 
@@ -179,15 +172,6 @@ The JSON representation of the Python AST depends on the serializer used (`ast2j
 
 The converter is resilient to missing metadata fields and does not depend on any specific serializer's conventions for unserializable types.
 
-### 5.5 Minimum Elixir Version
+### 5.5 Elixir Version
 
-The generated code requires **Elixir 1.12 or later**. Key version-dependent features used:
-
-| Feature | Minimum version |
-|---|---|
-| `Enum.sort/2` with `:asc`/`:desc` atom | Elixir 1.10 |
-| `is_struct/1` guard (used in `py_str` helper) | Elixir 1.11 |
-| `import Bitwise` (non-deprecated form) | Elixir 1.0 (always valid) |
-| `^^^` operator without deprecation warning | Pre-1.12 (warns in 1.12+, still works) |
-
-**Recommendation:** Target Elixir 1.12+ as the baseline. This covers all features used by the generated code. The `^^^` (XOR) operator emits a deprecation warning in 1.12+ but functions correctly; use `Bitwise.bxor(a, b)` to suppress warnings if desired.
+The generated code targets **modern Elixir** (current stable release). No effort is made to support older Elixir versions. The code uses standard library functions (`Integer.floor_div/2`, `Integer.mod/2`, `Enum.sort_by/3`, `import Bitwise`, etc.) that have been stable for many releases.

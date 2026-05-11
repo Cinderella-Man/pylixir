@@ -60,21 +60,9 @@ nil == false  # false — nil is falsy, but != false
 
 **Implication:** Code like `if my_list:` (meaning "if not empty") or `not 0` will produce wrong results if translated naively.
 
-**Solution — runtime `truthy?/1` helper:** Rather than attempting compile-time type inference (which would be complex and fragile), the transpiler always uses a `truthy?/1` helper that implements Python's truthiness model:
+**Solution — runtime `truthy?/1` helper:** Rather than attempting compile-time type inference (which would be complex and fragile), the transpiler always uses a `truthy?/1` helper that implements Python's truthiness model. See §13.20 for the canonical definition.
 
-```elixir
-defp truthy?(nil), do: false
-defp truthy?(false), do: false
-defp truthy?(0), do: false
-defp truthy?(0.0), do: false
-defp truthy?(""), do: false
-defp truthy?([]), do: false
-defp truthy?(%MapSet{} = s), do: MapSet.size(s) > 0
-defp truthy?(map) when is_map(map) and map_size(map) == 0, do: false
-defp truthy?(_), do: true
-```
-
-**Note on `MapSet` ordering:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. Without the explicit `%MapSet{}` clause, `map_size(MapSet.new())` would return `2` (for `__struct__` and `map` internal keys), incorrectly making `truthy?(MapSet.new())` return `true`. Python's `set()` is falsy, so the explicit `MapSet.size/1` check is required.
+**Note on `MapSet` ordering:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. All Elixir structs with one field have `map_size == 2` (for `__struct__` plus the field key itself), so `map_size(MapSet.new()) == 0` would be `false`, incorrectly making `truthy?(MapSet.new())` return `true`. Python's `set()` is falsy, so the explicit `MapSet.size/1` check is required.
 
 **Note on `-0.0`:** Python treats `-0.0` as falsy (`bool(-0.0)` → `False`). The `truthy?(0.0)` clause correctly handles this because Elixir's pattern matching treats `0.0` and `-0.0` as equal (`0.0 === -0.0` is `true`), so `-0.0` matches the `0.0` clause. No special handling needed.
 
@@ -279,25 +267,11 @@ Integer.to_string(255, 8)   # "377" — missing "0o" prefix
 Integer.to_string(255, 2)   # "11111111" — missing "0b" prefix
 ```
 
-**Solution:** Generate helpers that add the prefix and fix casing, **handling negative numbers correctly** (Python puts the minus sign before the prefix: `hex(-255)` → `"-0xff"`, not `"0x-ff"`):
+**Solution:** Generate helpers that add the prefix and fix casing, **handling negative numbers correctly** (Python puts the minus sign before the prefix: `hex(-255)` → `"-0xff"`, not `"0x-ff"`). See §13.20 for the canonical definitions of `py_hex/1`, `py_oct/1`, and `py_bin/1`.
 
-```elixir
-# hex — Python uses lowercase, minus before prefix
-defp py_hex(n) when n < 0, do: "-0x" <> String.downcase(Integer.to_string(-n, 16))
-defp py_hex(n), do: "0x" <> String.downcase(Integer.to_string(n, 16))
+**Important:** Python's `hex()` returns lowercase hex digits (`0xff`, not `0xFF`). Elixir's `Integer.to_string(n, 16)` returns uppercase (`FF`). The helpers use `String.downcase/1` to correct this.
 
-# oct — minus before prefix
-defp py_oct(n) when n < 0, do: "-0o" <> Integer.to_string(-n, 8)
-defp py_oct(n), do: "0o" <> Integer.to_string(n, 8)
-
-# bin — minus before prefix
-defp py_bin(n) when n < 0, do: "-0b" <> Integer.to_string(-n, 2)
-defp py_bin(n), do: "0b" <> Integer.to_string(n, 2)
-```
-
-**Important:** Python's `hex()` returns lowercase hex digits (`0xff`, not `0xFF`). Elixir's `Integer.to_string(n, 16)` returns uppercase (`FF`). The `String.downcase/1` call is required.
-
-**Important:** Python's `hex(-255)` returns `"-0xff"` — the minus sign precedes the `0x` prefix. A naive implementation like `"0x" <> String.downcase(Integer.to_string(n, 16))` would produce `"0x-ff"` for negative inputs because `Integer.to_string(-255, 16)` returns `"-FF"`. The helpers above use separate clauses for negative and non-negative inputs to produce the correct format.
+**Important:** Python's `hex(-255)` returns `"-0xff"` — the minus sign precedes the `0x` prefix. A naive implementation like `"0x" <> String.downcase(Integer.to_string(n, 16))` would produce `"0x-ff"` for negative inputs because `Integer.to_string(-255, 16)` returns `"-FF"`. The helpers use separate clauses for negative and non-negative inputs to produce the correct format.
 
 ### 11.16 `input()` Function
 
@@ -364,39 +338,7 @@ IO.puts("")
 
 **Solution:** For `print()` (no arguments), map to `IO.puts("")`. For `print(arg)` (single argument), map to `IO.puts(py_str(arg))`. For `print(arg1, arg2, ...)`, map to `IO.puts(Enum.join([py_str(arg1), py_str(arg2), ...], " "))`. For `print(..., sep=..., end=...)`, generate the appropriate `Enum.join` with custom separator and `IO.write` instead of `IO.puts` for custom end.
 
-**Critical: `to_string/1` does NOT match Python's `str()` for booleans and `None`.** Python's `print(True)` outputs `True` (capital T), `print(False)` outputs `False` (capital F), and `print(None)` outputs `None`. Elixir's `to_string(true)` returns `"true"` (lowercase), `to_string(false)` returns `"false"` (lowercase), and `to_string(nil)` returns `""` (empty string). Use a `py_str/1` helper instead of `to_string/1`:
-
-```elixir
-defp py_str(true), do: "True"
-defp py_str(false), do: "False"
-defp py_str(nil), do: "None"
-defp py_str(x) when is_atom(x), do: Atom.to_string(x)
-defp py_str(x) when is_list(x), do: py_repr_list(x)
-defp py_str(x) when is_tuple(x), do: py_repr_tuple(x)
-defp py_str(x) when is_map(x), do: py_repr_map(x)
-defp py_str(x), do: to_string(x)
-
-defp py_repr_list(items) do
-  inner = Enum.map_join(items, ", ", &py_repr/1)
-  "[" <> inner <> "]"
-end
-
-defp py_repr_tuple(t) do
-  items = Tuple.to_list(t)
-  case items do
-    [single] -> "(" <> py_repr(single) <> ",)"
-    _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
-  end
-end
-
-defp py_repr_map(m) do
-  inner = Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end)
-  "{" <> inner <> "}"
-end
-
-defp py_repr(x) when is_binary(x), do: "'" <> x <> "'"
-defp py_repr(x), do: py_str(x)
-```
+**Critical: `to_string/1` does NOT match Python's `str()` for booleans and `None`.** Python's `print(True)` outputs `True` (capital T), `print(False)` outputs `False` (capital F), and `print(None)` outputs `None`. Elixir's `to_string(true)` returns `"true"` (lowercase), `to_string(false)` returns `"false"` (lowercase), and `to_string(nil)` returns `""` (empty string). Use the `py_str/1` helper instead of `to_string/1`. See §13.20 for the canonical definitions of `py_str/1`, `py_repr/1`, `py_repr_list/1`, `py_repr_tuple/1`, and `py_repr_map/1`.
 
 **Why `to_string/1` is wrong for compound types:**
 - `to_string([65, 66])` returns `"AB"` (treats list as charlist), not `"[65, 66]"`.
@@ -423,19 +365,11 @@ result = str(count) + " items found"   # "5 items found"
 # CORRECT: "hello" <> " " <> "world"
 ```
 
-**Solution — runtime `py_add/2` helper:** Rather than attempting compile-time type inference, the transpiler uses a runtime-dispatching helper for all `Add` operations:
-
-```elixir
-defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
-defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
-defp py_add(a, b), do: a + b
-```
+**Solution — runtime `py_add/2` helper:** Rather than attempting compile-time type inference, the transpiler uses a runtime-dispatching helper for all `Add` operations. See §13.20 for the canonical definition of `py_add/2`.
 
 This handles both string concatenation (`"hello" + " world"`) and list concatenation (`[1, 2] + [3, 4]` → `[1, 2, 3, 4]`), which are both valid uses of `+` in Python. All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids the complexity of tracking string types through the context struct. The `py_add` helper is unconditionally included in the generated module (it's a no-op if never called).
 
-**Note:** The version above is simplified. The full `py_add` with boolean handling and list concatenation is defined in §13.20.
-
-See §11.24 for the extended version of `py_add` that also handles boolean operands.
+See §11.24 for the boolean handling that `py_add` also covers.
 
 ### 11.20 String and List Repetition with `*` (Critical)
 
@@ -453,23 +387,15 @@ String.duplicate("abc", 3)             # "abcabcabc"
 List.duplicate([1, 2], 3) |> Enum.concat()  # [1, 2, 1, 2, 1, 2]
 ```
 
-**Solution — runtime `py_mult/2` helper:**
+**Solution — runtime `py_mult/2` helper:** See §13.20 for the canonical definition.
 
-```elixir
-defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
-defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
-defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
-defp py_mult(a, b) when is_integer(a) and is_list(b), do: py_mult(b, a)
-defp py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
-defp py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
-defp py_mult(a, b), do: a * b
-```
+**Key implementation details:**
 
-**Note on boolean handling in `py_mult`:** Python's `True * 3` returns `3` and `False * 5` returns `0` because `bool` is a subclass of `int`. In Elixir, `true * 3` raises `ArithmeticError`. The `is_boolean` clauses convert booleans to integers before dispatching. These clauses must appear before the catch-all `a * b` clause but after the `is_binary`/`is_list` clauses (a boolean operand with a string or list would be a `TypeError` in Python too, so the ordering doesn't matter for those cases).
+- **Negative repeat counts:** Python's `"abc" * -1` returns `""` and `[1, 2] * -1` returns `[]`. Elixir's `String.duplicate/2` and `List.duplicate/2` raise `ArgumentError` on negative counts. The `py_mult` helper must guard against this, returning `""` or `[]` for non-positive repeat counts.
 
-**Note:** The version above is simplified. The canonical `py_mult` with all cases is defined in §13.20.
+- **Boolean handling:** Python's `True * 3` returns `3` and `False * 5` returns `0` because `bool` is a subclass of `int`. In Elixir, `true * 3` raises `ArithmeticError`. The `is_boolean` clauses convert booleans to integers before dispatching.
 
-**CRITICAL: Use `Enum.concat/1`, NOT `List.flatten/1`.** `Enum.concat/1` flattens exactly one level of nesting, which is correct. `List.flatten/1` recursively flattens ALL levels, which would corrupt nested list repetition:
+- **CRITICAL: Use `Enum.concat/1`, NOT `List.flatten/1`.** `Enum.concat/1` flattens exactly one level of nesting, which is correct. `List.flatten/1` recursively flattens ALL levels, which would corrupt nested list repetition:
 
 ```elixir
 # Python: [[1, 2]] * 3  →  [[1, 2], [1, 2], [1, 2]]
@@ -594,23 +520,11 @@ count = count + (x > 0)   # common idiom: adds 1 if x > 0, else 0
 # WRONG: false + 1    → ArithmeticError
 ```
 
-**Solution — runtime `py_add/2` already handles this partially**, but the `count + (x > 0)` idiom is especially common in competitive programming. The `py_add` helper should be extended:
+**Solution — runtime `py_add/2` already handles this partially**, but the `count + (x > 0)` idiom is especially common in competitive programming. The `py_add` helper includes `is_boolean` clauses that convert booleans to integers before performing arithmetic. See §13.20 for the canonical definition.
 
-```elixir
-defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
-defp py_add(a, b) when is_boolean(a), do: py_add(bool_to_int(a), b)
-defp py_add(a, b) when is_boolean(b), do: py_add(a, bool_to_int(b))
-defp py_add(a, b), do: a + b
-
-defp bool_to_int(true), do: 1
-defp bool_to_int(false), do: 0
-```
-
-**Note:** The `is_boolean` clauses must come before the catch-all `py_add(a, b), do: a + b` clause, since `a + b` would crash on boolean operands. (In Elixir, `is_integer(true)` returns `false`, so there is no guard-ordering conflict between `is_boolean` and `is_number`/`is_integer` — they don't overlap.) The `py_mult` helper should handle booleans similarly.
+**Note:** The `is_boolean` clauses must come before the catch-all `py_add(a, b), do: a + b` clause, since `a + b` would crash on boolean operands. (In Elixir, `is_integer(true)` returns `false`, so there is no guard-ordering conflict between `is_boolean` and `is_number`/`is_integer` — they don't overlap.) The `py_mult` helper handles booleans similarly.
 
 **Failure mode:** Silent crash (`ArithmeticError`) in code that uses boolean-integer arithmetic. This pattern is common in competitive programming where `count += (condition)` is idiomatic Python.
-
-**Note on helper consolidation:** The `py_add`, `py_mult`, and `py_bool_to_int` helpers shown here are simplified versions. The canonical, complete versions that handle all cases (booleans, strings, lists) are defined in §13.20. Implementers should use the §13.20 versions.
 
 ### 11.25 `round()` Banker's Rounding (Silent Correctness Trap)
 
@@ -626,7 +540,7 @@ defp bool_to_int(false), do: 0
 
 **Failure mode:** Silent wrong answer. No crash. Affects any code that relies on rounding .5 values.
 
-**Solution — `round(x)` with no `ndigits`:** Use Erlang's `:erlang.round/1`, which also rounds half-away-from-zero — same behavior as Elixir's `round/1`. For exact Python semantics, a custom helper is needed:
+**Solution — `round(x)` with no `ndigits`:** Elixir's `round/1` also rounds half-away-from-zero, not half-to-even. For exact Python semantics, a custom helper is needed (see the commented-out `py_round` in §13.20):
 
 ```elixir
 defp py_round(x) when is_integer(x), do: x

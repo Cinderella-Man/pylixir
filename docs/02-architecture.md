@@ -415,7 +415,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 
 #### 6.3.10 Python AST Version Variations
 
-See §5 (in `00-overview.md`) for the full version compatibility table and serializer variation notes. Key implementation rule: **treat all version-dependent fields as optional** — use `Map.get(node, "type_params", [])` not `node["type_params"]`.
+See §5 (in `00-overview.md`) for version compatibility notes and serializer variation notes. Key implementation rule: **treat all version-dependent fields as optional** — use `Map.get(node, "type_params", [])` not `node["type_params"]`.
 
 ---
 
@@ -438,9 +438,9 @@ See §5 (in `00-overview.md`) for the full version compatibility table and seria
 
 Note: `LShift`, `RShift`, `BitOr`, `BitXor`, `BitAnd`, and `Invert` are listed for completeness but may raise `UnsupportedNodeError` initially. Most algorithmic code does not use bitwise shifts (though `BitAnd`, `BitOr`, `BitXor` do appear in some problems).
 
-**Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `import Bitwise`. The code generator should unconditionally emit `import Bitwise` at the top of the generated module. This is a no-op when no bitwise operators are used, and avoids the need to track usage through the context struct. **Note:** `use Bitwise` is deprecated in favor of `import Bitwise`.
+**Bitwise operators require `import Bitwise`:** The operators `<<<`, `>>>`, `|||`, `&&&`, `^^^`, and `~~~` are only available after `import Bitwise`. The code generator should unconditionally emit `import Bitwise` at the top of the generated module. This is a no-op when no bitwise operators are used, and avoids the need to track usage through the context struct.
 
-**`^^^` deprecation warning:** Since Elixir 1.12, the `^^^` (XOR) operator emits a deprecation warning about wrong precedence. The generated code will still compile and work correctly, but will produce warnings. If targeting Elixir 1.12+, consider using `Bitwise.bxor(a, b)` instead of `a ^^^ b` to suppress warnings. Alternatively, accept the warnings — the operator still functions correctly.
+**`^^^` (XOR) operator:** The `^^^` operator emits a deprecation warning about wrong precedence in modern Elixir. The generated code will still compile and work correctly. To suppress warnings, use `Bitwise.bxor(a, b)` instead of `a ^^^ b`.
 
 #### Expressions (~12 nodes)
 `BinOp`, `UnaryOp`, `Compare`, `BoolOp`, `Call`, `IfExp`, `Subscript`, `Attribute`, `ListComp`, `Lambda`, `Slice`, `Starred` (in function call arguments only — `*args` unpacking)
@@ -771,6 +771,6 @@ For implementers who need to verify their AST construction, here's what `Macro.t
 | `{:__block__, [], [{:=, [], [{:x, [], nil}, 1]}, {:x, [], nil}]}` | `"x = 1\nx"` |
 | `{{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [{:list, [], nil}]}` | `"Enum.sort(list)"` |
 
-**Important gotcha:** `Code.format_string!/1` returns **iodata**, NOT a binary string. To get a binary string, pipe through `IO.iodata_to_binary/1`. Note that `Macro.to_string/1` does return a binary string directly — the iodata gotcha applies only to `Code.format_string!/1`.
+**Important gotcha:** `Code.format_string!/1` returns **iodata**, NOT a binary string. See §6.1.1 for the full explanation and correct pipeline.
 
 **Important gotcha — parenthesization:** `Macro.to_string/1` produces syntactically valid but visually ugly code — it adds parentheses around special forms like `defmodule(Foo) do`, `def(add(a, b)) do`, etc. This is cosmetically unpleasant but harmless: `Code.format_string!/1` cleans these up automatically. Do not use `Macro.to_string/1` output directly as the final result — always pass through `Code.format_string!/1`.

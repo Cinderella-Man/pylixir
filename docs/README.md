@@ -1,8 +1,8 @@
 # RFC-001: pylixir — Python AST to Elixir Transpiler Implementation Plan
 
-**Status:** Draft → Implementation Plan (v7)
+**Status:** Draft → Implementation Plan (v8)
 **Created:** 2026-05-09
-**Revised:** 2026-05-11 (v7 — restructured: merged implementation files, deduplicated version tables and helper definitions, added boolean comparison edge case, added float('inf')/str.split("") edge cases, fixed stale truthy? call-site references, consolidated helper canonical definitions into single file)
+**Revised:** 2026-05-11 (v8 — removed Elixir version-specific tables/workarounds (targets current stable), eliminated helper code duplication across files (all canonical in §13.20), fixed py_mult to handle negative repeat counts, fixed py_in clause ordering for MapSet, fixed worked example to use py_add/py_str, added context to §17.1 string similarity section)
 
 ---
 
@@ -22,5 +22,6 @@
 ### Conventions
 
 - **Canonical helper definitions** live in §13.20 (inside `03-implementation.md`). Other sections reference helpers but do not redefine them.
-- **Version compatibility** is defined once in §5 (inside `00-overview.md`). Other files reference §5 rather than duplicating the table.
+- **Python AST version notes** are in §5 (inside `00-overview.md`). Key rule: treat all version-dependent fields as optional.
 - **Builtins mapping tables** live in §12.8 (inside `05-node-reference.md`). Implementation notes reference §12.8 for the authoritative table.
+- **String/dict/mutation method tables** live in §9.4, §9.5, and §9.5.1 (inside `03-implementation.md`). §12.8 references these for the authoritative tables.

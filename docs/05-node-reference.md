@@ -136,17 +136,9 @@ All operator nodes (listed in §7.1) are handled as child nodes of `BinOp`, `Una
 # See §11.21 for full slice translation table
 ```
 
-**Note on `Subscript` dispatch:** When the `Subscript.slice` is a `Slice` node, always use the slice translation table (§11.21). When it is a simple expression (integer index or key), the converter uses `Enum.at/2` for lists, `String.at/2` for strings, and `Map.fetch!/2` for dicts. Since the transpiler does not track types, it uses a runtime-dispatching helper:
+**Note on `Subscript` dispatch:** When the `Subscript.slice` is a `Slice` node, always use the slice translation table (§11.21). When it is a simple expression (integer index or key), the converter uses `Enum.at/2` for lists, `String.at/2` for strings, and `Map.fetch!/2` for dicts. Since the transpiler does not track types, it uses the runtime-dispatching helper `py_getitem/2` (see §13.20 for the canonical definition).
 
-```elixir
-defp py_getitem(collection, key) when is_list(collection), do: Enum.at(collection, key)
-defp py_getitem(collection, key) when is_binary(collection), do: String.at(collection, key)
-defp py_getitem(collection, key) when is_tuple(collection) and key >= 0, do: elem(collection, key)
-defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, tuple_size(collection) + key)
-defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
-```
-
-**Note on MapSet:** `MapSet` is a struct (map), so the `is_map` clause would match MapSets. This is acceptable because `MapSet` does not support subscript access in Python (sets are not subscriptable), so this case should not arise in valid translated code.
+**Note on MapSet:** `MapSet` is a struct (map), so the `is_map` clause in `py_getitem` would match MapSets. This is acceptable because `MapSet` does not support subscript access in Python (sets are not subscriptable), so this case should not arise in valid translated code.
 
 **`Attribute`** — attribute access.
 
@@ -349,9 +341,9 @@ The following node types raise `UnsupportedNodeError`:
 | `range(start, stop)` | `start..(stop-1)//1` |
 | `range(start, stop, step)` | See §11.22 for step-direction-dependent formula |
 | `sorted(x)` | `Enum.sort(x)` |
-| `sorted(x, reverse=True)` | `Enum.sort(x, :desc)` — **requires Elixir 1.10+**; for older versions use `Enum.sort(x) \|> Enum.reverse()` |
+| `sorted(x, reverse=True)` | `Enum.sort(x, :desc)` |
 | `sorted(x, key=f)` | `Enum.sort_by(x, f)` |
-| `sorted(x, key=f, reverse=True)` | `Enum.sort_by(x, f, :desc)` — **requires Elixir 1.10+**; for older versions use `Enum.sort_by(x, f) \|> Enum.reverse()` |
+| `sorted(x, key=f, reverse=True)` | `Enum.sort_by(x, f, :desc)` |
 
 **`sorted` keyword argument detection:** The `key` and `reverse` arguments appear as `keyword` nodes in the AST's `Call.keywords` list. The converter must inspect `keywords` for entries with `arg: "key"` and `arg: "reverse"`. When `reverse` is present and its `value` is `Constant(value=true)`, use `:desc`. When `key` is present, switch from `Enum.sort` to `Enum.sort_by`. When both are present, use `Enum.sort_by(x, f, :desc)`.
 
@@ -425,33 +417,11 @@ The following node types raise `UnsupportedNodeError`:
 
 #### String Methods (Non-Mutating)
 
-These are method calls on string objects. See §9.5.1 for the full table. The most commonly encountered in algorithmic code:
-
-| Python Method | Elixir Translation |
-|---|---|
-| `s.lower()` | `String.downcase(s)` |
-| `s.upper()` | `String.upcase(s)` |
-| `s.strip()` | `String.trim(s)` |
-| `s.split()` / `s.split(sep)` | `String.split(s)` / `String.split(s, sep)` |
-| `sep.join(items)` | `Enum.join(items, sep)` |
-| `s.startswith(p)` | `String.starts_with?(s, p)` |
-| `s.endswith(p)` | `String.ends_with?(s, p)` |
-| `s.find(sub)` | `py_str_find(s, sub)` — returns `-1` on not found (see §9.5.1) |
-| `s.count(sub)` | `py_str_count(s, sub)` (see §9.5.1) |
-| `s.replace(old, new)` | `String.replace(s, old, new)` |
-| `list.index(x)` | `py_list_index(list, x)` — raises on not found (see §9.5.1) |
+These are method calls on string objects. See §9.5.1 for the full table and implementation details.
 
 #### Dictionary Methods (Non-Mutating)
 
-These are called as expressions (not statements) and return values:
-
-| Python | Elixir |
-|---|---|
-| `d.items()` | `Map.to_list(d)` |
-| `d.keys()` | `Map.keys(d)` |
-| `d.values()` | `Map.values(d)` |
-| `d.get(key)` | `Map.get(d, key)` |
-| `d.get(key, default)` | `Map.get(d, key, default)` |
+These are called as expressions (not statements) and return values. See §9.5 for the full table including mutation methods.
 
 #### Builtins That Raise `UnsupportedNodeError`
 

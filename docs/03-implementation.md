@@ -103,6 +103,8 @@ Python dicts have methods that return views over their contents. These are commo
 | `my_dict.items()` | `Map.to_list(my_dict)` (returns `[{key, value}, ...]`) |
 | `my_dict.keys()` | `Map.keys(my_dict)` |
 | `my_dict.values()` | `Map.values(my_dict)` |
+| `my_dict.get(key)` | `Map.get(my_dict, key)` |
+| `my_dict.get(key, default)` | `Map.get(my_dict, key, default)` |
 
 **Note on `items()` tuple order:** Python's `dict.items()` yields `(key, value)` tuples. Elixir's `Map.to_list/1` also returns `{key, value}` tuples. The order matches, so no swapping is needed (unlike `enumerate`).
 
@@ -125,45 +127,17 @@ Python strings are immutable, so string methods always return new values. These 
 | `sep.join(items)` | `Enum.join(items, sep)` |
 | `s.replace(old, new)` | `String.replace(s, old, new)` |
 | `s.replace(old, new, 1)` | `String.replace(s, old, new, global: false)` |
-| `s.find(sub)` | `py_str_find(s, sub)` — see helper below |
-| `s.count(sub)` | `py_str_count(s, sub)` — see helper below |
+| `s.find(sub)` | `py_str_find(s, sub)` — see §13.20 |
+| `s.count(sub)` | `py_str_count(s, sub)` — see §13.20 |
 | `s.isdigit()` | `Regex.match?(~r/^\d+$/, s)` |
 | `s.isalpha()` | `Regex.match?(~r/^\p{L}+$/u, s)` |
 | `s.isalnum()` | `Regex.match?(~r/^[\p{L}\d]+$/u, s)` |
-| `s.index(x)` | `py_str_index(s, x)` — raises on not found (same as `list.index`) |
+| `s.index(x)` | `py_str_index(s, x)` — raises on not found (see §13.20, same logic as `list.index`) |
 | `s.zfill(width)` | `String.pad_leading(s, width, "0")` |
 
 **Note on `join` argument order:** Python's `join` is a method on the separator: `", ".join(items)`. In the AST, `func` is `Attribute(value=Constant(", "), attr="join")`. The converter must detect this pattern and emit `Enum.join(items, sep)` with the arguments swapped.
 
-**Helpers for `find` and `count`:**
-
-```elixir
-# s.find(sub) — returns character index or -1 (not nil)
-# NOTE: uses String operations for correct Unicode character positions.
-# :binary.match/2 returns byte offsets, which differ from character offsets
-# for multi-byte UTF-8 characters. This version is correct for all strings.
-defp py_str_find(s, sub) do
-  case String.split(s, sub, parts: 2) do
-    [_] -> -1
-    [before, _rest] -> String.length(before)
-  end
-end
-
-# s.count(sub) — count non-overlapping occurrences
-# NOTE: empty substring — Python's "abc".count("") returns 4 (len + 1).
-defp py_str_count(s, ""), do: String.length(s) + 1
-defp py_str_count(s, sub) do
-  length(String.split(s, sub)) - 1
-end
-
-# list.index(x) — returns index or raises ValueError equivalent
-defp py_list_index(list, x) do
-  case Enum.find_index(list, fn v -> v == x end) do
-    nil -> raise RuntimeError, "#{inspect(x)} is not in list"
-    idx -> idx
-  end
-end
-```
+**Helpers for `find`, `count`, and `index`:** These methods need custom helpers because their return values or error behaviors differ from the closest Elixir equivalents. See §13.20 for the canonical definitions of `py_str_find/2`, `py_str_count/2`, and `py_list_index/2`.
 
 ### 9.6 `del` and `pop` — List Mutation Behavior
 
@@ -237,11 +211,13 @@ Python's `in` operator checks membership in any collection. Since the transpiler
 
 ```elixir
 defp py_in(elem, collection) when is_list(collection), do: elem in collection
-defp py_in(elem, collection) when is_map(collection), do: Map.has_key?(collection, elem)
 defp py_in(elem, collection) when is_binary(collection), do: String.contains?(collection, elem)
 defp py_in(elem, %MapSet{} = collection), do: MapSet.member?(collection, elem)
+defp py_in(elem, collection) when is_map(collection), do: Map.has_key?(collection, elem)
 defp py_in(elem, collection) when is_tuple(collection), do: py_in(elem, Tuple.to_list(collection))
 ```
+
+**Important:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. Without the explicit `%MapSet{}` clause, the `is_map` clause would match MapSets and call `Map.has_key?`, which checks struct keys, not set membership. See §13.20 for the canonical definition.
 
 **Note on tuples:** Python supports `x in (1, 2, 3)` (tuple membership). Elixir tuples do NOT implement the `Enumerable` protocol, so `Enum.member?/2` raises `Protocol.UndefinedError` on tuples. The `is_tuple` clause converts to a list first.
 
@@ -257,18 +233,11 @@ When the collection is a literal list or range, the converter can emit `x in col
 
 ### 9.10 The `len()` Function
 
-Python's `len()` works on lists, tuples, dicts, sets, and strings. Since the transpiler does not perform type inference, it uses a runtime-dispatching helper:
-
-```elixir
-defp py_len(x) when is_list(x), do: length(x)
-defp py_len(x) when is_binary(x), do: String.length(x)
-defp py_len(x) when is_map(x), do: map_size(x)
-defp py_len(x) when is_tuple(x), do: tuple_size(x)
-```
+Python's `len()` works on lists, tuples, dicts, sets, and strings. Since the transpiler does not perform type inference, it uses a runtime-dispatching helper `py_len/1` (see §13.20 for the canonical definition).
 
 When the argument is a literal list or a variable assigned from a list literal in the same scope, the converter may emit `length(x)` directly as an optimization. Otherwise, emit `py_len(x)`.
 
-**Note on MapSet:** `MapSet` is a struct (map), so `map_size/1` returns the struct's internal map size, not the set element count. For `MapSet`, use `MapSet.size/1`. The `py_len` helper can be extended with a clause `defp py_len(%MapSet{} = x), do: MapSet.size(x)` placed before the `is_map` clause.
+**Note on MapSet:** `MapSet` is a struct (map), so `map_size/1` on a `MapSet` returns the struct's internal field count (always 2 for `__struct__` and `map`), not the set element count. The `py_len` helper uses a `%MapSet{}` clause with `MapSet.size/1` placed before the `is_map` clause to handle this correctly.
 
 ### 9.11 `not` Operator
 
@@ -355,7 +324,7 @@ When a `while` loop is encountered, its helper `defp` function is emitted inline
 - Generated Elixir code wraps everything in a `defmodule TranslatedCode do ... end` block.
 - Python function definitions become `defp` (private functions).
 - The module has a single `def run do ... end` public function that contains all top-level (non-function) statements from the Python source.
-- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. **Note:** `use Bitwise` is deprecated; use `import Bitwise` instead. See §7.1 for the `^^^` deprecation note.
+- `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. See §7.1 for the `^^^` deprecation note.
 - The generated code ends with `TranslatedCode.run()` to execute the entry point.
 - The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_pow/2`, `py_len/1`, `py_in/2`, `py_getitem/2`, `py_setitem/3`, `py_int/1`, `py_float/1`, `py_str/1`, `py_bool_to_int/1`, `truthy?/1`, `py_str_find/2`, `py_str_count/2`, `py_list_index/2`, `py_repr/1`, `py_hex/1`, `py_oct/1`, `py_bin/1`, `py_abs/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
 
@@ -946,10 +915,14 @@ defp py_add(a, b) when is_number(a) and is_number(b), do: a + b
 defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
 defp py_add(a, b), do: a + b
 
-defp py_mult(a, b) when is_binary(a) and is_integer(b), do: String.duplicate(a, b)
-defp py_mult(a, b) when is_integer(a) and is_binary(b), do: String.duplicate(b, a)
-defp py_mult(a, b) when is_list(a) and is_integer(b), do: List.duplicate(a, b) |> Enum.concat()
-defp py_mult(a, b) when is_integer(a) and is_list(b), do: List.duplicate(b, a) |> Enum.concat()
+defp py_mult(a, b) when is_binary(a) and is_integer(b) and b > 0, do: String.duplicate(a, b)
+defp py_mult(a, b) when is_binary(a) and is_integer(b), do: ""
+defp py_mult(a, b) when is_integer(a) and is_binary(b) and a > 0, do: String.duplicate(b, a)
+defp py_mult(a, b) when is_integer(a) and is_binary(b), do: ""
+defp py_mult(a, b) when is_list(a) and is_integer(b) and b > 0, do: List.duplicate(a, b) |> Enum.concat()
+defp py_mult(a, b) when is_list(a) and is_integer(b), do: []
+defp py_mult(a, b) when is_integer(a) and is_list(b) and a > 0, do: List.duplicate(b, a) |> Enum.concat()
+defp py_mult(a, b) when is_integer(a) and is_list(b), do: []
 defp py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
 defp py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
 defp py_mult(a, b), do: a * b
