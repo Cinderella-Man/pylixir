@@ -415,18 +415,7 @@ Operators are child nodes of `BinOp`, `UnaryOp`, `BoolOp`, and `Compare`. They n
 
 #### 6.3.10 Python AST Version Variations
 
-The Python AST format is not stable across versions. While this library targets "Python 3.8+," the AST shape varies:
-
-| Feature | Python 3.8–3.9 | Python 3.10–3.11 | Python 3.12+ |
-|---|---|---|---|
-| `Constant.kind` field | Present (`"u"` or `nil`) | Present (`"u"` or `nil`) | Present (still in grammar) |
-| `FunctionDef.type_params` | **Does not exist** | **Does not exist** | Present (list of type parameter nodes) |
-| Old literal nodes (`Num`, `Str`, `Bytes`, `NameConstant`, `Ellipsis`) | Deprecated but still produced by some tools | Deprecated but still produced by some tools | Emit `DeprecationWarning` (3.12–3.13); **removed in 3.14** |
-| `Match` statement | Does not exist | Present (Python 3.10+, PEP 634) | Present |
-
-**The converter should treat version-dependent fields as optional.** Use `Map.get(node, "type_params", [])` rather than `node["type_params"]` to avoid `KeyError` on pre-3.12 ASTs. Similarly, `Map.get(node, "kind", nil)` for `Constant.kind`.
-
-**Serializer variations:** The JSON representation of the Python AST depends on the serializer used (`ast2json`, `ast.dump` with custom serialization, etc.). Key areas where serializers diverge: representation of complex numbers (no JSON type exists), representation of `bytes` literals, handling of `Ellipsis` constant, and whether metadata fields (`lineno`, `col_offset`, etc.) are included. The converter should be resilient to missing metadata fields and should not depend on any specific serializer's conventions for unserializable types.
+See §5 (in `00-overview.md`) for the full version compatibility table and serializer variation notes. Key implementation rule: **treat all version-dependent fields as optional** — use `Map.get(node, "type_params", [])` not `node["type_params"]`.
 
 ---
 

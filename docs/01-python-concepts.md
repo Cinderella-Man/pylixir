@@ -76,7 +76,7 @@ Python treats many values as "falsy" in boolean contexts. The following values a
 | `{}` (empty dict) | **NOT falsy in Elixir** | Elixir treats `%{}` as truthy |
 | `set()` (empty set) | **NOT falsy in Elixir** | No direct equivalent |
 
-**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `Pylixir.Helpers.truthy?/1` helper function where exact Python truthiness is required. See §11.3.
+**This is the single largest semantic gap between Python and Elixir.** The transpiler must handle this with `&&`/`||`/`!` operators (which use Elixir's truthiness — only `nil` and `false` are falsy) and a `truthy?/1` helper function where exact Python truthiness is required. See §11.3.
 
 ### 2.7 Python's `and`/`or`/`not` vs Elixir's `and`/`or`/`not`
 
@@ -91,7 +91,7 @@ Elixir's `and`/`or`/`not` **require boolean operands** and raise `BadBooleanErro
 
 **Solution:** The transpiler uses `&&`/`||`/`!` which accept any value in Elixir, matching Python's flexibility (though with Elixir's truthiness model, not Python's).
 
-**`not`/`!` truthiness gap:** Python's `not` uses Python's truthiness: `not 0` → `True`, `not []` → `True`, `not ""` → `True`. Elixir's `!` uses Elixir's truthiness: `!0` → `false`, `![]` → `false`, `!""` → `false`. These disagree on `0`, `[]`, `""`, and `%{}`. The transpiler uses `!Pylixir.Helpers.truthy?(x)` instead of `!x` to ensure Python truthiness semantics. See §11.3.
+**`not`/`!` truthiness gap:** Python's `not` uses Python's truthiness: `not 0` → `True`, `not []` → `True`, `not ""` → `True`. Elixir's `!` uses Elixir's truthiness: `!0` → `false`, `![]` → `false`, `!""` → `false`. These disagree on `0`, `[]`, `""`, and `%{}`. The transpiler uses `!truthy?(x)` instead of `!x` to ensure Python truthiness semantics. See §11.3.
 
 ### 2.8 Chained Comparisons
 

@@ -178,3 +178,16 @@ The JSON representation of the Python AST depends on the serializer used (`ast2j
 - **Metadata fields:** Some serializers include `lineno`, `col_offset`, etc.; others strip them.
 
 The converter is resilient to missing metadata fields and does not depend on any specific serializer's conventions for unserializable types.
+
+### 5.5 Minimum Elixir Version
+
+The generated code requires **Elixir 1.12 or later**. Key version-dependent features used:
+
+| Feature | Minimum version |
+|---|---|
+| `Enum.sort/2` with `:asc`/`:desc` atom | Elixir 1.10 |
+| `is_struct/1` guard (used in `py_str` helper) | Elixir 1.11 |
+| `import Bitwise` (non-deprecated form) | Elixir 1.0 (always valid) |
+| `^^^` operator without deprecation warning | Pre-1.12 (warns in 1.12+, still works) |
+
+**Recommendation:** Target Elixir 1.12+ as the baseline. This covers all features used by the generated code. The `^^^` (XOR) operator emits a deprecation warning in 1.12+ but functions correctly; use `Bitwise.bxor(a, b)` to suppress warnings if desired.

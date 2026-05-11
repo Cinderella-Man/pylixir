@@ -76,6 +76,8 @@ defp truthy?(_), do: true
 
 **Note on `MapSet` ordering:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. Without the explicit `%MapSet{}` clause, `map_size(MapSet.new())` would return `2` (for `__struct__` and `map` internal keys), incorrectly making `truthy?(MapSet.new())` return `true`. Python's `set()` is falsy, so the explicit `MapSet.size/1` check is required.
 
+**Note on `-0.0`:** Python treats `-0.0` as falsy (`bool(-0.0)` → `False`). The `truthy?(0.0)` clause correctly handles this because Elixir's pattern matching treats `0.0` and `-0.0` as equal (`0.0 === -0.0` is `true`), so `-0.0` matches the `0.0` clause. No special handling needed.
+
 **Translation rules:**
 
 - `if x:` → `if truthy?(x) do ... end`
@@ -277,14 +279,25 @@ Integer.to_string(255, 8)   # "377" — missing "0o" prefix
 Integer.to_string(255, 2)   # "11111111" — missing "0b" prefix
 ```
 
-**Solution:** Generate helpers that add the prefix and fix casing:
+**Solution:** Generate helpers that add the prefix and fix casing, **handling negative numbers correctly** (Python puts the minus sign before the prefix: `hex(-255)` → `"-0xff"`, not `"0x-ff"`):
+
 ```elixir
-"0x" <> String.downcase(Integer.to_string(n, 16))   # hex — Python uses lowercase
-"0o" <> Integer.to_string(n, 8)                       # oct
-"0b" <> Integer.to_string(n, 2)                       # bin
+# hex — Python uses lowercase, minus before prefix
+defp py_hex(n) when n < 0, do: "-0x" <> String.downcase(Integer.to_string(-n, 16))
+defp py_hex(n), do: "0x" <> String.downcase(Integer.to_string(n, 16))
+
+# oct — minus before prefix
+defp py_oct(n) when n < 0, do: "-0o" <> Integer.to_string(-n, 8)
+defp py_oct(n), do: "0o" <> Integer.to_string(n, 8)
+
+# bin — minus before prefix
+defp py_bin(n) when n < 0, do: "-0b" <> Integer.to_string(-n, 2)
+defp py_bin(n), do: "0b" <> Integer.to_string(n, 2)
 ```
 
 **Important:** Python's `hex()` returns lowercase hex digits (`0xff`, not `0xFF`). Elixir's `Integer.to_string(n, 16)` returns uppercase (`FF`). The `String.downcase/1` call is required.
+
+**Important:** Python's `hex(-255)` returns `"-0xff"` — the minus sign precedes the `0x` prefix. A naive implementation like `"0x" <> String.downcase(Integer.to_string(n, 16))` would produce `"0x-ff"` for negative inputs because `Integer.to_string(-255, 16)` returns `"-FF"`. The helpers above use separate clauses for negative and non-negative inputs to produce the correct format.
 
 ### 11.16 `input()` Function
 
@@ -420,6 +433,8 @@ defp py_add(a, b), do: a + b
 
 This handles both string concatenation (`"hello" + " world"`) and list concatenation (`[1, 2] + [3, 4]` → `[1, 2, 3, 4]`), which are both valid uses of `+` in Python. All `BinOp` `Add` nodes emit `py_add(a, b)`. This is simple, correct, and avoids the complexity of tracking string types through the context struct. The `py_add` helper is unconditionally included in the generated module (it's a no-op if never called).
 
+**Note:** The version above is simplified. The full `py_add` with boolean handling and list concatenation is defined in §13.20.
+
 See §11.24 for the extended version of `py_add` that also handles boolean operands.
 
 ### 11.20 String and List Repetition with `*` (Critical)
@@ -451,6 +466,8 @@ defp py_mult(a, b), do: a * b
 ```
 
 **Note on boolean handling in `py_mult`:** Python's `True * 3` returns `3` and `False * 5` returns `0` because `bool` is a subclass of `int`. In Elixir, `true * 3` raises `ArithmeticError`. The `is_boolean` clauses convert booleans to integers before dispatching. These clauses must appear before the catch-all `a * b` clause but after the `is_binary`/`is_list` clauses (a boolean operand with a string or list would be a `TypeError` in Python too, so the ordering doesn't matter for those cases).
+
+**Note:** The version above is simplified. The canonical `py_mult` with all cases is defined in §13.20.
 
 **CRITICAL: Use `Enum.concat/1`, NOT `List.flatten/1`.** `Enum.concat/1` flattens exactly one level of nesting, which is correct. `List.flatten/1` recursively flattens ALL levels, which would corrupt nested list repetition:
 
@@ -592,3 +609,162 @@ defp bool_to_int(false), do: 0
 **Note:** The `is_boolean` clauses must come before the catch-all `py_add(a, b), do: a + b` clause, since `a + b` would crash on boolean operands. (In Elixir, `is_integer(true)` returns `false`, so there is no guard-ordering conflict between `is_boolean` and `is_number`/`is_integer` — they don't overlap.) The `py_mult` helper should handle booleans similarly.
 
 **Failure mode:** Silent crash (`ArithmeticError`) in code that uses boolean-integer arithmetic. This pattern is common in competitive programming where `count += (condition)` is idiomatic Python.
+
+**Note on helper consolidation:** The `py_add`, `py_mult`, and `py_bool_to_int` helpers shown here are simplified versions. The canonical, complete versions that handle all cases (booleans, strings, lists) are defined in §13.20. Implementers should use the §13.20 versions.
+
+### 11.25 `round()` Banker's Rounding (Silent Correctness Trap)
+
+**Problem:** Python's `round()` uses **banker's rounding** (round-half-to-even), while Elixir's `round/1` uses **round-half-away-from-zero**. These disagree on .5 values.
+
+| Expression | Python | Elixir `round/1` |
+|---|---|---|
+| `round(0.5)` | `0` (round to even) | `1` ✗ |
+| `round(1.5)` | `2` (round to even) | `2` ✓ |
+| `round(2.5)` | `2` (round to even) | `3` ✗ |
+| `round(3.5)` | `4` (round to even) | `4` ✓ |
+| `round(-0.5)` | `0` (round to even) | `-1` ✗ |
+
+**Failure mode:** Silent wrong answer. No crash. Affects any code that relies on rounding .5 values.
+
+**Solution — `round(x)` with no `ndigits`:** Use Erlang's `:erlang.round/1`, which also rounds half-away-from-zero — same behavior as Elixir's `round/1`. For exact Python semantics, a custom helper is needed:
+
+```elixir
+defp py_round(x) when is_integer(x), do: x
+defp py_round(x) when is_float(x) do
+  floored = floor(x)
+  decimal = x - floored
+  cond do
+    decimal > 0.5 -> floored + 1
+    decimal < 0.5 -> floored
+    # exactly 0.5: round to even
+    rem(floored, 2) == 0 -> floored
+    true -> floored + 1
+  end
+end
+```
+
+**`round(x, ndigits)`:** Python's two-argument `round(x, n)` rounds to `n` decimal places. Elixir has no built-in equivalent. Use `Float.round(x, n)`, which also uses round-half-away-from-zero. Document the rounding difference as a known limitation for the MVP.
+
+**Known limitation for MVP:** Use Elixir's `round/1` directly and document that .5 values may round differently. Most algorithmic code does not depend on the exact rounding mode of .5 values.
+
+### 11.26 `abs()` with Booleans
+
+**Problem:** Python's `abs(True)` returns `1` and `abs(False)` returns `0` because `bool` is a subclass of `int`. Elixir's `abs(true)` raises `ArithmeticError`.
+
+```python
+abs(True)    # 1
+abs(False)   # 0
+```
+
+```elixir
+# WRONG: abs(true)  → ArithmeticError
+```
+
+**Solution:** The `abs` builtin can be mapped directly for the common case (numeric arguments). For boolean safety, use the `py_bool_to_int` helper:
+
+```elixir
+defp py_abs(x) when is_boolean(x), do: py_bool_to_int(x)
+defp py_abs(x), do: abs(x)
+```
+
+**Failure mode:** Runtime crash (`ArithmeticError`). Uncommon in practice — `abs(True)` is rare — but follows the same pattern as boolean arithmetic (§11.24).
+
+### 11.27 Boolean Values in Comparisons (Critical — v7 addition)
+
+**Problem:** In Python, `bool` is a subclass of `int`, so booleans participate in numeric comparisons: `True > 0.5` → `True` (because `1 > 0.5`), `True < 2` → `True` (because `1 < 2`), `False == 0` → `True`.
+
+In Elixir, `true` and `false` are atoms. Elixir's term ordering is: `number < atom < reference < function < port < pid < tuple < map < list < bitstring`. This means **any atom is always greater than any number**:
+
+```elixir
+# Elixir:
+true > 999999999   # true (atom > number in term ordering!)
+false > 999999999  # true (atom > number)
+true == 1          # false (different types)
+
+# Python:
+True > 999999999   # False (1 > 999999999)
+False > 999999999  # False (0 > 999999999)
+True == 1          # True (bool is int subclass)
+```
+
+**Failure mode:** 🔴 Silent wrong result. Any code that compares a boolean with a number will produce silently wrong results. This is particularly dangerous in patterns like `sorted(items, key=lambda x: x > 0)` where the comparison result (a boolean) is later compared with other booleans — this happens to work because all the values are booleans, but any code that mixes boolean comparison results with integers will break.
+
+**Affected patterns:**
+- `count += (x > 0)` — the `(x > 0)` produces `true`/`false`, then `py_add` handles it via `py_bool_to_int`. This specific pattern is safe due to the `py_add` helper.
+- `if result > 0:` where `result` was assigned from a boolean expression — this compares a boolean with a number using `>`, which uses Elixir term ordering. ❌ Wrong.
+- `max(found, x > threshold)` — compares boolean with number. ❌ Wrong.
+
+**Solution:** The comparison operators `<`, `<=`, `>`, `>=` need a runtime helper when either operand could be boolean:
+
+```elixir
+defp py_compare(a, :>, b), do: py_num(a) > py_num(b)
+defp py_compare(a, :<, b), do: py_num(a) < py_num(b)
+# etc.
+
+defp py_num(true), do: 1
+defp py_num(false), do: 0
+defp py_num(x), do: x
+```
+
+**MVP recommendation:** For the MVP, document as a known limitation. The full fix requires wrapping all comparison operators in a helper, which significantly impacts code readability. Most algorithmic code compares numbers with numbers and booleans with booleans — cross-type comparison is uncommon. The `py_add`/`py_mult` helpers already handle the most common boolean-as-int pattern (`count += (condition)`).
+
+### 11.28 `float('inf')` and `float('nan')` (v7 addition)
+
+**Problem:** Python's `float('inf')` is a common way to create infinity in competitive programming (e.g., `min_val = float('inf')`). This goes through the `py_float` helper, which calls `Float.parse("inf")`. Elixir's `Float.parse("inf")` returns `:error` — it does not recognize "inf", "infinity", or "nan" as valid float strings.
+
+```python
+float('inf')    # inf (positive infinity)
+float('-inf')   # -inf (negative infinity)
+float('nan')    # nan (not a number)
+```
+
+**Solution:** Extend `py_float` with special string handling:
+
+```elixir
+defp py_float(x) when is_binary(x) do
+  trimmed = String.trim(x)
+  case String.downcase(trimmed) do
+    "inf" -> raise UnsupportedNodeError, node_type: "float('inf')"
+    "+inf" -> raise UnsupportedNodeError, node_type: "float('inf')"
+    "-inf" -> raise UnsupportedNodeError, node_type: "float('-inf')"
+    "infinity" -> raise UnsupportedNodeError, node_type: "float('infinity')"
+    "+infinity" -> raise UnsupportedNodeError, node_type: "float('infinity')"
+    "-infinity" -> raise UnsupportedNodeError, node_type: "float('-infinity')"
+    "nan" -> raise UnsupportedNodeError, node_type: "float('nan')"
+    _ ->
+      case Float.parse(trimmed) do
+        {f, ""} -> f
+        _ -> raise ArgumentError, "could not convert string to float: #{inspect(x)}"
+      end
+  end
+end
+```
+
+**MVP recommendation:** Raise `UnsupportedNodeError` for inf/nan strings. This matches the approach for `math.inf` (§11.17). A future version could use IEEE 754 bit patterns to construct actual infinity floats if needed.
+
+### 11.29 `str.split("")` Divergence (v7 addition)
+
+**Problem:** Python's `"hello".split("")` raises `ValueError: empty separator`. Elixir's `String.split("hello", "")` returns `["", "h", "e", "l", "l", "o", ""]` (splits between every character, with empty strings at boundaries).
+
+**Failure mode:** 🔴 Silent wrong result — instead of crashing like Python, Elixir produces a list of characters with empty string padding.
+
+**Solution:** The `str.split(sep)` mapping should check for empty separator strings. For the MVP, document as a known limitation — `s.split("")` is extremely rare in algorithmic code (developers use `list(s)` to split a string into characters instead).
+
+### 11.30 Map Ordering vs Dict Ordering (v7 addition)
+
+**Problem:** Python 3.7+ guarantees insertion-order dictionaries. Elixir maps have no guaranteed iteration ordering — small maps (≤32 keys) use sorted key order, large maps use a hash array mapped trie (HAMT) with implementation-defined ordering.
+
+```python
+d = {"b": 2, "a": 1, "c": 3}
+list(d.keys())  # ['b', 'a', 'c'] — insertion order guaranteed
+```
+
+```elixir
+d = %{"b" => 2, "a" => 1, "c" => 3}
+Map.keys(d)  # ["a", "b", "c"] — sorted, NOT insertion order
+```
+
+**Failure mode:** 🔴 Silent wrong result for any code that depends on dict iteration order.
+
+**Solution:** Document as a known limitation. Most algorithmic code does not depend on dict ordering. Code that does (e.g., "return the first key inserted") would need an ordered map implementation, which is beyond MVP scope.
+

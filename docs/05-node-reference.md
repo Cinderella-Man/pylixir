@@ -374,7 +374,7 @@ The following node types raise `UnsupportedNodeError`:
 | `float()` | `0.0` (no arguments — Python returns 0.0) |
 | `float(x)` | `py_float(x)` — runtime dispatch (see helpers in §13.20) |
 | `str(x)` | `py_str(x)` — NOT `to_string(x)` (see §11.18 for True/False/None divergence) |
-| `bool(x)` | `Pylixir.Helpers.truthy?(x)` |
+| `bool(x)` | `truthy?(x)` (local helper — see §13.20) |
 | `list(x)` | `Enum.to_list(x)` |
 | `tuple(x)` | `List.to_tuple(Enum.to_list(x))` |
 | `set(x)` | `MapSet.new(Enum.to_list(x))` |
@@ -399,9 +399,9 @@ The following node types raise `UnsupportedNodeError`:
 | `input(prompt)` | `IO.gets(prompt) \|> String.trim_trailing("\n")` |
 | `chr(n)` | `List.to_string([n])` |
 | `ord(c)` | `String.to_charlist(c) \|> hd()` |
-| `hex(n)` | `"0x" <> String.downcase(Integer.to_string(n, 16))` |
-| `oct(n)` | `"0o" <> Integer.to_string(n, 8)` |
-| `bin(n)` | `"0b" <> Integer.to_string(n, 2)` |
+| `hex(n)` | `py_hex(n)` — helper handles negative numbers and lowercase (see §11.15) |
+| `oct(n)` | `py_oct(n)` — helper handles negative numbers (see §11.15) |
+| `bin(n)` | `py_bin(n)` — helper handles negative numbers (see §11.15) |
 | `math.ceil(x)` | `ceil(x)` |
 | `math.floor(x)` | `floor(x)` |
 | `math.sqrt(x)` | `:math.sqrt(x)` |
@@ -414,6 +414,12 @@ The following node types raise `UnsupportedNodeError`:
 | `math.pi` | `:math.pi()` |
 | `math.e` | `:math.exp(1)` |
 | `math.inf` | **RAISES UnsupportedNodeError** — no safe Elixir equivalent (see §11.17) |
+| `round(x)` | `round(x)` — **WARNING: rounding mode differs** (see §11.25). Python uses banker's rounding (half-to-even), Elixir uses half-away-from-zero. For exact semantics, use `py_round(x)` helper. |
+| `round(x, n)` | `Float.round(x, n)` — same rounding mode caveat as `round(x)` |
+| `divmod(a, b)` | `{Integer.floor_div(a, b), Integer.mod(a, b)}` — returns a tuple of (quotient, remainder) using floored division |
+| `any(x)` | `Enum.any?(x, &truthy?/1)` — **NOT** `Enum.any?(x)`, which uses Elixir truthiness (see §11.3) |
+| `all(x)` | `Enum.all?(x, &truthy?/1)` — **NOT** `Enum.all?(x)`, which uses Elixir truthiness (see §11.3) |
+| `abs(x)` | `py_abs(x)` — wraps `abs/1` with boolean handling (see §11.26). For code known to be numeric-only, `abs(x)` directly is fine. |
 
 **`min`/`max` dispatch rule:** Python's `min` and `max` accept either two arguments (`min(a, b)`) or a single iterable (`min([1, 2, 3])`). The converter must check argument count: one argument → `Enum.min/1` or `Enum.max/1`; two or more arguments → Elixir's built-in `min/2` or `max/2`.
 

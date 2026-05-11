@@ -126,7 +126,80 @@ end
 
 test "hex() outputs lowercase with prefix" do
   # Python: hex(255) == "0xff"
-  assert "0x" <> String.downcase(Integer.to_string(255, 16)) == "0xff"
+  py_hex = fn
+    n when n < 0 -> "-0x" <> String.downcase(Integer.to_string(-n, 16))
+    n -> "0x" <> String.downcase(Integer.to_string(n, 16))
+  end
+  assert py_hex.(255) == "0xff"
+end
+
+test "hex() with negative numbers puts minus before prefix" do
+  # Python: hex(-255) == "-0xff"
+  py_hex = fn
+    n when n < 0 -> "-0x" <> String.downcase(Integer.to_string(-n, 16))
+    n -> "0x" <> String.downcase(Integer.to_string(n, 16))
+  end
+  assert py_hex.(-255) == "-0xff"
+  assert py_hex.(-1) == "-0x1"
+  assert py_hex.(0) == "0x0"
+end
+
+test "round() banker's rounding differs from Elixir" do
+  # Python: round(2.5) == 2 (half-to-even)
+  # Elixir: round(2.5) == 3 (half-away-from-zero)
+  # This documents the known difference
+  assert round(2.5) == 3  # Elixir behavior, NOT Python behavior
+  # Python would return 2 here
+end
+
+test "any() with Python truthiness" do
+  # Python: any([0, "", None]) == False
+  truthy? = fn
+    nil -> false; false -> false; 0 -> false
+    0.0 -> false; "" -> false; [] -> false; _ -> true
+  end
+  assert Enum.any?([0, "", nil], truthy?) == false
+  # Python: any([0, "", 1]) == True
+  assert Enum.any?([0, "", 1], truthy?) == true
+end
+
+test "all() with Python truthiness" do
+  # Python: all([1, "hello", [1]]) == True
+  truthy? = fn
+    nil -> false; false -> false; 0 -> false
+    0.0 -> false; "" -> false; [] -> false; _ -> true
+  end
+  assert Enum.all?([1, "hello", [1]], truthy?) == true
+  # Python: all([1, "", [1]]) == False
+  assert Enum.all?([1, "", [1]], truthy?) == false
+end
+
+test "divmod returns (floor_div, mod) tuple" do
+  # Python: divmod(7, 2) == (3, 1)
+  assert {Integer.floor_div(7, 2), Integer.mod(7, 2)} == {3, 1}
+  # Python: divmod(-7, 2) == (-4, 1)
+  assert {Integer.floor_div(-7, 2), Integer.mod(-7, 2)} == {-4, 1}
+end
+
+test "abs(True) returns 1 in Python" do
+  # Python: abs(True) == 1, abs(False) == 0
+  py_abs = fn
+    x when is_boolean(x) and x == true -> 1
+    x when is_boolean(x) -> 0
+    x -> abs(x)
+  end
+  assert py_abs.(true) == 1
+  assert py_abs.(false) == 0
+end
+
+test "py_str_count with empty substring" do
+  # Python: "abc".count("") == 4 (len + 1)
+  py_str_count = fn
+    s, "" -> String.length(s) + 1
+    s, sub -> length(String.split(s, sub)) - 1
+  end
+  assert py_str_count.("abc", "") == 4
+  assert py_str_count.("", "") == 1
 end
 
 test "int() with no arguments returns 0" do
