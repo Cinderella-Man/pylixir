@@ -36,7 +36,33 @@ d = Map.put(d, key, Map.fetch!(d, key) + 1)
 
 **Note:** Python's `d[key] += 1` raises `KeyError` if `key` is missing — it does NOT silently default to `0`. Using `Map.fetch!/2` (not `Map.get/3` with a default) preserves this behavior. A common Python idiom for safe increment is `d[key] = d.get(key, 0) + 1`, which uses an explicit `Assign` with `d.get(key, 0)` — that pattern is handled separately via the `dict.get` builtin mapping.
 
-The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it as a map mutation rather than a variable rebinding.
+The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it as a collection mutation rather than a variable rebinding.
+
+**List subscript AugAssign:** When the subscript target is a list rather than a dict (e.g., `my_list[i] += 1`), the translation is different:
+
+```python
+my_list[i] += 1
+```
+
+```elixir
+my_list = List.replace_at(my_list, i, Enum.at(my_list, i) + 1)
+```
+
+Since the transpiler does not perform type inference, the subscript `AugAssign` handler should use a runtime-dispatching helper:
+
+```elixir
+defp py_setitem(collection, key, value) when is_list(collection), do: List.replace_at(collection, key, value)
+defp py_setitem(collection, key, value) when is_map(collection), do: Map.put(collection, key, value)
+```
+
+The full `AugAssign` + `Subscript` pattern becomes:
+
+```elixir
+# General case: collection[key] op= value
+# Elixir: collection = py_setitem(collection, key, op(py_getitem(collection, key), value))
+```
+
+This handles both `d[key] += 1` (dict) and `my_list[i] += 1` (list) correctly.
 
 ### 9.4 Mutation Methods (Statement-Level)
 
@@ -112,15 +138,24 @@ Python strings are immutable, so string methods always return new values. These 
 **Helpers for `find` and `count`:**
 
 ```elixir
-# s.find(sub) — returns index or -1 (not nil)
+# s.find(sub) — returns character index or -1 (not nil)
+# NOTE: uses String operations for correct Unicode character positions.
+# :binary.match/2 returns byte offsets, which differ from character offsets
+# for multi-byte UTF-8 characters. This version is correct for all strings.
 defp py_str_find(s, sub) do
-  case :binary.match(s, sub) do
-    {pos, _len} -> pos
-    :nomatch -> -1
+  case String.split(s, sub, parts: 2) do
+    [_] -> -1
+    [before, _rest] -> String.length(before)
   end
 end
 
 # s.count(sub) — count non-overlapping occurrences
+# NOTE: empty substring requires special handling — Python's "abc".count("")
+# returns 4 (len + 1). String.split("abc", "") returns ["a", "b", "c"]
+# (3 elements), so the generic formula produces 2 (wrong).
+defp py_str_count(_s, "") do
+  raise ArgumentError, "py_str_count with empty substring not supported"
+end
 defp py_str_count(s, sub) do
   length(String.split(s, sub)) - 1
 end
@@ -199,7 +234,10 @@ defp py_in(elem, collection) when is_list(collection), do: elem in collection
 defp py_in(elem, collection) when is_map(collection), do: Map.has_key?(collection, elem)
 defp py_in(elem, collection) when is_binary(collection), do: String.contains?(collection, elem)
 defp py_in(elem, %MapSet{} = collection), do: MapSet.member?(collection, elem)
+defp py_in(elem, collection) when is_tuple(collection), do: py_in(elem, Tuple.to_list(collection))
 ```
+
+**Note on tuples:** Python supports `x in (1, 2, 3)` (tuple membership). Elixir tuples do NOT implement the `Enumerable` protocol, so `Enum.member?/2` raises `Protocol.UndefinedError` on tuples. The `is_tuple` clause converts to a list first.
 
 When the collection is a literal list or range, the converter can emit `x in collection` directly. Otherwise, emit `py_in(x, collection)`.
 

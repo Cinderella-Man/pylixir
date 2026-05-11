@@ -296,6 +296,17 @@ IO.gets("") |> String.trim_trailing("\n")
 
 **Solution:** Map `input()` to `IO.gets("") |> String.trim_trailing("\n")`. Map `input(prompt)` to `IO.gets(prompt) |> String.trim_trailing("\n")`. Note: `String.trim_trailing("\n")` specifically strips only the trailing newline, matching Python's `input()` behavior (which does not strip other whitespace).
 
+**Gotcha — EOF handling:** `IO.gets/1` returns the atom `:eof` when stdin is closed or exhausted. `String.trim_trailing(:eof, "\n")` raises `FunctionClauseError`. Python's `input()` raises `EOFError` in this case. For the MVP, the crash is an acceptable analog (both are runtime errors). A more robust version could use a helper:
+
+```elixir
+defp py_input(prompt) do
+  case IO.gets(prompt) do
+    :eof -> raise RuntimeError, "EOFError"
+    line -> String.trim_trailing(line, "\n")
+  end
+end
+```
+
 ### 11.17 `math` Module Functions
 
 Python's `math` module provides `math.ceil`, `math.floor`, `math.sqrt`, `math.log`, `math.log2`, `math.log10`, `math.gcd`, etc. These should be mapped to Elixir equivalents:
@@ -347,8 +358,41 @@ defp py_str(true), do: "True"
 defp py_str(false), do: "False"
 defp py_str(nil), do: "None"
 defp py_str(x) when is_atom(x), do: Atom.to_string(x)
+defp py_str(x) when is_list(x), do: py_repr_list(x)
+defp py_str(x) when is_tuple(x), do: py_repr_tuple(x)
+defp py_str(x) when is_map(x), do: py_repr_map(x)
 defp py_str(x), do: to_string(x)
+
+defp py_repr_list(items) do
+  inner = Enum.map_join(items, ", ", &py_repr/1)
+  "[" <> inner <> "]"
+end
+
+defp py_repr_tuple(t) do
+  items = Tuple.to_list(t)
+  case items do
+    [single] -> "(" <> py_repr(single) <> ",)"
+    _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
+  end
+end
+
+defp py_repr_map(m) do
+  inner = Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end)
+  "{" <> inner <> "}"
+end
+
+defp py_repr(x) when is_binary(x), do: "'" <> x <> "'"
+defp py_repr(x), do: py_str(x)
 ```
+
+**Why `to_string/1` is wrong for compound types:**
+- `to_string([65, 66])` returns `"AB"` (treats list as charlist), not `"[65, 66]"`.
+- `to_string({1, 2})` raises `Protocol.UndefinedError` (tuples don't implement `String.Chars`).
+- `to_string(%{a: 1})` raises `Protocol.UndefinedError` (maps don't implement `String.Chars`).
+
+The `py_repr/1` helper wraps strings in quotes (Python's `repr()` behavior for strings inside collections) to match Python's `str([1, "a"])` → `"[1, 'a']"`.
+
+**Known limitation:** This does not handle all Python repr edge cases (e.g., escaping quotes inside strings, nested quote style alternation). For the MVP, single-quote wrapping is sufficient.
 
 **Failure mode:** Silent wrong output. Any test that captures IO and compares against Python's output will fail on `True`/`False`/`None` values.
 
@@ -507,6 +551,15 @@ if step > 0, do: a..(b - 1)//step, else: a..(b + 1)//step
 | `2 ** -1` | `:math.pow(2, -1)` → `0.5` |
 
 **Trade-off:** `:math.pow/2` always returns a float, so `2 ** 3` returns `8.0` instead of `8`. This can cause type mismatches downstream (e.g., using the result as a list index). When the exponent is a known positive integer literal, the converter may use `Integer.pow/2` instead to preserve the integer type. Otherwise, default to `:math.pow/2`.
+
+**Known limitation — large integer exponents:** Python supports arbitrary-precision integer exponents: `2 ** 1000` returns a huge exact integer. `:math.pow(2, 1000)` returns approximately `1.07e301` (IEEE 754 float), and `:math.pow(2, 1024)` returns `:infinity` (float overflow). This is a significant difference for competitive programming where large exponents on integers are common (e.g., modular exponentiation). **Mitigation:** When both operands are known to be integers at transpile time (both are `Constant` nodes with integer values, or variables in an integer-only context), prefer `Integer.pow/2`. For runtime-determined exponents, a helper can dispatch:
+
+```elixir
+defp py_pow(base, exp) when is_integer(base) and is_integer(exp) and exp >= 0, do: Integer.pow(base, exp)
+defp py_pow(base, exp), do: :math.pow(base, exp)
+```
+
+This preserves exact integer arithmetic when possible and falls back to float for fractional/negative exponents.
 
 ### 11.24 Boolean Values in Arithmetic (Critical)
 

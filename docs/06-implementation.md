@@ -7,7 +7,7 @@
 - The module has a single `def run do ... end` public function that contains all top-level (non-function) statements from the Python source.
 - `import Bitwise` is unconditionally included at the top of the module. It is a no-op when no bitwise operators are used, and avoids the need to track bitwise usage through the context struct. **Note:** `use Bitwise` is deprecated; use `import Bitwise` instead. See §7.1 for the `^^^` deprecation note.
 - The generated code ends with `TranslatedCode.run()` to execute the entry point.
-- The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_len/1`, `py_in/2`, `py_getitem/2`, `py_int/1`, `py_bool_to_int/1`, `truthy?/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
+- The module includes runtime helper functions (`py_add/2`, `py_mult/2`, `py_pow/2`, `py_len/1`, `py_in/2`, `py_getitem/2`, `py_setitem/3`, `py_int/1`, `py_float/1`, `py_str/1`, `py_bool_to_int/1`, `truthy?/1`, `py_str_find/2`, `py_str_count/2`, `py_list_index/2`, `py_repr/1`) as needed. These are emitted unconditionally in the MVP for simplicity; a later optimization can prune unused helpers.
 
 ### 13.2 The `convert/2` Function Pattern
 
@@ -114,6 +114,34 @@ catch
 end
 ```
 
+**Generalized break with multiple accumulated variables:** When the loop body modifies multiple variables and also contains `break`, the throw must carry the full accumulator tuple — not just one variable:
+
+```python
+total = 0
+found_idx = -1
+for i, x in enumerate(items):
+    total += x
+    if x == target:
+        found_idx = i
+        break
+```
+
+```elixir
+{total, found_idx} = try do
+  Enum.reduce(Enum.with_index(items), {0, -1}, fn {x, i}, {total, found_idx} ->
+    total = total + x
+    if x == target do
+      throw({:break, {total, found_idx = i}})
+    end
+    {total, found_idx}
+  end)
+catch
+  {:break, state} -> state
+end
+```
+
+The `throw` carries the full `{total, found_idx}` tuple, and the `catch` returns the tuple for destructuring. The pattern is always: `throw({:break, {all, accumulated, vars}})`, `catch {:break, state} -> state`.
+
 ### 13.5 List Comprehension Optimization
 
 For simple list comprehensions, prefer Elixir's `for` comprehension over `Enum.map` + `Enum.filter`:
@@ -200,6 +228,15 @@ IO.puts(to_string(x))
 - **When the loop body does NOT contain `break`:** no `try`/`catch` is needed — just call the helper directly and destructure the result.
 - The helper function body must call itself recursively to loop.
 
+**Read-only variables (critical):** The while helper function needs ALL outer-scope variables referenced in the loop body as arguments — not just the ones it mutates. Variables that the loop reads but doesn't write (e.g., `arr` and `target` in a binary search while loop) must be passed as extra arguments so the recursive helper can access them. The detection algorithm should:
+
+1. Walk the loop body to find **all** `Name` nodes with `ctx: Load` → these are read variables.
+2. Walk the loop body to find **all** assignment targets → these are written variables.
+3. The helper's parameters are: `written_vars ∪ (read_vars ∩ outer_scope_vars)`. Written vars are the mutable state; read-only vars are passed through unchanged on each recursive call.
+4. Only the written vars are returned in the state tuple; read-only vars are not destructured by the caller.
+
+See the binary search example in §19, where `arr` and `target` are read-only parameters of `while_0`.
+
 **While loop with `break` carrying state:**
 
 ```elixir
@@ -266,14 +303,18 @@ end
 
 ### 13.10 The `AugAssign` Subscript Pattern
 
-When `AugAssign.target` is a `Subscript` node (e.g., `d[key] += 1`), the translation is a map update:
+When `AugAssign.target` is a `Subscript` node (e.g., `d[key] += 1`), the translation uses a runtime-dispatching helper for the collection update. For dicts, the translation preserves Python's `KeyError` on missing keys by using `Map.fetch!/2`:
 
 ```elixir
 # Python: d[key] += 1
-# Elixir: d = Map.put(d, key, Map.get(d, key, 0) + 1)
+# Elixir: d = py_setitem(d, key, py_getitem(d, key) + 1)
+# Which, for dicts, evaluates to: d = Map.put(d, key, Map.fetch!(d, key) + 1)
+# For lists: my_list = List.replace_at(my_list, i, Enum.at(my_list, i) + 1)
 ```
 
-The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it differently from simple variable augmentation.
+**Important:** Use `Map.fetch!/2` (not `Map.get/3` with a default) — Python's `d[key] += 1` raises `KeyError` if `key` is missing (see §9.3).
+
+The `convert/2` function for `AugAssign` must check if `target["_type"]` is `"Subscript"` and handle it differently from simple variable augmentation. Since the transpiler does not perform type inference, use the `py_getitem`/`py_setitem` runtime helpers (see §9.3 and §13.20).
 
 ### 13.11 Comparison Operator AST Mapping
 
@@ -312,7 +353,9 @@ defp wrap_truthy(%{"_type" => type} = test, ctx) when type in ~w[Compare BoolOp]
 end
 defp wrap_truthy(test, ctx) do
   {test_ast, ctx} = convert(test, ctx)
-  {{{:., [], [{:__aliases__, [], [:Pylixir, :Helpers]}, :truthy?]}, [], [test_ast]}, ctx}
+  # truthy? is a local defp in the generated module (see §13.20),
+  # so emit a local function call, NOT a remote call to Pylixir.Helpers.
+  {{:truthy?, [], [test_ast]}, ctx}
 end
 
 # Collect all branches into a flat list of {test, body} pairs
@@ -442,7 +485,7 @@ defp py_add(a, b), do: a + b
 
 ### 13.17 Power Operator Dispatch
 
-The `Pow` operator in `BinOp` uses `:math.pow/2` by default, which always returns a float. When the exponent is a known non-negative integer literal, `Integer.pow/2` can be used instead to preserve integer types:
+The `Pow` operator in `BinOp` uses the `py_pow/2` runtime helper (see §13.20), which dispatches based on operand types. When both operands are integers with a non-negative exponent, it uses `Integer.pow/2` to preserve exact integer arithmetic. Otherwise, it falls back to `:math.pow/2`:
 
 ```elixir
 def convert_pow(base_ast, %{"_type" => "Constant", "value" => exp}, ctx) when is_integer(exp) and exp >= 0 do
@@ -450,9 +493,11 @@ def convert_pow(base_ast, %{"_type" => "Constant", "value" => exp}, ctx) when is
 end
 
 def convert_pow(base_ast, exp_ast, ctx) do
-  {quote(do: :math.pow(unquote(base_ast), unquote(exp_ast))), ctx}
+  {quote(do: py_pow(unquote(base_ast), unquote(exp_ast))), ctx}
 end
 ```
+
+**Note:** The static optimization for known integer literals emits `Integer.pow` directly, avoiding the helper call overhead. For runtime-determined exponents, `py_pow` handles the dispatch (see §11.23 for the precision trade-offs).
 
 ### 13.18 Formatter Pipeline
 
@@ -523,6 +568,9 @@ defp py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
 defp py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
 defp py_mult(a, b), do: a * b
 
+defp py_pow(base, exp) when is_integer(base) and is_integer(exp) and exp >= 0, do: Integer.pow(base, exp)
+defp py_pow(base, exp), do: :math.pow(base, exp)
+
 defp py_len(x) when is_list(x), do: length(x)
 defp py_len(x) when is_binary(x), do: String.length(x)
 defp py_len(%MapSet{} = x), do: MapSet.size(x)
@@ -535,10 +583,14 @@ defp py_getitem(collection, key) when is_tuple(collection) and key >= 0, do: ele
 defp py_getitem(collection, key) when is_tuple(collection), do: elem(collection, tuple_size(collection) + key)
 defp py_getitem(collection, key) when is_map(collection), do: Map.fetch!(collection, key)
 
+defp py_setitem(collection, key, value) when is_list(collection), do: List.replace_at(collection, key, value)
+defp py_setitem(collection, key, value) when is_map(collection), do: Map.put(collection, key, value)
+
 defp py_in(x, collection) when is_list(collection), do: x in collection
 defp py_in(x, collection) when is_binary(collection), do: String.contains?(collection, x)
 defp py_in(x, %MapSet{} = collection), do: MapSet.member?(collection, x)
 defp py_in(x, collection) when is_map(collection), do: Map.has_key?(collection, x)
+defp py_in(x, collection) when is_tuple(collection), do: py_in(x, Tuple.to_list(collection))
 defp py_in(x, collection), do: Enum.member?(collection, x)
 
 defp py_int(true), do: 1
@@ -547,6 +599,8 @@ defp py_int(x) when is_float(x), do: trunc(x)
 defp py_int(x) when is_integer(x), do: x
 defp py_int(x) when is_binary(x), do: String.trim(x) |> String.to_integer()
 
+defp py_float(true), do: 1.0
+defp py_float(false), do: 0.0
 defp py_float(x) when is_integer(x), do: x / 1
 defp py_float(x) when is_float(x), do: x
 defp py_float(x) when is_binary(x) do
@@ -560,21 +614,50 @@ end
 defp py_str(true), do: "True"
 defp py_str(false), do: "False"
 defp py_str(nil), do: "None"
+defp py_str(x) when is_atom(x), do: Atom.to_string(x)
+defp py_str(x) when is_list(x), do: py_repr_list(x)
+defp py_str(x) when is_tuple(x), do: py_repr_tuple(x)
+defp py_str(x) when is_map(x) and not is_struct(x), do: py_repr_map(x)
 defp py_str(x), do: to_string(x)
+
+# Python-style repr for compound types (used by py_str and print)
+defp py_repr_list(items) do
+  "[" <> Enum.map_join(items, ", ", &py_repr/1) <> "]"
+end
+
+defp py_repr_tuple(t) do
+  items = Tuple.to_list(t)
+  case items do
+    [single] -> "(" <> py_repr(single) <> ",)"
+    _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
+  end
+end
+
+defp py_repr_map(m) do
+  "{" <> Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
+end
+
+defp py_repr(x) when is_binary(x), do: "'" <> x <> "'"
+defp py_repr(x), do: py_str(x)
 
 defp py_bool_to_int(true), do: 1
 defp py_bool_to_int(false), do: 0
 defp py_bool_to_int(x), do: x
 
-# s.find(sub) — returns index or -1 (not nil)
+# s.find(sub) — returns character index or -1 (not nil)
+# Uses String operations for correct Unicode character positions.
+# (:binary.match/2 returns byte offsets, wrong for multi-byte UTF-8.)
 defp py_str_find(s, sub) do
-  case :binary.match(s, sub) do
-    {pos, _len} -> pos
-    :nomatch -> -1
+  case String.split(s, sub, parts: 2) do
+    [_] -> -1
+    [before, _rest] -> String.length(before)
   end
 end
 
 # s.count(sub) — count non-overlapping occurrences
+# NOTE: empty substring is a known limitation. Python's "abc".count("")
+# returns 4 (len + 1). This helper does not support empty substring.
+defp py_str_count(_s, ""), do: raise(ArgumentError, "py_str_count with empty substring not supported")
 defp py_str_count(s, sub), do: length(String.split(s, sub)) - 1
 
 # list.index(x) — returns index or raises
@@ -585,3 +668,59 @@ defp py_list_index(list, x) do
   end
 end
 ```
+
+### 13.21 Nested Function Definitions (Inner `def`)
+
+Python allows defining functions inside other functions. The inner function becomes a closure over the enclosing scope:
+
+```python
+def outer(x):
+    def inner(y):
+        return x + y
+    return inner(5)
+```
+
+In Elixir, `defp` inside `defmodule` cannot capture outer function variables — `defp` defines a module-level function, not a closure. The converter must emit inner function definitions as anonymous functions (`fn`):
+
+```elixir
+defp outer(x) do
+  inner = fn y -> x + y end
+  inner.(5)
+end
+```
+
+**Key implementation details:**
+
+1. **Detection:** When a `FunctionDef` node appears inside the body of another `FunctionDef`, it is a nested function. The outer `FunctionDef` is handled normally (emits `defp`); the inner one emits an anonymous function assigned to a variable.
+
+2. **Variable capture:** Elixir's `fn` captures variables by value at creation time. This naturally matches Python's closure semantics for most algorithmic code (where the captured variable is not mutated after the inner function is defined).
+
+3. **Recursive inner functions:** If the inner function calls itself recursively, the anonymous function approach is more complex because the function must reference itself. Use a Y-combinator pattern or assign the function and pass itself as an argument:
+
+```python
+def outer():
+    def helper(n):
+        if n <= 0:
+            return 0
+        return n + helper(n - 1)
+    return helper(10)
+```
+
+```elixir
+defp outer() do
+  helper = fn helper_ref, n ->
+    if n <= 0 do
+      0
+    else
+      n + helper_ref.(helper_ref, n - 1)
+    end
+  end
+  helper.(helper, 10)
+end
+```
+
+This self-referencing pattern works but is verbose. For the MVP, it is the recommended approach. A future version could detect non-recursive inner functions and use the simpler `fn` form.
+
+4. **Scope stack update:** When entering a nested `FunctionDef`, push a new scope. The inner function's parameters and local variables go in this new scope. Variables from the outer scope are accessible (captured by the `fn` closure) but not added to the inner scope.
+
+5. **Known functions pre-pass:** The two-pass name collection (§13.6) should NOT include nested function names — they are local bindings, not module-level functions.

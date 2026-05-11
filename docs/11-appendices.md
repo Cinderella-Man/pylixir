@@ -387,7 +387,18 @@ A compact reference for the most common correctness traps.
 | 56 | `py_mult` with booleans | `true * 3` crashes | Add `is_boolean` clauses to `py_mult` | §11.20 |
 | 57 | `d[key] += 1` default | `Map.get(d, key, 0)` silent wrong | `Map.fetch!(d, key)` to match Python `KeyError` | §9.3 |
 | 58 | `if`/`cond` truthiness | `cond do my_list -> ...` | `cond do truthy?(my_list) -> ...` | §13.12 |
+| 59 | `py_in` with tuples | `Enum.member?(tuple, x)` crashes | `py_in(x, Tuple.to_list(tuple))` | §9.9 |
+| 60 | `py_float(True)` | `py_float(true)` crashes (no clause) | Add `defp py_float(true), do: 1.0` | §13.20 |
+| 61 | `py_str` compound types | `to_string([1,2])` → charlist garble | `py_repr_list([1,2])` → `"[1, 2]"` | §11.18 |
+| 62 | `py_str` tuples | `to_string({1,2})` crashes | `py_repr_tuple({1,2})` → `"(1, 2)"` | §11.18 |
+| 63 | `py_str_find` Unicode | `:binary.match` returns byte offset | `String.split` + `String.length` | §9.5.1 |
+| 64 | `py_str_count("")` | `String.split(s, "")` wrong count | Raise or special-case empty substring | §9.5.1 |
+| 65 | `AugAssign` list subscript | Only handles dict `d[key] += 1` | `py_setitem`/`py_getitem` dispatch | §9.3 |
+| 66 | `math.pow` large int exp | `:math.pow(2, 1000)` loses precision | `py_pow` dispatches to `Integer.pow` | §11.23 |
+| 67 | `input()` at EOF | `IO.gets` returns `:eof` atom | Handle `:eof` or let crash analog | §11.16 |
+| 68 | Nested `def` (closures) | `defp` can't capture outer vars | Emit `fn` for inner functions | §13.21 |
+| 69 | `truthy?` call site | Remote call to `Pylixir.Helpers` | Local call (helpers are `defp` in module) | §13.12 |
 
 ---
 
-*End of RFC-001 v9*
+*End of RFC-001 v10*

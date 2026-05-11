@@ -37,7 +37,7 @@ This glossary explains Elixir-specific terms that appear throughout this documen
 | **`unquote`** | Inside `quote`, evaluates an expression and splices the result into the AST. |
 | **Special form** | AST node that cannot be implemented as a macro. Examples: `fn`, `case`, `try`, `receive`. |
 | **`__block__`** | The AST representation of a block of expressions. `{:__block__, [], [expr1, expr2, ...]}`. |
-| **`__aliases__`** | The AST representation of a module alias. `{:__aliases__, [:alias, Foo]}`. |
+| **`__aliases__`** | The AST representation of a module alias. `{:__aliases__, [], [:Foo]}` for `Foo`, `{:__aliases__, [], [:MyApp, :Utils]}` for `MyApp.Utils`. Always a three-tuple. |
 | **`Code.format_string!/1`** | Formats Elixir source code. Returns **iodata** (not binary). Use `IO.iodata_to_binary/1` to get a string. |
 | **iodata** | A list of binaries and characters for efficient IO. Not the same as a binary/string. |
 | **`Macro.to_string/1`** | Converts an Elixir AST back to source code string. Useful for debugging. |
