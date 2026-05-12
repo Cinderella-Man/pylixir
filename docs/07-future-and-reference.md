@@ -248,7 +248,7 @@ defmodule TranslatedCode do
         if count == 5 do
           throw({:break, {count}})  # break: carry state
         else
-          IO.puts(to_string(count))
+          IO.puts(py_str(count))
           while_0(count)
         end
       end
@@ -325,7 +325,7 @@ defmodule TranslatedCode do
 
   def run do
     result = sum_evens([1, 2, 3, 4, 5, 6])
-    IO.puts(to_string(result))
+    IO.puts(py_str(result))
   end
 end
 
@@ -398,7 +398,7 @@ defmodule TranslatedCode do
 
   def run do
     result = binary_search([1, 3, 5, 7, 9, 11, 13], 7)
-    IO.puts(to_string(result))
+    IO.puts(py_str(result))
   end
 end
 
@@ -847,11 +847,11 @@ A compact reference for the most common correctness traps. **Severity key:** �
 | 49 | 🟢 | `^^^` deprecation | `a ^^^ b` emits warning | Use `Bitwise.bxor(a, b)` or accept warnings | §7.1 |
 | 50 | 🔴 | `print(True)` casing | `to_string(true)` → `"true"` | `py_str(true)` → `"True"` | §11.18 |
 | 51 | 🔴 | `print(None)` output | `to_string(nil)` → `""` | `py_str(nil)` → `"None"` | §11.18 |
-| 52 | 🟡 | `int(True)` / `int(False)` | `py_int(true)` crashes | Add boolean clauses to `py_int` | §13.20 |
+| 52 | 🟡 | `int(True)` / `int(False)` | `py_int(true)` crashes | ✓ Boolean clauses in canonical `py_int` (§13.20) | §13.20 |
 | 53 | 🟡 | `int("  42  ")` whitespace | `String.to_integer("  42  ")` crashes | `String.trim(x) \|> String.to_integer()` | §13.20 |
 | 54 | 🟡 | `float("3")` format | `String.to_float("3")` crashes | Use `Float.parse/1` | §13.20 |
 | 55 | 🟡 | Tuple negative index | `elem(t, -1)` crashes | `elem(t, tuple_size(t) + key)` | §13.20 |
-| 56 | 🟡 | `py_mult` with booleans | `true * 3` crashes | Add `is_boolean` clauses to `py_mult` | §11.20 |
+| 56 | 🟡 | `py_mult` with booleans | `true * 3` crashes | ✓ `is_boolean` clauses in canonical `py_mult` (§13.20) | §11.20 |
 | 57 | 🔴 | `d[key] += 1` default | `Map.get(d, key, 0)` silent wrong | `Map.fetch!(d, key)` to match Python `KeyError` | §9.3 |
 | 58 | 🔴 | `if`/`cond` truthiness | `cond do my_list -> ...` | `cond do truthy?(my_list) -> ...` | §13.12 |
 | 59 | 🟡 | `py_in` with tuples | `Enum.member?(tuple, x)` crashes | `py_in(x, Tuple.to_list(tuple))` | §9.9 |
@@ -879,4 +879,4 @@ A compact reference for the most common correctness traps. **Severity key:** �
 
 ---
 
-*End of RFC-001 v7*
+*End of RFC-001 v8*

@@ -108,7 +108,7 @@ The following are explicitly out of scope. Each includes a brief explanation of 
 |----------|----------------|-----|
 | **OOP** | Classes, inheritance, decorators, `@staticmethod`, `@classmethod`, `super()` | No Elixir equivalent; would require a full object system |
 | **Async** | `async def`, `await`, `async for`, `async with` | No direct Elixir equivalent (Elixir uses processes/GenServer, not async/await) |
-| **Imports** | `import`, `from X import Y`, `import X as Z` | Module systems are fundamentally different; would need a mapping table for every Python module |
+| **Imports** | `import`, `from X import Y`, `import X as Z` | Module systems are fundamentally different; would need a mapping table for every Python module. **Exception:** `import math` is silently ignored (emits no code) since `math` module functions are pre-mapped — see §13.6.1 |
 | **I/O** | `open()`, `read()`, `write()`, file operations | Beyond algorithmic translation scope |
 | **Exceptions** | `try`/`except`/`finally`, `raise` with custom types, exception chaining | While `try`/`rescue` exists in Elixir, mapping Python's exception hierarchy is a separate project |
 | **Generators** | `yield`, `yield from`, generator expressions, `send()`, `throw()` on generators | No direct Elixir equivalent; would require coroutine emulation |

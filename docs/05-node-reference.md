@@ -315,7 +315,7 @@ The following node types raise `UnsupportedNodeError`:
 |---|---|
 | **Class system** | `ClassDef` |
 | **Async** | `AsyncFunctionDef`, `AsyncFor`, `AsyncWith`, `Await` |
-| **Imports** | `Import`, `ImportFrom` |
+| **Imports** | `Import`, `ImportFrom` — **exception:** `import math` is silently ignored (see §13.6.1) |
 | **Exception handling** | `Try`, `TryStar`, `ExceptHandler`, `Raise` |
 | **Context managers** | `With` |
 | **Scope** | `Global`, `Nonlocal` |
@@ -384,9 +384,15 @@ The following node types raise `UnsupportedNodeError`:
 | `isinstance(x, list)` | `is_list(x)` |
 | `isinstance(x, dict)` | `is_map(x)` |
 | `isinstance(x, (int, float))` | `is_number(x)` |
+
+**`isinstance` with type tuples:** Python's `isinstance(x, (int, float))` is mapped to `is_number(x)` as a special case. Other tuple forms like `isinstance(x, (int, str))` would need `is_integer(x) or is_binary(x)`. For the MVP, only the `(int, float)` → `is_number` mapping is supported. Other tuple forms raise `UnsupportedNodeError`.
+
 | `print()` | `IO.puts("")` (no arguments — prints empty line) |
 | `print(x)` | `IO.puts(py_str(x))` — use `py_str`, NOT `to_string` (see §11.18) |
 | `print(a, b, c)` | `IO.puts(Enum.join([py_str(a), py_str(b), py_str(c)], " "))` |
+
+**`print` with `sep` and `end` keywords:** Python's `print(a, b, sep=",")` uses a custom separator, and `print(a, end="")` suppresses the trailing newline. For `sep=...`, replace `" "` with the custom separator in the `Enum.join` call. For `end=...`, use `IO.write` instead of `IO.puts` and append the custom ending. For the MVP, `sep` is straightforward to implement; `end` requires switching from `IO.puts` to `IO.write(Enum.join(...) <> end_str)`. Both are detected via `keyword` nodes in `Call.keywords` (same mechanism as `sorted`'s `key`/`reverse`).
+
 | `input()` | `IO.gets("") \|> String.trim_trailing("\n")` |
 | `input(prompt)` | `IO.gets(prompt) \|> String.trim_trailing("\n")` |
 | `chr(n)` | `List.to_string([n])` |

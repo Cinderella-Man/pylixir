@@ -207,15 +207,7 @@ my_list = List.replace_at(my_list, i, new_value)
 
 ### 9.9 The `in` Operator
 
-Python's `in` operator checks membership in any collection. Since the transpiler does not perform type inference (see §1.5), it uses a runtime-dispatching helper for `in` checks where the collection type is unknown:
-
-```elixir
-defp py_in(elem, collection) when is_list(collection), do: elem in collection
-defp py_in(elem, collection) when is_binary(collection), do: String.contains?(collection, elem)
-defp py_in(elem, %MapSet{} = collection), do: MapSet.member?(collection, elem)
-defp py_in(elem, collection) when is_map(collection), do: Map.has_key?(collection, elem)
-defp py_in(elem, collection) when is_tuple(collection), do: py_in(elem, Tuple.to_list(collection))
-```
+Python's `in` operator checks membership in any collection. Since the transpiler does not perform type inference (see §1.5), it uses a runtime-dispatching helper `py_in/2` for `in` checks where the collection type is unknown. See §13.20 for the canonical definition of `py_in/2`.
 
 **Important:** The `%MapSet{}` clause MUST appear before the `is_map` clause. `MapSet` is a struct (backed by a map), so `is_map(MapSet.new())` returns `true`. Without the explicit `%MapSet{}` clause, the `is_map` clause would match MapSets and call `Map.has_key?`, which checks struct keys, not set membership. See §13.20 for the canonical definition.
 
@@ -500,6 +492,8 @@ For truly unknown names (not in builtins, not in scope, not in `known_functions`
 
 Many Python builtins in the mapping table are actually method calls or module-qualified calls that appear as `Call` nodes where `func` is an `Attribute` node (not a `Name` node). The converter must detect these patterns in the `Call` handler:
 
+**Note on `import math`:** Python's `math` module requires `import math` at the top of the file. Since `Import` nodes are listed as unsupported in §4, the converter must handle this gracefully. **Recommendation:** The `Import` handler should silently ignore `import math` (emit no code) since math functions are pre-mapped in the builtins table. All other `Import`/`ImportFrom` nodes should still raise `UnsupportedNodeError`. Without this special case, any Python file using `math.ceil()` will crash on the `import math` node before reaching the actual math calls.
+
 **Pattern 1 — `math.xxx()` calls:** The Python AST for `math.ceil(x)` is `Call(func=Attribute(value=Name("math"), attr="ceil"), args=[Name("x")])`. The converter should check: if `func._type == "Attribute"` and `func.value._type == "Name"` and `func.value.id == "math"`, then look up `func.attr` in the math builtins table.
 
 ```elixir
@@ -703,6 +697,13 @@ def convert(%{"_type" => "If"} = node, ctx) do
 end
 
 # Wrap condition in truthy? unless it's already a boolean-producing node
+# NOTE: Compare nodes always produce true/false, so skipping truthy? is safe.
+# BoolOp nodes (&&/||) return operand values, not necessarily booleans.
+# This optimization is safe for BoolOp ONLY when all operands are themselves
+# boolean-producing (e.g., Compare nodes). When BoolOp operands can be
+# non-boolean (e.g., `0 or "default"`), &&/|| uses Elixir truthiness, not
+# Python truthiness, and the condition may evaluate differently.
+# This is an accepted limitation for the MVP — see §11.3 for details.
 defp wrap_truthy(%{"_type" => type} = test, ctx) when type in ~w[Compare BoolOp] do
   convert(test, ctx)
 end
@@ -769,6 +770,10 @@ When a Python `If` expression appears inside another expression (e.g., `x = cond
 
 When a Python function contains a `return` statement inside a `for` or `while` loop, the translation is complex because Elixir's `Enum.reduce` or `for` comprehension cannot "return" from the enclosing function.
 
+**When `try`/`catch` is NOT needed:** If a function has only a single `return` at the very end of its body (the "tail position"), no wrapping is needed — Elixir's last-expression-is-return-value semantics handle this naturally. `def add(a, b): return a + b` → `defp add(a, b), do: py_add(a, b)`. Similarly, if all `return` statements are in the tail position of each branch of an `if`/`elif`/`else` chain (and there are no loops), `cond` handles it naturally since each branch's last expression is the return value.
+
+**When `try`/`catch` IS needed:** Wrap the function body in `try`/`catch` when any `return` appears: (a) inside a `for` or `while` loop body, or (b) in a non-tail position (e.g., `return` inside an `if` block where code follows after the `if`). The detection algorithm: walk the function body AST and check if any `Return` node appears inside a `For`, `While`, or in a non-tail position of an `If` branch. If so, wrap the entire function body in `try`/`catch`.
+
 **Solution:** Use `try`/`throw`/`catch` at the function level:
 
 ```elixir
@@ -829,14 +834,9 @@ end
 
 For the MVP, the `BinOp` handler uses the runtime-dispatch helper `py_add/2` whenever the `Add` operator is encountered and the operand types are not statically obvious:
 
-```elixir
-defp py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
-defp py_add(a, b) when is_number(a) and is_number(b), do: a + b
-defp py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
-defp py_add(a, b), do: a + b
-```
+The `py_add/2` helper (see §13.20 for the canonical definition) dispatches at runtime based on operand types — string concatenation via `<>`, list concatenation via `++`, boolean-to-integer coercion, and numeric addition via `+`.
 
-**Static optimization:** When both operands are string `Constant` nodes, or either operand is a `Call` to `str()` (mapped to `to_string/1`), the converter emits `<>` directly without the helper. This covers the most common cases and produces cleaner output.
+**Static optimization:** When both operands are string `Constant` nodes, or either operand is a `Call` to `str()` (mapped to `py_str/1`), the converter emits `<>` directly without the helper. This covers the most common cases and produces cleaner output.
 
 ### 13.17 Power Operator Dispatch
 
