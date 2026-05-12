@@ -682,3 +682,83 @@ Map.keys(d)  # ["a", "b", "c"] — sorted, NOT insertion order
 
 **Solution:** Document as a known limitation. Most algorithmic code does not depend on dict ordering. Code that does (e.g., "return the first key inserted") would need an ordered map implementation, which is beyond MVP scope.
 
+### 11.31 `isinstance(True, int)` Returns `True` in Python (v9 addition)
+
+**Problem:** In Python, `bool` is a subclass of `int`. This means `isinstance(True, int)` returns `True` and `isinstance(False, int)` returns `True`. The RFC maps `isinstance(x, int)` to Elixir's `is_integer(x)`, but `is_integer(true)` returns `false` in Elixir because booleans are atoms, not integers.
+
+```python
+isinstance(True, int)    # True — bool is subclass of int
+isinstance(False, int)   # True
+isinstance(True, bool)   # True
+type(True) == int        # False — type() is strict, not subclass-aware
+```
+
+```elixir
+is_integer(true)    # false — booleans are atoms in Elixir
+is_boolean(true)    # true
+```
+
+**Failure mode:** 🔴 Silent wrong result. Any code that uses `isinstance(x, int)` to check whether a value (which could be boolean) supports arithmetic will get `false` for boolean values in the translated code. This is particularly dangerous when `isinstance` is used as a guard before arithmetic operations — the guard will incorrectly reject booleans.
+
+**Note:** The `type(x) == int` mapping to `is_integer(x)` is **correct** — Python's `type(True) == int` is `False` because `type()` checks the exact type, not subclasses. Only the `isinstance` mapping is wrong.
+
+**Solution:** Map `isinstance(x, int)` to `is_integer(x) || is_boolean(x)` to match Python's subclass-aware behavior. Alternatively, for the MVP, document as a known limitation — most algorithmic code uses `isinstance(x, int)` to guard numeric operations, and boolean values in those contexts are rare.
+
+### 11.32 List Out-of-Bounds Returns `nil` vs Python's `IndexError` (v9 addition)
+
+**Problem:** Python's `my_list[i]` raises `IndexError` when `i` is out of bounds. The transpiler uses `Enum.at(list, i)` for list indexing (via the `py_getitem` helper), which returns `nil` for out-of-bounds indices instead of raising an error.
+
+```python
+items = [1, 2, 3]
+items[10]    # IndexError: list index out of range
+```
+
+```elixir
+items = [1, 2, 3]
+Enum.at(items, 10)    # nil — no error!
+```
+
+**Failure mode:** 🔴 Silent wrong result. The `nil` propagates through downstream computations, potentially causing wrong results far from the source of the bug. For example, `items[10] + 1` raises `IndexError` in Python but `Enum.at(items, 10) + 1` raises `ArithmeticError` in Elixir (nil + 1), which is a different error at a different location.
+
+**Solution:** Use `Enum.fetch!/2` instead of `Enum.at/2` in the `py_getitem` helper for lists. `Enum.fetch!/2` raises `Enum.OutOfBoundsError` on invalid indices, which is closer to Python's `IndexError` behavior:
+
+```elixir
+defp py_getitem(collection, key) when is_list(collection) do
+  case Enum.fetch(collection, key) do
+    {:ok, value} -> value
+    :error -> raise RuntimeError, "list index out of range"
+  end
+end
+```
+
+**MVP recommendation:** Use `Enum.at/2` for the MVP and document the difference. The `Enum.fetch!` approach is more correct but adds overhead. Most algorithmic code that indexes lists uses valid indices derived from `range(len(list))`, so out-of-bounds access is uncommon in correct programs.
+
+### 11.33 `List.replace_at/3` Silent No-Op on Out-of-Bounds (v9 addition)
+
+**Problem:** Python's `my_list[i] = x` raises `IndexError` when `i` is out of bounds. The transpiler uses `List.replace_at(list, i, x)` for index assignment (via the `py_setitem` helper), which silently returns the original list unchanged when the index is out of bounds.
+
+```python
+items = [1, 2, 3]
+items[10] = 99    # IndexError: list assignment index out of range
+```
+
+```elixir
+items = [1, 2, 3]
+List.replace_at(items, 10, 99)    # [1, 2, 3] — silently unchanged!
+```
+
+**Failure mode:** 🔴 Silent wrong result. The assignment appears to succeed but has no effect, potentially causing algorithms to produce wrong results without any error.
+
+**Solution:** For the MVP, document as a known limitation. A more robust version could add bounds checking to `py_setitem`:
+
+```elixir
+defp py_setitem(collection, key, value) when is_list(collection) do
+  if key >= length(collection) or key < -length(collection) do
+    raise RuntimeError, "list assignment index out of range"
+  end
+  List.replace_at(collection, key, value)
+end
+```
+
+**MVP recommendation:** Document as a known limitation. Correct algorithmic code typically uses valid indices.
+

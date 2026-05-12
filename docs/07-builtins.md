@@ -387,6 +387,10 @@ The following node types raise `UnsupportedNodeError`:
 
 **`isinstance` with type tuples:** Python's `isinstance(x, (int, float))` is mapped to `is_number(x)` as a special case. Other tuple forms like `isinstance(x, (int, str))` would need `is_integer(x) or is_binary(x)`. For the MVP, only the `(int, float)` → `is_number` mapping is supported. Other tuple forms raise `UnsupportedNodeError`.
 
+**`isinstance(x, int)` and booleans (critical):** Python's `isinstance(True, int)` returns `True` because `bool` is a subclass of `int`. The mapping `isinstance(x, int)` → `is_integer(x)` returns `false` for booleans in Elixir. See §11.31 for the full analysis. For the MVP, document as a known limitation. A more precise mapping is `is_integer(x) || is_boolean(x)`.
+
+**`dict()` keyword constructor:** Python's `dict()` with no arguments returns `%{}`. With a single iterable argument, `dict(x)` → `Map.new(Enum.to_list(x))`. Python also supports keyword arguments: `dict(a=1, b=2)`, which appears as a `Call` with `keywords` and no positional `args`. For this form, construct a map from the keyword nodes: `%{"a" => 1, "b" => 2}` (using string keys, since Python dict keys from kwargs are always strings). For the MVP, raise `UnsupportedNodeError` for the keyword form — it is uncommon in algorithmic code.
+
 | `print()` | `IO.puts("")` (no arguments — prints empty line) |
 | `print(x)` | `IO.puts(py_str(x))` — use `py_str`, NOT `to_string` (see §11.18) |
 | `print(a, b, c)` | `IO.puts(Enum.join([py_str(a), py_str(b), py_str(c)], " "))` |
@@ -419,7 +423,7 @@ The following node types raise `UnsupportedNodeError`:
 | `all(x)` | `Enum.all?(x, &truthy?/1)` — **NOT** `Enum.all?(x)`, which uses Elixir truthiness (see §11.3) |
 | `abs(x)` | `py_abs(x)` — wraps `abs/1` with boolean handling (see §11.26). For code known to be numeric-only, `abs(x)` directly is fine. |
 
-**`min`/`max` dispatch rule:** Python's `min` and `max` accept either two arguments (`min(a, b)`) or a single iterable (`min([1, 2, 3])`). The converter must check argument count: one argument → `Enum.min/1` or `Enum.max/1`; two or more arguments → Elixir's built-in `min/2` or `max/2`.
+**`min`/`max` dispatch rule:** Python's `min` and `max` accept either two arguments (`min(a, b)`), a single iterable (`min([1, 2, 3])`), or **three or more arguments** (`min(a, b, c)`). The converter must check argument count: one argument → `Enum.min/1` or `Enum.max/1`; two arguments → Elixir's built-in `min/2` or `max/2`; three or more arguments → `Enum.min([a, b, c, ...])` or `Enum.max([a, b, c, ...])` (wrap in a list and use the Enum form).
 
 #### String Methods (Non-Mutating)
 
