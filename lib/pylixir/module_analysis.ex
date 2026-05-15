@@ -142,10 +142,7 @@ defmodule Pylixir.ModuleAnalysis do
   end
 
   defp mutates_name?(%{"_type" => "Assign", "targets" => targets}, name) do
-    Enum.any?(targets, fn
-      %{"_type" => "Name", "id" => ^name} -> true
-      _ -> false
-    end)
+    Enum.any?(targets, &target_mentions?(&1, name))
   end
 
   defp mutates_name?(%{"_type" => "AugAssign", "target" => target}, name) do
@@ -183,4 +180,20 @@ defmodule Pylixir.ModuleAnalysis do
     do: aug_target_root_name(value)
 
   defp aug_target_root_name(_), do: nil
+
+  # Does this assignment-target node bind/mutate the given name?
+  # Recurses through Tuple destructure targets and through Subscript
+  # targets (which T13 rewrites to a setitem reassigning the collection
+  # root).
+  defp target_mentions?(%{"_type" => "Name", "id" => id}, name), do: id == name
+
+  defp target_mentions?(%{"_type" => "Tuple", "elts" => elts}, name) do
+    Enum.any?(elts, &target_mentions?(&1, name))
+  end
+
+  defp target_mentions?(%{"_type" => "Subscript", "value" => value}, name) do
+    aug_target_root_name(value) == name
+  end
+
+  defp target_mentions?(_, _), do: false
 end

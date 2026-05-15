@@ -38,17 +38,42 @@ defmodule Pylixir.Nodes.BinOpTest do
     end
   end
 
-  describe "AST shape — unsupported operators (T11/T12 territory)" do
-    test "FloorDiv raises (T11)" do
-      assert_raise UnsupportedNodeError, ~r/FloorDiv/, fn ->
-        Converter.convert(binop("FloorDiv", const(7), const(2)), Context.new())
+  describe "AST shape — T11 ops" do
+    test "FloorDiv emits py_floor_div" do
+      {ast, _} = Converter.convert(binop("FloorDiv", const(7), const(2)), Context.new())
+      assert ast == {:py_floor_div, [], [7, 2]}
+    end
+
+    test "Mod emits py_mod" do
+      {ast, _} = Converter.convert(binop("Mod", const(7), const(2)), Context.new())
+      assert ast == {:py_mod, [], [7, 2]}
+    end
+
+    test "LShift emits Bitwise.bsl (fully-qualified)" do
+      {ast, _} = Converter.convert(binop("LShift", const(1), const(3)), Context.new())
+      assert ast == {{:., [], [{:__aliases__, [], [:Bitwise]}, :bsl]}, [], [1, 3]}
+    end
+
+    test "RShift, BitOr, BitAnd, BitXor each route to their Bitwise function" do
+      for {op_name, fn_name} <- [
+            {"RShift", :bsr},
+            {"BitOr", :bor},
+            {"BitAnd", :band},
+            {"BitXor", :bxor}
+          ] do
+        {ast, _} = Converter.convert(binop(op_name, const(5), const(3)), Context.new())
+        assert ast == {{:., [], [{:__aliases__, [], [:Bitwise]}, fn_name]}, [], [5, 3]}
       end
     end
 
-    test "MatMult raises (T11 explicit rejection)" do
-      assert_raise UnsupportedNodeError, ~r/MatMult/, fn ->
-        Converter.convert(binop("MatMult", const(1), const(2)), Context.new())
-      end
+    test "MatMult raises explicitly with a dedicated hint" do
+      err =
+        assert_raise UnsupportedNodeError, fn ->
+          Converter.convert(binop("MatMult", const(1), const(2)), Context.new())
+        end
+
+      assert err.node_type == "MatMult"
+      assert err.hint =~ "matrix"
     end
   end
 
@@ -87,6 +112,44 @@ defmodule Pylixir.Nodes.BinOpTest do
         TranspileHelpers.transpile_and_run(module_with(binop("Pow", const(2), const(3))))
 
       assert value == 8
+    end
+  end
+
+  describe "end-to-end — T11 ops" do
+    test "FloorDiv: -7 // 2 == -4 (Python floor, not truncate)" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("FloorDiv", const(-7), const(2))))
+
+      assert value == -4
+    end
+
+    test "Mod: -7 % 2 == 1 (Python floor-modulo, sign follows divisor)" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("Mod", const(-7), const(2))))
+
+      assert value == 1
+    end
+
+    test "LShift: 1 << 4 == 16" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("LShift", const(1), const(4))))
+
+      assert value == 16
+    end
+
+    test "BitXor: 5 ^ 3 == 6" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("BitXor", const(5), const(3))))
+
+      assert value == 6
+    end
+
+    test "Mod with string left operand raises with the Python %-formatting hint" do
+      assert_raise ArgumentError, ~r/%-string formatting/, fn ->
+        TranspileHelpers.transpile_and_run(
+          module_with(binop("Mod", const("hello %s"), const("world")))
+        )
+      end
     end
   end
 

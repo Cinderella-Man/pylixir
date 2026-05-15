@@ -126,6 +126,40 @@ defmodule Pylixir.RuntimeHelpersTest do
     end
   end
 
+  describe "py_floor_div/2 — Python `//` (RFC §6.1)" do
+    test "int // int rounds toward negative infinity (not toward zero)" do
+      assert H.py_floor_div(7, 2) == 3
+      assert H.py_floor_div(-7, 2) == -4
+      assert H.py_floor_div(7, -2) == -4
+    end
+
+    test "float operands return float and still floor" do
+      assert H.py_floor_div(7.0, 2) == 3.0
+      assert H.py_floor_div(-7.0, 2.0) == -4.0
+    end
+  end
+
+  describe "py_mod/2 — Python `%` (RFC §6.2)" do
+    test "int % int matches Python floor-modulo (sign of result follows divisor)" do
+      assert H.py_mod(7, 2) == 1
+      assert H.py_mod(-7, 2) == 1
+      assert H.py_mod(7, -2) == -1
+    end
+
+    test "float operands return float floor-modulo" do
+      assert_in_delta H.py_mod(7.5, 2.0), 1.5, 1.0e-9
+    end
+
+    test "string left operand raises with the Python %-formatting hint" do
+      err =
+        assert_raise ArgumentError, fn ->
+          H.py_mod("hello %s", "world")
+        end
+
+      assert err.message =~ "%-string formatting"
+    end
+  end
+
   describe "boolean arithmetic (RFC §6.11)" do
     test "True + True == 2; True * 5 == 5" do
       assert H.py_add(true, true) == 2

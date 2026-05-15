@@ -80,6 +80,27 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_pow(base, exp), do: :math.pow(base, exp)
 
+  # Python's `//` floor-divides; sign follows the divisor for negatives.
+  # Integer.floor_div/2 matches Python for int operands; for mixed/float
+  # operands, `:math.floor(a/b)` matches Python (returns float).
+  def py_floor_div(a, b) when is_integer(a) and is_integer(b), do: Integer.floor_div(a, b)
+  def py_floor_div(a, b) when is_number(a) and is_number(b), do: :math.floor(a / b)
+
+  # Python's `%` is dual-meaning: numeric modulo (floor-modulo, sign
+  # follows divisor) and string %-formatting. The helper dispatches at
+  # runtime: integers → Integer.mod/2; binary left → raise with a hint
+  # naming the unsupported feature rather than letting an opaque
+  # FunctionClauseError leak through.
+  def py_mod(a, _b) when is_binary(a),
+    do:
+      raise(ArgumentError,
+        message:
+          "Python %-string formatting (`'%s' % name`) is not supported; use string concatenation"
+      )
+
+  def py_mod(a, b) when is_integer(a) and is_integer(b), do: Integer.mod(a, b)
+  def py_mod(a, b) when is_number(a) and is_number(b), do: a - b * :math.floor(a / b)
+
   # === Collection access ===
   def py_len(x) when is_list(x), do: length(x)
   def py_len(x) when is_binary(x), do: String.length(x)
