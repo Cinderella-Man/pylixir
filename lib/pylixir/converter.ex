@@ -21,4 +21,20 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => type}, _context) do
     raise UnsupportedNodeError, node_type: type
   end
+
+  @doc """
+  Pre-pass over a Module body that collects every top-level `FunctionDef`
+  name. Used to seed `Pylixir.Context.known_functions` so call sites can
+  reference functions defined later in the source (RFC §10.3).
+
+  Nested function definitions are deliberately excluded — they are local
+  bindings, not module-level functions.
+  """
+  @spec collect_function_names([map()]) :: MapSet.t(String.t())
+  def collect_function_names(body) when is_list(body) do
+    body
+    |> Enum.filter(&match?(%{"_type" => "FunctionDef"}, &1))
+    |> Enum.map(& &1["name"])
+    |> MapSet.new()
+  end
 end
