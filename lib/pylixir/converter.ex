@@ -10,8 +10,8 @@ defmodule Pylixir.Converter do
   catch-all clause raises `Pylixir.UnsupportedNodeError`.
   """
 
-  alias Pylixir.AST.{BoolReturning, Trivial}
-  alias Pylixir.{Context, HelpersCodegen, ModuleAnalysis, Naming, UnsupportedNodeError}
+  alias Pylixir.AST.{BoolReturning, Trivial, Walk}
+  alias Pylixir.{Context, HelpersCodegen, LoopAnalysis, ModuleAnalysis, Naming, UnsupportedNodeError}
 
   @type elixir_ast :: Macro.t()
 
@@ -29,10 +29,17 @@ defmodule Pylixir.Converter do
 
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
     {fn_asts, context} = convert_each(analysis.function_defs, context)
+
+    # Runtime statements live inside py_main; nested FunctionDefs there
+    # are inside control flow (or `If`/`For`/etc.) and must raise per T19.
+    context = %{context | def_position: :other}
     {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
+    context = %{context | def_position: :module_top}
 
     helpers = HelpersCodegen.helpers_ast()
-    body_block = helpers ++ attr_asts ++ fn_asts ++ [py_main_def(stmt_asts)]
+
+    body_block =
+      helpers ++ attr_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
 
     defmodule_ast =
       {:defmodule, [],
@@ -66,6 +73,143 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
+
+  # Minimal Call clause — supports `Name(args)` calls only. T28 will
+  # generalize to `Attribute` calls, builtins, math, kwargs, local-scope
+  # shadowing precedence with explicit `.(args)` for shadowed names.
+  def convert(%{"_type" => "Call"} = node, context) do
+    if Map.get(node, "keywords", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "Call",
+        hint: "keyword arguments at call sites are not yet supported (T28 territory)",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+
+    case node["func"] do
+      %{"_type" => "Name", "id" => id} ->
+        {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+        atom = id |> Naming.rewrite() |> String.to_atom()
+
+        call_ast =
+          if name_in_scope?(context, id) do
+            {{:., [], [{atom, [], nil}]}, [], arg_asts}
+          else
+            {atom, [], arg_asts}
+          end
+
+        {call_ast, context}
+
+      _ ->
+        raise UnsupportedNodeError,
+          node_type: "Call",
+          hint:
+            "only `Name(args)` call shapes are supported pre-T28; got `#{Map.get(node["func"], "_type")}`",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  def convert(%{"_type" => "Return"} = node, context) do
+    case context.return_mode do
+      nil ->
+        raise UnsupportedNodeError,
+          node_type: "Return",
+          hint: "`return` outside a function is a Python SyntaxError",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      :unwrapped ->
+        case Map.get(node, "value") do
+          nil -> {nil, context}
+          value -> convert(value, context)
+        end
+
+      :wrapped ->
+        {value_ast, context} =
+          case Map.get(node, "value") do
+            nil -> {nil, context}
+            value -> convert(value, context)
+          end
+
+        {{:throw, [], [{:pylixir_return, value_ast}]}, context}
+    end
+  end
+
+  def convert(%{"_type" => "FunctionDef"} = node, context) do
+    case context.def_position do
+      :module_top ->
+        emit_function_def(node, context)
+
+      :nested_fn ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint:
+            "nested function definitions are not yet supported (T21); lift to module level or use a `lambda`",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      :other ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint:
+            "function definitions inside control flow are not supported; lift to module level",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  def convert(%{"_type" => "While"} = node, context) do
+    if Map.get(node, "orelse", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "While",
+        hint: "while/else (Python's while-loop `else` clause) is not supported",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+
+    emit_while(node, context)
+  end
+
+  def convert(%{"_type" => "For"} = node, context) do
+    if Map.get(node, "orelse", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "For",
+        hint: "for/else (Python's for-loop `else` clause) is not supported",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+
+    emit_for(node, context)
+  end
+
+  def convert(%{"_type" => "Break"} = node, context) do
+    case context.loop_break_payload do
+      nil ->
+        raise UnsupportedNodeError,
+          node_type: "Break",
+          hint: "`break` outside a loop is not supported (and is a SyntaxError in Python)",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      payload_ast ->
+        {{:throw, [], [{:pylixir_break, payload_ast}]}, context}
+    end
+  end
+
+  def convert(%{"_type" => "Continue"} = node, context) do
+    case context.loop_break_payload do
+      nil ->
+        raise UnsupportedNodeError,
+          node_type: "Continue",
+          hint: "`continue` outside a loop is not supported (and is a SyntaxError in Python)",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      payload_ast ->
+        {{:throw, [], [{:pylixir_continue, payload_ast}]}, context}
+    end
+  end
 
   # Minimal Expr clause: unwrap and convert the inner value. The full
   # plan T31 also drops the result unless it's a recognised mutation —
@@ -431,6 +575,493 @@ defmodule Pylixir.Converter do
   defp bind_name_returning_assign(context, coll_id, coll_ref, setitem) do
     context = bind_name(context, coll_id)
     {{:=, [], [coll_ref, setitem]}, context}
+  end
+
+  # --- FunctionDef emission (T19) ---------------------------------------
+
+  defp emit_function_def(node, context) do
+    %{"name" => py_name, "args" => args, "body" => body} = node
+
+    if Map.get(node, "decorator_list", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "FunctionDef",
+        hint: "Python decorators are not supported",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+
+    validate_arguments!(args, node)
+
+    {param_asts, context} = build_param_asts(args, context)
+    param_names = arg_names(args)
+
+    return_mode = decide_return_mode(body)
+
+    saved_scopes = context.scopes
+    saved_def_position = context.def_position
+    saved_return_mode = context.return_mode
+
+    new_scope = MapSet.new(param_names)
+
+    context = %{
+      context
+      | scopes: [new_scope | context.scopes],
+        def_position: :nested_fn,
+        return_mode: return_mode
+    }
+
+    {body_asts, context} = convert_each(body, context)
+
+    context = %{
+      context
+      | scopes: saved_scopes,
+        def_position: saved_def_position,
+        return_mode: saved_return_mode
+    }
+
+    body_block =
+      case body_asts do
+        [] -> nil
+        _ -> body_to_block(body_asts)
+      end
+
+    body_block = maybe_wrap_return_catch(body_block, return_mode)
+
+    fn_name_atom = py_name |> Naming.rewrite() |> String.to_atom()
+    defp_ast = {:defp, [], [{fn_name_atom, [], param_asts}, [do: body_block]]}
+    {defp_ast, context}
+  end
+
+  # Conservative wrap rule (Q19): wrap iff 2+ Returns, OR exactly 1 Return
+  # that is NOT the function body's literal final top-level statement.
+  defp decide_return_mode(body) do
+    returns = collect_returns(body)
+
+    cond do
+      returns == [] -> :unwrapped
+      length(returns) == 1 and last_is_return?(body) -> :unwrapped
+      true -> :wrapped
+    end
+  end
+
+  defp collect_returns(body) do
+    Enum.reduce(body, [], fn stmt, acc ->
+      Walk.walk_scope(stmt, acc, fn
+        %{"_type" => "Return"} = ret, list -> [ret | list]
+        _, list -> list
+      end)
+    end)
+  end
+
+  defp last_is_return?([]), do: false
+  defp last_is_return?(body), do: match?(%{"_type" => "Return"}, List.last(body))
+
+  defp maybe_wrap_return_catch(body_block, :unwrapped), do: body_block
+  defp maybe_wrap_return_catch(nil, :wrapped), do: nil
+
+  defp maybe_wrap_return_catch(body_block, :wrapped) do
+    val_ref = {:val, [], nil}
+
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_return, val_ref}], val_ref]}
+
+    {:try, [], [[do: body_block, catch: [catch_clause]]]}
+  end
+
+  defp validate_arguments!(args, node) do
+    cond do
+      Map.get(args, "vararg") != nil ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "Python `*args` (varargs) parameter is not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      Map.get(args, "kwarg") != nil ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "Python `**kwargs` parameter is not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      Map.get(args, "kwonlyargs", []) != [] ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "Python keyword-only parameters (`*, x`) are not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      Map.get(args, "posonlyargs", []) != [] ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "Python positional-only parameters (`x, /`) are not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      true ->
+        :ok
+    end
+  end
+
+  defp arg_names(args) do
+    args |> Map.get("args", []) |> Enum.map(& &1["arg"])
+  end
+
+  defp build_param_asts(args, context) do
+    arg_list = Map.get(args, "args", [])
+    defaults = Map.get(args, "defaults", [])
+    defaults_start = length(arg_list) - length(defaults)
+
+    {asts, context} =
+      arg_list
+      |> Enum.with_index()
+      |> Enum.reduce({[], context}, fn {arg, i}, {acc, ctx} ->
+        arg_atom = arg["arg"] |> Naming.rewrite() |> String.to_atom()
+        arg_ref = {arg_atom, [], nil}
+
+        if i >= defaults_start do
+          default_node = Enum.at(defaults, i - defaults_start)
+          {default_ast, ctx} = convert(default_node, ctx)
+          {[{:\\, [], [arg_ref, default_ast]} | acc], ctx}
+        else
+          {[arg_ref | acc], ctx}
+        end
+      end)
+
+    {Enum.reverse(asts), context}
+  end
+
+  # --- While-loop emission (T18) ----------------------------------------
+
+  defp emit_while(%{"test" => test, "body" => body}, context) do
+    n = context.while_counter
+    fn_name = String.to_atom("while_#{n}")
+    context = %{context | while_counter: n + 1}
+
+    pre_loop_context = context
+    analysis = LoopAnalysis.analyze(body)
+    threaded = analysis.assigned_vars |> MapSet.to_list() |> Enum.sort()
+    threaded_set = MapSet.new(threaded)
+
+    # Read-only vars: referenced inside body, NOT threaded, AND bound in
+    # the outer scope. These pass through the recursive helper unchanged
+    # (RFC §10.5).
+    referenced_in_test =
+      Walk.walk_scope(test, MapSet.new(), fn
+        %{"_type" => "Name", "id" => id}, acc -> MapSet.put(acc, id)
+        _, acc -> acc
+      end)
+
+    read_only =
+      analysis.referenced_vars
+      |> MapSet.union(referenced_in_test)
+      |> MapSet.difference(threaded_set)
+      |> MapSet.to_list()
+      |> Enum.filter(&var_bound?(pre_loop_context, &1))
+      |> Enum.sort()
+
+    {payload_ast, _refs} = build_acc_refs(threaded)
+    flow = loop_flow(body)
+
+    saved_payload = context.loop_break_payload
+    context = %{context | loop_break_payload: payload_ast}
+    {test_ast, context} = convert_test(test, context)
+    {body_asts, context} = convert_each(body, context)
+    context = %{context | loop_break_payload: saved_payload}
+
+    threaded_refs =
+      Enum.map(threaded, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    read_only_refs =
+      Enum.map(read_only, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    param_refs = threaded_refs ++ read_only_refs
+    state_value = state_value_ast(threaded, threaded_refs)
+    initial_args = Enum.map(threaded ++ read_only, &initial_ref(&1, pre_loop_context))
+
+    recurse_call = {fn_name, [], param_refs}
+    body_with_recurse = body_to_block(body_asts ++ [recurse_call])
+    inner_body = maybe_continue_while(body_with_recurse, payload_ast, recurse_call, elem(flow, 1))
+
+    cond_ast =
+      {:cond, [],
+       [
+         [
+           do: [
+             {:->, [], [[test_ast], inner_body]},
+             {:->, [], [[true], state_value]}
+           ]
+         ]
+       ]}
+
+    defp_ast =
+      {:defp, [],
+       [
+         {fn_name, [], param_refs},
+         [do: cond_ast]
+       ]}
+
+    context = %{context | while_helpers: context.while_helpers ++ [defp_ast]}
+
+    caller_call = {fn_name, [], initial_args}
+    wrapped_call = maybe_break_reduce(caller_call, payload_ast, elem(flow, 0))
+
+    context =
+      Enum.reduce(threaded, context, fn v, ctx -> bind_name(ctx, v) end)
+
+    final_ast =
+      case threaded do
+        [] -> wrapped_call
+        _ -> {:=, [], [payload_ast, wrapped_call]}
+      end
+
+    {final_ast, context}
+  end
+
+  defp state_value_ast([], _refs), do: :ok
+  defp state_value_ast([_single], [ref]), do: ref
+  defp state_value_ast(_, refs), do: tuple_pattern(refs)
+
+  # While-specific continue: catch arm calls the recursive helper with the
+  # captured state (post-body-so-far values), so continue advances rather
+  # than spinning with pre-iteration values.
+  defp maybe_continue_while(body_block, _payload_ast, _recurse_call, false), do: body_block
+
+  defp maybe_continue_while(body_block, payload_ast, recurse_call, true) do
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_continue, payload_ast}], recurse_call]}
+
+    {:try, [], [[do: body_block, catch: [catch_clause]]]}
+  end
+
+  # --- For-loop emission (T16b + T17) -----------------------------------
+
+  defp emit_for(%{"target" => target, "iter" => iter, "body" => body}, context) do
+    pre_loop_context = context
+
+    {iter_ast, context} = convert(iter, context)
+    {target_ast, target_names, context} = convert_loop_target(target, context)
+
+    analysis = LoopAnalysis.analyze(body)
+
+    threaded =
+      analysis.assigned_vars
+      |> MapSet.difference(MapSet.new(target_names))
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    flow = loop_flow(body)
+
+    {payload_ast, acc_refs} = build_acc_refs(threaded)
+    saved = context.loop_break_payload
+    context = %{context | loop_break_payload: payload_ast}
+    {body_asts, context} = convert_each(body, context)
+    context = %{context | loop_break_payload: saved}
+
+    case {threaded, flow} do
+      {[], _} ->
+        emit_for_each(iter_ast, target_ast, body_asts, flow, context)
+
+      {[single], _} ->
+        emit_for_reduce_single(
+          iter_ast,
+          target_ast,
+          single,
+          body_asts,
+          pre_loop_context,
+          flow,
+          context
+        )
+
+      {_multi, _} ->
+        emit_for_reduce_tuple(
+          iter_ast,
+          target_ast,
+          threaded,
+          acc_refs,
+          body_asts,
+          pre_loop_context,
+          flow,
+          context
+        )
+    end
+  end
+
+  # Tuple {has_break?, has_continue?} restricted to break/continue at THIS
+  # loop's level — does not descend into nested For/While/Function/etc.
+  defp loop_flow(body) do
+    Enum.reduce(body, {false, false}, fn node, {b, c} ->
+      same_loop_walk(node, {b, c}, fn
+        %{"_type" => "Break"}, {_, cc} -> {true, cc}
+        %{"_type" => "Continue"}, {bb, _} -> {bb, true}
+        _, acc -> acc
+      end)
+    end)
+  end
+
+  defp same_loop_walk(%{"_type" => type} = node, acc, fun) do
+    acc = fun.(node, acc)
+
+    if type in ~w(FunctionDef AsyncFunctionDef Lambda ClassDef For AsyncFor While
+                  ListComp SetComp DictComp GeneratorExp) do
+      acc
+    else
+      node |> Map.delete("_type") |> Enum.reduce(acc, fn {_k, v}, a -> same_loop_walk(v, a, fun) end)
+    end
+  end
+
+  defp same_loop_walk(list, acc, fun) when is_list(list) do
+    Enum.reduce(list, acc, fn item, a -> same_loop_walk(item, a, fun) end)
+  end
+
+  defp same_loop_walk(_, acc, _fun), do: acc
+
+  defp build_acc_refs([]), do: {:pylixir_each, []}
+
+  defp build_acc_refs([single]) do
+    ref = {single |> Naming.rewrite() |> String.to_atom(), [], nil}
+    {ref, [ref]}
+  end
+
+  defp build_acc_refs(vars) do
+    refs =
+      Enum.map(vars, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    {tuple_pattern(refs), refs}
+  end
+
+  defp emit_for_each(iter_ast, target_ast, body_asts, {has_break?, has_continue?}, context) do
+    body_block = body_to_block(body_asts)
+    body_with_continue = maybe_continue_each(body_block, has_continue?)
+    fn_ast = {:fn, [], [{:->, [], [[target_ast], body_with_continue]}]}
+    each_call = {{:., [], [{:__aliases__, [], [:Enum]}, :each]}, [], [iter_ast, fn_ast]}
+    wrapped = maybe_break_each(each_call, has_break?)
+    {wrapped, context}
+  end
+
+  defp maybe_continue_each(body_block, false), do: body_block
+
+  defp maybe_continue_each(body_block, true) do
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_continue, {:_, [], nil}}], :ok]}
+
+    {:try, [], [[do: body_block, catch: [catch_clause]]]}
+  end
+
+  defp maybe_break_each(call, false), do: call
+
+  defp maybe_break_each(call, true) do
+    catch_clause =
+      {:->, [],
+       [[:throw, {:pylixir_break, {:_, [], nil}}], :ok]}
+
+    {:try, [], [[do: call, catch: [catch_clause]]]}
+  end
+
+  defp emit_for_reduce_single(iter_ast, target_ast, var, body_asts, pre_ctx, flow, context) do
+    acc_ref = {var |> Naming.rewrite() |> String.to_atom(), [], nil}
+    initial = initial_ref(var, pre_ctx)
+
+    inner_body = body_to_block(body_asts ++ [acc_ref])
+    inner_body = maybe_continue_iter(inner_body, acc_ref, elem(flow, 1))
+
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, acc_ref], inner_body]}]}
+
+    reduce =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, initial, fn_ast]}
+
+    rhs = maybe_break_reduce(reduce, acc_ref, elem(flow, 0))
+    context = bind_name(context, var)
+    {{:=, [], [acc_ref, rhs]}, context}
+  end
+
+  defp emit_for_reduce_tuple(iter_ast, target_ast, vars, acc_refs, body_asts, pre_ctx, flow, context) do
+    acc_pattern = tuple_pattern(acc_refs)
+    initial = tuple_pattern(Enum.map(vars, &initial_ref(&1, pre_ctx)))
+
+    inner_body = body_to_block(body_asts ++ [acc_pattern])
+    inner_body = maybe_continue_iter(inner_body, acc_pattern, elem(flow, 1))
+
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, acc_pattern], inner_body]}]}
+
+    reduce =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, initial, fn_ast]}
+
+    rhs = maybe_break_reduce(reduce, acc_pattern, elem(flow, 0))
+    context = Enum.reduce(vars, context, &bind_name(&2, &1))
+    {{:=, [], [acc_pattern, rhs]}, context}
+  end
+
+  defp maybe_continue_iter(body_block, _acc, false), do: body_block
+
+  defp maybe_continue_iter(body_block, acc_ast, true) do
+    # Captured pattern binds whatever Continue threw; the catch arm
+    # returns it as the new iteration accumulator.
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_continue, acc_ast}], acc_ast]}
+
+    {:try, [], [[do: body_block, catch: [catch_clause]]]}
+  end
+
+  defp maybe_break_reduce(reduce_call, _acc_pattern, false), do: reduce_call
+
+  defp maybe_break_reduce(reduce_call, acc_pattern, true) do
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_break, acc_pattern}], acc_pattern]}
+
+    {:try, [], [[do: reduce_call, catch: [catch_clause]]]}
+  end
+
+  defp initial_ref(var, context) do
+    if var_bound?(context, var) do
+      {var |> Naming.rewrite() |> String.to_atom(), [], nil}
+    else
+      nil
+    end
+  end
+
+  defp var_bound?(context, var) do
+    Enum.any?(context.scopes, &MapSet.member?(&1, var))
+  end
+
+  defp name_in_scope?(context, name) do
+    Enum.any?(context.scopes, &MapSet.member?(&1, name))
+  end
+
+  defp tuple_pattern([a, b]), do: {a, b}
+  defp tuple_pattern(refs), do: {:{}, [], refs}
+
+  defp convert_loop_target(%{"_type" => "Name", "id" => id}, context) do
+    context = bind_name(context, id)
+    atom = id |> Naming.rewrite() |> String.to_atom()
+    {{atom, [], nil}, [id], context}
+  end
+
+  defp convert_loop_target(%{"_type" => "Tuple", "elts" => elts}, context) do
+    reject_starred!(elts, "Tuple")
+
+    {refs, names, context} =
+      Enum.reduce(elts, {[], [], context}, fn
+        %{"_type" => "Name", "id" => id}, {refs, names, ctx} ->
+          ctx = bind_name(ctx, id)
+          atom = id |> Naming.rewrite() |> String.to_atom()
+          {[{atom, [], nil} | refs], [id | names], ctx}
+
+        other, _acc ->
+          raise UnsupportedNodeError,
+            node_type: "For",
+            hint:
+              "for-loop tuple-target element must be a Name; got `#{Map.get(other, "_type")}`"
+      end)
+
+    {tuple_pattern(Enum.reverse(refs)), Enum.reverse(names), context}
+  end
+
+  defp convert_loop_target(target, _context) do
+    raise UnsupportedNodeError,
+      node_type: "For",
+      hint:
+        "for-loop target shape `#{Map.get(target, "_type")}` is not supported (use a Name or Tuple of Names)"
   end
 
   # --- If / IfExp emission ----------------------------------------------

@@ -30,6 +30,8 @@ defmodule Pylixir.Context do
 
   @type def_position :: :module_top | :nested_fn | :other
 
+  @type return_mode :: nil | :unwrapped | :wrapped
+
   @type t :: %__MODULE__{
           scopes: [MapSet.t(String.t())],
           while_counter: non_neg_integer(),
@@ -37,7 +39,10 @@ defmodule Pylixir.Context do
           known_functions: MapSet.t(String.t()),
           temp_counter: non_neg_integer(),
           module_attrs: MapSet.t(String.t()),
-          def_position: def_position()
+          def_position: def_position(),
+          loop_break_payload: nil | Macro.t(),
+          while_helpers: [Macro.t()],
+          return_mode: return_mode()
         }
 
   @enforce_keys [:scopes]
@@ -47,7 +52,10 @@ defmodule Pylixir.Context do
             known_functions: MapSet.new(),
             temp_counter: 0,
             module_attrs: MapSet.new(),
-            def_position: :module_top
+            def_position: :module_top,
+            loop_break_payload: nil,
+            while_helpers: [],
+            return_mode: nil
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

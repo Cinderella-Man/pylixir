@@ -9,7 +9,7 @@ defmodule Pylixir.IntegrationTest do
   """
   use ExUnit.Case, async: true
 
-  alias Pylixir.{PythonParseError, TranspileHelpers}
+  alias Pylixir.{PythonParseError, TranspileHelpers, UnsupportedNodeError}
 
   defp python_available? do
     python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
@@ -296,6 +296,277 @@ else:
       case run_python(source) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 100
+      end
+    end
+  end
+
+  describe "For loops (T16/T17)" do
+    test "sum: total = 0; for i in [1..5]: total += i" do
+      source = """
+      total = 0
+      for i in [1, 2, 3, 4, 5]:
+          total += i
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 15
+      end
+    end
+
+    test "factorial with for loop" do
+      source = """
+      result = 1
+      for i in [1, 2, 3, 4, 5]:
+          result *= i
+      result
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 120
+      end
+    end
+
+    test "early break: first match wins" do
+      source = """
+      result = 0
+      for i in [10, 20, 30, 40]:
+          if i > 25:
+              result = i
+              break
+      result
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 30
+      end
+    end
+
+    test "continue: skip odd numbers" do
+      source = """
+      total = 0
+      for i in [1, 2, 3, 4, 5, 6]:
+          if i % 2 == 1:
+              continue
+          total += i
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 12
+      end
+    end
+
+    test "tuple-unpack target: for (k, v) in pairs" do
+      source = """
+      total = 0
+      for (k, v) in [(1, 10), (2, 20), (3, 30)]:
+          total += v
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 60
+      end
+    end
+
+    test "nested for: inner break is local to inner loop" do
+      source = """
+      total = 0
+      for i in [1, 2, 3]:
+          for j in [10, 20, 30]:
+              if j == 20:
+                  break
+              total += j
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 30
+      end
+    end
+  end
+
+  describe "While loops (T18)" do
+    test "counter: while i < 5: i += 1" do
+      source = """
+      i = 0
+      while i < 5:
+          i += 1
+      i
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 5
+      end
+    end
+
+    test "summation: i + total state threading" do
+      source = """
+      i = 0
+      total = 0
+      while i < 5:
+          total += i
+          i += 1
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 10
+      end
+    end
+
+    test "while with break" do
+      source = """
+      i = 0
+      while i < 100:
+          if i >= 7:
+              break
+          i += 1
+      i
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 7
+      end
+    end
+
+    test "while with continue: skip when i == 3" do
+      source = """
+      i = 0
+      total = 0
+      while i < 5:
+          i += 1
+          if i == 3:
+              continue
+          total += i
+      total
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 12
+      end
+    end
+  end
+
+  describe "FunctionDef + Return (T19/T20)" do
+    test "function with single tail return — unwrapped emission" do
+      source = """
+      def double(x):
+          return x * 2
+
+      double(21)
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 42
+      end
+    end
+
+    test "function with default arg" do
+      source = """
+      def greet(name, greeting='Hello'):
+          return greeting + ', ' + name
+
+      greet('World')
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == "Hello, World"
+      end
+    end
+
+    test "function with early return inside if — wrapped emission via try/catch" do
+      source = """
+      def sign(x):
+          if x > 0:
+              return 1
+          if x < 0:
+              return -1
+          return 0
+
+      sign(-5)
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == -1
+      end
+    end
+
+    test "function with for + early-return inside loop" do
+      source = """
+      def find_first_even(xs):
+          for x in xs:
+              if x % 2 == 0:
+                  return x
+          return None
+
+      find_first_even([1, 3, 5, 4, 7])
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 4
+      end
+    end
+
+    test "function with while loop and return inside" do
+      source = """
+      def first_power_of_two_above(n):
+          x = 1
+          while x <= n:
+              x *= 2
+          return x
+
+      first_power_of_two_above(100)
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 128
+      end
+    end
+
+    test "module-level constant referenced from inside a function" do
+      source = """
+      PI = 3.14159
+
+      def circle_area(r):
+          return PI * r * r
+
+      circle_area(2)
+      """
+
+      case run_python(source) do
+        :skip -> :ok
+        {_, value, _, _} -> assert_in_delta value, 12.56636, 0.001
+      end
+    end
+
+    test "function inside If raises (def_position :other)" do
+      source = """
+      if True:
+          def foo():
+              return 1
+      """
+
+      if python_available?() do
+        assert_raise UnsupportedNodeError, ~r/control flow/, fn ->
+          Pylixir.transpile(source)
+        end
       end
     end
   end
