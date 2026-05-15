@@ -67,6 +67,12 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  # Minimal Expr clause: unwrap and convert the inner value. The full
+  # plan T31 also drops the result unless it's a recognised mutation —
+  # that distinction matters for statement-context method calls (T30)
+  # but is a no-op for the T06–T15 features exercised here.
+  def convert(%{"_type" => "Expr", "value" => value}, context), do: convert(value, context)
+
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
     case orelse do
       [] -> emit_if_only(test, body, context)

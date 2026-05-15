@@ -24,7 +24,8 @@ defmodule Pylixir.MixProject do
 
   defp deps do
     [
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:jason, "~> 1.4"}
     ]
   end
 end

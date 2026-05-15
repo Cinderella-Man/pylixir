@@ -1,3 +1,16 @@
+defmodule Pylixir.PythonParseError do
+  @moduledoc """
+  Raised by `Pylixir.transpile/1` when the Python serializer reports a
+  parse failure or internal error.
+
+  Fields mirror the JSON envelope emitted by `priv/python/serialize.py`:
+  `:message`, `:lineno`, `:col_offset`, `:text`. `:lineno`/`:col_offset` are
+  `nil` for non-syntax errors.
+  """
+
+  defexception [:message, :lineno, :col_offset, :text]
+end
+
 defmodule Pylixir.UnsupportedNodeError do
   @moduledoc """
   Raised when the converter encounters a Python AST node type that pylixir
