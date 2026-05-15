@@ -6,6 +6,7 @@ defmodule Pylixir.Nodes.BinOpTest do
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp list_node(elts), do: %{"_type" => "List", "elts" => elts}
   defp op(name), do: %{"_type" => name}
+
   defp binop(op_name, left, right),
     do: %{"_type" => "BinOp", "op" => op(op_name), "left" => left, "right" => right}
 

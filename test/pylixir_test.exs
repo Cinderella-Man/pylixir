@@ -21,6 +21,7 @@ defmodule PylixirTest do
       # py_main on empty Module returns nil and emits nothing on stdout.
       assert value == nil
       assert stdout == ""
+
       assert diagnostics == [],
              "generated module produced unexpected diagnostics: " <> inspect(diagnostics)
     end

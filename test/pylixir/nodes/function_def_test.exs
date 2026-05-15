@@ -113,7 +113,9 @@ defmodule Pylixir.Nodes.FunctionDefTest do
     test "type_params silently ignored (PEP 695)" do
       assert {{:defp, _, _}, _} =
                Converter.convert(
-                 function_def("f", arguments([]), [], type_params: [%{"_type" => "TypeVar", "name" => "T"}]),
+                 function_def("f", arguments([]), [],
+                   type_params: [%{"_type" => "TypeVar", "name" => "T"}]
+                 ),
                  Context.new()
                )
     end

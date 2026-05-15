@@ -42,13 +42,12 @@ defmodule Pylixir.Builtins do
 
   def emit("range", [start, stop], _kw),
     do:
-      {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-       [{:.., [], [start, sub_one(stop)]}]}
+      {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [{:.., [], [start, sub_one(stop)]}]}
 
   def emit("range", [start, stop, step], _kw),
     do:
       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-       [{:"..//", [], [start, sub_one(stop), step]}]}
+       [{:..//, [], [start, sub_one(stop), step]}]}
 
   def emit("sorted", [xs], kw) do
     base = {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs]}
@@ -73,7 +72,9 @@ defmodule Pylixir.Builtins do
       end
 
     # Python yields (i, x); Elixir yields {x, i}. Swap via Enum.map.
-    swap_fn = {:fn, [], [{:->, [], [[{{:x, [], nil}, {:i, [], nil}}], {{:i, [], nil}, {:x, [], nil}}]}]}
+    swap_fn =
+      {:fn, [], [{:->, [], [[{{:x, [], nil}, {:i, [], nil}}], {{:i, [], nil}, {:x, [], nil}}]}]}
+
     {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [base, swap_fn]}
   end
 
@@ -176,7 +177,8 @@ defmodule Pylixir.Builtins do
     do: enum_truthy_call(:all?, xs)
 
   def emit(name, _args, _kw),
-    do: raise(ArgumentError, "Pylixir.Builtins.emit/3 has no clause for `#{name}` with these args")
+    do:
+      raise(ArgumentError, "Pylixir.Builtins.emit/3 has no clause for `#{name}` with these args")
 
   defp sub_one(ast) when is_integer(ast), do: ast - 1
   defp sub_one(ast), do: {:-, [], [ast, 1]}
@@ -189,13 +191,20 @@ defmodule Pylixir.Builtins do
       end
 
     case Map.get(kw, "reverse") do
-      nil -> base
-      true_ast when true_ast == true -> {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}
+      nil ->
+        base
+
+      true_ast when true_ast == true ->
+        {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}
+
       _other ->
         # Conservative: if `reverse=<expr>`, can't tell at codegen time.
         # Emit a conditional. For MVP, treat truthy as reverse.
-        {:if, [], [{:truthy?, [], [Map.get(kw, "reverse")]},
-                  [do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}, else: base]]}
+        {:if, [],
+         [
+           {:truthy?, [], [Map.get(kw, "reverse")]},
+           [do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}, else: base]
+         ]}
     end
   end
 
@@ -253,7 +262,8 @@ defmodule Pylixir.Builtins do
 
   defp isinstance_call(_x_ast, type_ast),
     do:
-      raise(ArgumentError,
+      raise(
+        ArgumentError,
         "isinstance/2 second arg must be a bare type name; got #{inspect(type_ast, limit: 3)}"
       )
 

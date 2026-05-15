@@ -14,7 +14,13 @@ defmodule Pylixir.LoopAnalysisTest do
     do: %{"_type" => "AugAssign", "target" => target, "op" => op(op_name), "value" => value}
 
   defp for_node(target, body),
-    do: %{"_type" => "For", "target" => target, "iter" => name("xs"), "body" => body, "orelse" => []}
+    do: %{
+      "_type" => "For",
+      "target" => target,
+      "iter" => name("xs"),
+      "body" => body,
+      "orelse" => []
+    }
 
   defp if_node(test, body, orelse \\ []),
     do: %{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}

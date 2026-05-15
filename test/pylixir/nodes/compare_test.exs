@@ -42,6 +42,7 @@ defmodule Pylixir.Nodes.CompareTest do
 
     test "Is/IsNot map to ==/!= per RFC §10.10" do
       {is_ast, _} = Converter.convert(compare(name("x"), ["Is"], [const(nil)]), Context.new())
+
       {isnot_ast, _} =
         Converter.convert(compare(name("x"), ["IsNot"], [const(nil)]), Context.new())
 
@@ -169,9 +170,7 @@ defmodule Pylixir.Nodes.CompareTest do
       lst = %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}
 
       {_, value, _, _} =
-        TranspileHelpers.transpile_and_run(
-          module_with(compare(const(2), ["In"], [lst]))
-        )
+        TranspileHelpers.transpile_and_run(module_with(compare(const(2), ["In"], [lst])))
 
       assert value == true
     end
@@ -180,18 +179,14 @@ defmodule Pylixir.Nodes.CompareTest do
       lst = %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}
 
       {_, value, _, _} =
-        TranspileHelpers.transpile_and_run(
-          module_with(compare(const(5), ["NotIn"], [lst]))
-        )
+        TranspileHelpers.transpile_and_run(module_with(compare(const(5), ["NotIn"], [lst])))
 
       assert value == true
     end
 
     test "x is None when x is nil" do
       {_, value, _, _} =
-        TranspileHelpers.transpile_and_run(
-          module_with(compare(const(nil), ["Is"], [const(nil)]))
-        )
+        TranspileHelpers.transpile_and_run(module_with(compare(const(nil), ["Is"], [const(nil)])))
 
       assert value == true
     end

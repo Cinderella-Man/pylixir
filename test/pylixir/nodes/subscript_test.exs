@@ -65,5 +65,4 @@ defmodule Pylixir.Nodes.SubscriptTest do
       end
     end
   end
-
 end

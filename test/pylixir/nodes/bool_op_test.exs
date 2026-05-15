@@ -5,7 +5,9 @@ defmodule Pylixir.Nodes.BoolOpTest do
 
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp op(name), do: %{"_type" => name}
-  defp bool_op(op_name, values), do: %{"_type" => "BoolOp", "op" => op(op_name), "values" => values}
+
+  defp bool_op(op_name, values),
+    do: %{"_type" => "BoolOp", "op" => op(op_name), "values" => values}
 
   defp module_with(stmt), do: %{"_type" => "Module", "body" => [stmt]}
 
@@ -29,9 +31,7 @@ defmodule Pylixir.Nodes.BoolOpTest do
   describe "end-to-end — RFC §6.3 cases where Elixir && / || semantics agree with Python and/or" do
     test "And of two truthy values returns the last (1 and 2 == 2)" do
       {_, value, _, _} =
-        TranspileHelpers.transpile_and_run(
-          module_with(bool_op("And", [const(1), const(2)]))
-        )
+        TranspileHelpers.transpile_and_run(module_with(bool_op("And", [const(1), const(2)])))
 
       assert value == 2
     end

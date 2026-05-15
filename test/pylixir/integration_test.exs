@@ -34,7 +34,9 @@ defmodule Pylixir.IntegrationTest do
   describe "Constants & Names (T06/T07)" do
     test "bare integer literal at module top" do
       case run_python("42\n") do
-        :skip -> :ok
+        :skip ->
+          :ok
+
         {_, value, _, diagnostics} ->
           assert value == 42
           assert diagnostics == []

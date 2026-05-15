@@ -78,5 +78,4 @@ defmodule Pylixir.ConverterTest do
       refute err.message =~ "line"
     end
   end
-
 end

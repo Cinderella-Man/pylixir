@@ -46,7 +46,8 @@ defmodule Pylixir.Nodes.ComprehensionTest do
 
     test "nested generators" do
       case run("[(x, y) for x in [1, 2] for y in [10, 20]]\n") do
-        :skip -> :ok
+        :skip ->
+          :ok
 
         {_, value, _, _} ->
           assert value == [{1, 10}, {1, 20}, {2, 10}, {2, 20}]

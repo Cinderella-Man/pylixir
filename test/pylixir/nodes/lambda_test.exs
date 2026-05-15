@@ -50,7 +50,9 @@ defmodule Pylixir.Nodes.LambdaTest do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
             assert_raise Pylixir.UnsupportedNodeError, ~r/default/, fn ->
-              Pylixir.transpile("greet = lambda name, prefix='Hi': prefix + ', ' + name\ngreet('x')\n")
+              Pylixir.transpile(
+                "greet = lambda name, prefix='Hi': prefix + ', ' + name\ngreet('x')\n"
+              )
             end
           end
 

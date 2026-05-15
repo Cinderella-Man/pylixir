@@ -11,7 +11,16 @@ defmodule Pylixir.Converter do
   """
 
   alias Pylixir.AST.{BoolReturning, Trivial, Walk}
-  alias Pylixir.{Builtins, Context, HelpersCodegen, LoopAnalysis, ModuleAnalysis, Naming, UnsupportedNodeError}
+
+  alias Pylixir.{
+    Builtins,
+    Context,
+    HelpersCodegen,
+    LoopAnalysis,
+    ModuleAnalysis,
+    Naming,
+    UnsupportedNodeError
+  }
 
   @type elixir_ast :: Macro.t()
 
@@ -209,7 +218,10 @@ defmodule Pylixir.Converter do
     emit_comprehension(:gen, elt, generators, context)
   end
 
-  def convert(%{"_type" => "DictComp", "key" => key, "value" => value, "generators" => generators}, context) do
+  def convert(
+        %{"_type" => "DictComp", "key" => key, "value" => value, "generators" => generators},
+        context
+      ) do
     emit_comprehension(:dict, {key, value}, generators, context)
   end
 
@@ -774,7 +786,12 @@ defmodule Pylixir.Converter do
   end
 
   # Multiple generators: flat_map of the rest.
-  defp build_comp([%{"target" => target, "iter" => iter, "ifs" => ifs} | rest], elt_node, kind, context) do
+  defp build_comp(
+         [%{"target" => target, "iter" => iter, "ifs" => ifs} | rest],
+         elt_node,
+         kind,
+         context
+       ) do
     {iter_ast, context} = convert(iter, context)
     saved_scopes = context.scopes
     {target_ast, _, context} = convert_loop_target(target, context)
@@ -1172,7 +1189,9 @@ defmodule Pylixir.Converter do
                   ListComp SetComp DictComp GeneratorExp) do
       acc
     else
-      node |> Map.delete("_type") |> Enum.reduce(acc, fn {_k, v}, a -> same_loop_walk(v, a, fun) end)
+      node
+      |> Map.delete("_type")
+      |> Enum.reduce(acc, fn {_k, v}, a -> same_loop_walk(v, a, fun) end)
     end
   end
 
@@ -1218,8 +1237,7 @@ defmodule Pylixir.Converter do
 
   defp maybe_break_each(call, true) do
     catch_clause =
-      {:->, [],
-       [[:throw, {:pylixir_break, {:_, [], nil}}], :ok]}
+      {:->, [], [[:throw, {:pylixir_break, {:_, [], nil}}], :ok]}
 
     {:try, [], [[do: call, catch: [catch_clause]]]}
   end
@@ -1241,7 +1259,16 @@ defmodule Pylixir.Converter do
     {{:=, [], [acc_ref, rhs]}, context}
   end
 
-  defp emit_for_reduce_tuple(iter_ast, target_ast, vars, acc_refs, body_asts, pre_ctx, flow, context) do
+  defp emit_for_reduce_tuple(
+         iter_ast,
+         target_ast,
+         vars,
+         acc_refs,
+         body_asts,
+         pre_ctx,
+         flow,
+         context
+       ) do
     acc_pattern = tuple_pattern(acc_refs)
     initial = tuple_pattern(Enum.map(vars, &initial_ref(&1, pre_ctx)))
 
@@ -1581,13 +1608,20 @@ defmodule Pylixir.Converter do
   defp mutation_rhs("update", target, [other], _kw, _node) do
     # dict.update(other) → Map.merge; MapSet.update(other) → MapSet.union.
     # Branch at runtime.
-    {:cond, [], [[
-      do: [
-        {:->, [], [[{:is_struct, [], [target, {:__aliases__, [], [:MapSet]}]}],
-                   {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}]},
-        {:->, [], [[true], {{:., [], [{:__aliases__, [], [:Map]}, :merge]}, [], [target, other]}]}
-      ]
-    ]]}
+    {:cond, [],
+     [
+       [
+         do: [
+           {:->, [],
+            [
+              [{:is_struct, [], [target, {:__aliases__, [], [:MapSet]}]}],
+              {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}
+            ]},
+           {:->, [],
+            [[true], {{:., [], [{:__aliases__, [], [:Map]}, :merge]}, [], [target, other]}]}
+         ]
+       ]
+     ]}
   end
 
   defp mutation_rhs(method, _target, args, _kw, node) do
@@ -1623,8 +1657,7 @@ defmodule Pylixir.Converter do
   defp emit_math_attribute(attr, node, _context) when attr in @math_unsupported_attrs do
     raise UnsupportedNodeError,
       node_type: "Attribute",
-      hint:
-        "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)",
+      hint: "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
@@ -1713,8 +1746,7 @@ defmodule Pylixir.Converter do
         other, _acc ->
           raise UnsupportedNodeError,
             node_type: "For",
-            hint:
-              "for-loop tuple-target element must be a Name; got `#{Map.get(other, "_type")}`"
+            hint: "for-loop tuple-target element must be a Name; got `#{Map.get(other, "_type")}`"
       end)
 
     {tuple_pattern(Enum.reverse(refs)), Enum.reverse(names), context}
@@ -1742,8 +1774,7 @@ defmodule Pylixir.Converter do
       pattern = state_tuple_pattern(assigned)
       context = Enum.reduce(assigned, context, &bind_name(&2, &1))
 
-      {{:=, [],
-        [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
+      {{:=, [], [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
     end
   end
 
@@ -1761,8 +1792,7 @@ defmodule Pylixir.Converter do
       pattern = state_tuple_pattern(assigned)
       context = Enum.reduce(assigned, context, &bind_name(&2, &1))
 
-      {{:=, [],
-        [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
+      {{:=, [], [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
     end
   end
 

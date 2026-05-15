@@ -54,8 +54,7 @@ defmodule Pylixir.LoopAnalysis do
     {assigned, referenced} =
       Enum.reduce(body, {MapSet.new(), MapSet.new()}, fn node, {a_acc, r_acc} ->
         Walk.walk_scope(node, {a_acc, r_acc}, fn n, {a, r} ->
-          {MapSet.union(a, names_assigned_in(n)),
-           MapSet.union(r, names_referenced_in(n))}
+          {MapSet.union(a, names_assigned_in(n)), MapSet.union(r, names_referenced_in(n))}
         end)
       end)
 

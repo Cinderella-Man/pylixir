@@ -5,7 +5,9 @@ defmodule Pylixir.Nodes.UnaryOpTest do
 
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp op(name), do: %{"_type" => name}
-  defp unary(op_name, operand), do: %{"_type" => "UnaryOp", "op" => op(op_name), "operand" => operand}
+
+  defp unary(op_name, operand),
+    do: %{"_type" => "UnaryOp", "op" => op(op_name), "operand" => operand}
 
   defp module_with(stmt),
     do: %{"_type" => "Module", "body" => [stmt]}

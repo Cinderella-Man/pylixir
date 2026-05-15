@@ -15,7 +15,13 @@ defmodule Pylixir.Nodes.ForTest do
     do: %{"_type" => "AugAssign", "target" => target, "op" => op(op_name), "value" => value}
 
   defp for_node(target, iter, body, orelse \\ []),
-    do: %{"_type" => "For", "target" => target, "iter" => iter, "body" => body, "orelse" => orelse}
+    do: %{
+      "_type" => "For",
+      "target" => target,
+      "iter" => iter,
+      "body" => body,
+      "orelse" => orelse
+    }
 
   defp module_with(stmts), do: %{"_type" => "Module", "body" => stmts}
 
@@ -145,8 +151,10 @@ defmodule Pylixir.Nodes.ForTest do
           for_node(
             %{"_type" => "Tuple", "elts" => [name("a"), name("b")]},
             pairs,
-            [aug_assign(name("sum"), "Add", aug_target = name("a")),
-             aug_assign(name("sum"), "Add", aug_target_2 = name("b"))]
+            [
+              aug_assign(name("sum"), "Add", aug_target = name("a")),
+              aug_assign(name("sum"), "Add", aug_target_2 = name("b"))
+            ]
           ),
           name("sum")
         ])
