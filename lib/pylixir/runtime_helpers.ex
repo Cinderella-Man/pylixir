@@ -108,6 +108,51 @@ defmodule Pylixir.RuntimeHelpers do
   def py_len(x) when is_map(x), do: map_size(x)
   def py_len(x) when is_tuple(x), do: tuple_size(x)
 
+  # Python slice [start:stop:step] with full semantics: negative indices
+  # wrap from len; nil bounds default to 0/len (or len-1/-1 for negative
+  # step); negative step iterates backward. Works on lists, binaries, and
+  # tuples. See RFC §6.18.
+  def py_slice(coll, start, stop, step) do
+    step_v = step || 1
+    len = py_len(coll)
+
+    {start_i, stop_i} = py_slice_bounds(start, stop, step_v, len)
+    indices = py_slice_indices(start_i, stop_i, step_v)
+
+    cond do
+      is_list(coll) -> Enum.map(indices, &Enum.at(coll, &1))
+      is_binary(coll) -> Enum.map_join(indices, "", &String.at(coll, &1))
+      is_tuple(coll) -> indices |> Enum.map(&elem(coll, &1)) |> List.to_tuple()
+    end
+  end
+
+  def py_slice_bounds(start, stop, step, len) do
+    if step > 0 do
+      s = if start == nil, do: 0, else: py_slice_clamp_pos(start, len)
+      e = if stop == nil, do: len, else: py_slice_clamp_pos(stop, len)
+      {s, e}
+    else
+      s = if start == nil, do: len - 1, else: py_slice_clamp_neg(start, len)
+      e = if stop == nil, do: -1, else: py_slice_clamp_neg(stop, len)
+      {s, e}
+    end
+  end
+
+  def py_slice_clamp_pos(i, len) when i < 0, do: max(0, len + i)
+  def py_slice_clamp_pos(i, len), do: min(i, len)
+
+  def py_slice_clamp_neg(i, len) when i < 0, do: max(-1, len + i)
+  def py_slice_clamp_neg(i, len) when i >= len, do: len - 1
+  def py_slice_clamp_neg(i, _len), do: i
+
+  def py_slice_indices(start, stop, step) when step > 0 do
+    Stream.iterate(start, &(&1 + step)) |> Enum.take_while(&(&1 < stop))
+  end
+
+  def py_slice_indices(start, stop, step) do
+    Stream.iterate(start, &(&1 + step)) |> Enum.take_while(&(&1 > stop))
+  end
+
   def py_getitem(c, k) when is_list(c), do: Enum.at(c, k)
   def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
   def py_getitem(c, k) when is_tuple(c) and k >= 0, do: elem(c, k)

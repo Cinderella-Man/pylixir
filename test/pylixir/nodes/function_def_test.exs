@@ -52,12 +52,11 @@ defmodule Pylixir.Nodes.FunctionDefTest do
       assert match?({:defp, [], [_, _]}, ast)
     end
 
-    test "at :nested_fn — raises (T21 territory)" do
+    test "at :nested_fn — emits a fn binding (T21)" do
       ctx = %{Context.new() | def_position: :nested_fn}
 
-      assert_raise UnsupportedNodeError, ~r/nested function/, fn ->
-        Converter.convert(function_def("inner", arguments([]), []), ctx)
-      end
+      {ast, _} = Converter.convert(function_def("inner", arguments([]), [const(1)]), ctx)
+      assert match?({:=, [], [{:inner, [], nil}, {:fn, [], _}]}, ast)
     end
 
     test "at :other — raises with control-flow hint" do

@@ -42,7 +42,9 @@ defmodule Pylixir.Context do
           def_position: def_position(),
           loop_break_payload: nil | Macro.t(),
           while_helpers: [Macro.t()],
-          return_mode: return_mode()
+          return_mode: return_mode(),
+          recursive_lambdas: MapSet.t(String.t()),
+          recursive_self_binding: nil | String.t()
         }
 
   @enforce_keys [:scopes]
@@ -55,7 +57,9 @@ defmodule Pylixir.Context do
             def_position: :module_top,
             loop_break_payload: nil,
             while_helpers: [],
-            return_mode: nil
+            return_mode: nil,
+            recursive_lambdas: MapSet.new(),
+            recursive_self_binding: nil
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

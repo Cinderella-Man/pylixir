@@ -11,7 +11,7 @@ defmodule Pylixir.Converter do
   """
 
   alias Pylixir.AST.{BoolReturning, Trivial, Walk}
-  alias Pylixir.{Context, HelpersCodegen, LoopAnalysis, ModuleAnalysis, Naming, UnsupportedNodeError}
+  alias Pylixir.{Builtins, Context, HelpersCodegen, LoopAnalysis, ModuleAnalysis, Naming, UnsupportedNodeError}
 
   @type elixir_ast :: Macro.t()
 
@@ -78,27 +78,39 @@ defmodule Pylixir.Converter do
   # generalize to `Attribute` calls, builtins, math, kwargs, local-scope
   # shadowing precedence with explicit `.(args)` for shadowed names.
   def convert(%{"_type" => "Call"} = node, context) do
-    if Map.get(node, "keywords", []) != [] do
-      raise UnsupportedNodeError,
-        node_type: "Call",
-        hint: "keyword arguments at call sites are not yet supported (T28 territory)",
-        lineno: Map.get(node, "lineno"),
-        col_offset: Map.get(node, "col_offset")
-    end
-
     case node["func"] do
       %{"_type" => "Name", "id" => id} ->
         {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
-        atom = id |> Naming.rewrite() |> String.to_atom()
+        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
 
-        call_ast =
-          if name_in_scope?(context, id) do
-            {{:., [], [{atom, [], nil}]}, [], arg_asts}
-          else
-            {atom, [], arg_asts}
-          end
+        cond do
+          id == context.recursive_self_binding ->
+            self_ref = {:self, [], nil}
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            _ = atom
+            no_kwargs!(kwargs, id, node)
+            {{{:., [], [self_ref]}, [], arg_asts ++ [self_ref]}, context}
 
-        {call_ast, context}
+          MapSet.member?(context.recursive_lambdas, id) ->
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            ref = {atom, [], nil}
+            no_kwargs!(kwargs, id, node)
+            {{{:., [], [ref]}, [], arg_asts ++ [ref]}, context}
+
+          name_in_scope?(context, id) ->
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            ref = {atom, [], nil}
+            no_kwargs!(kwargs, id, node)
+            {{{:., [], [ref]}, [], arg_asts}, context}
+
+          Builtins.supported?(id) ->
+            {Builtins.emit(id, arg_asts, kwargs), context}
+
+          true ->
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            no_kwargs!(kwargs, id, node)
+            {{atom, [], arg_asts}, context}
+        end
 
       _ ->
         raise UnsupportedNodeError,
@@ -142,12 +154,7 @@ defmodule Pylixir.Converter do
         emit_function_def(node, context)
 
       :nested_fn ->
-        raise UnsupportedNodeError,
-          node_type: "FunctionDef",
-          hint:
-            "nested function definitions are not yet supported (T21); lift to module level or use a `lambda`",
-          lineno: Map.get(node, "lineno"),
-          col_offset: Map.get(node, "col_offset")
+        emit_nested_function_def(node, context)
 
       :other ->
         raise UnsupportedNodeError,
@@ -157,6 +164,55 @@ defmodule Pylixir.Converter do
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
+  end
+
+  def convert(%{"_type" => "ListComp", "elt" => elt, "generators" => generators}, context) do
+    emit_comprehension(:list, elt, generators, context)
+  end
+
+  def convert(%{"_type" => "SetComp", "elt" => elt, "generators" => generators}, context) do
+    emit_comprehension(:set, elt, generators, context)
+  end
+
+  def convert(%{"_type" => "GeneratorExp", "elt" => elt, "generators" => generators}, context) do
+    emit_comprehension(:gen, elt, generators, context)
+  end
+
+  def convert(%{"_type" => "DictComp", "key" => key, "value" => value, "generators" => generators}, context) do
+    emit_comprehension(:dict, {key, value}, generators, context)
+  end
+
+  def convert(%{"_type" => "Subscript", "value" => value, "slice" => slice}, context) do
+    case slice do
+      %{"_type" => "Slice"} = slice_node ->
+        {value_ast, context} = convert(value, context)
+        {start_ast, context} = convert_optional(Map.get(slice_node, "lower"), context)
+        {stop_ast, context} = convert_optional(Map.get(slice_node, "upper"), context)
+        {step_ast, context} = convert_optional(Map.get(slice_node, "step"), context)
+        {{:py_slice, [], [value_ast, start_ast, stop_ast, step_ast]}, context}
+
+      _ ->
+        {value_ast, context} = convert(value, context)
+        {slice_ast, context} = convert(slice, context)
+        {{:py_getitem, [], [value_ast, slice_ast]}, context}
+    end
+  end
+
+  def convert(%{"_type" => "Lambda", "args" => args, "body" => body} = node, context) do
+    validate_arguments!(args, node)
+    reject_defaults!(args, "Lambda", node)
+    {param_asts, context} = build_param_asts(args, context)
+    param_names = arg_names(args)
+
+    saved_scopes = context.scopes
+    new_scope = MapSet.new(param_names)
+    context = %{context | scopes: [new_scope | context.scopes]}
+
+    {body_ast, context} = convert(body, context)
+
+    context = %{context | scopes: saved_scopes}
+
+    {{:fn, [], [{:->, [], [param_asts, body_ast]}]}, context}
   end
 
   def convert(%{"_type" => "While"} = node, context) do
@@ -577,6 +633,167 @@ defmodule Pylixir.Converter do
     {{:=, [], [coll_ref, setitem]}, context}
   end
 
+  # --- Nested FunctionDef emission (T21) --------------------------------
+
+  defp emit_nested_function_def(node, context) do
+    %{"name" => name, "args" => args, "body" => body} = node
+
+    if Map.get(node, "decorator_list", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "FunctionDef",
+        hint: "decorators on nested functions are not supported",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+
+    validate_arguments!(args, node)
+    reject_defaults!(args, "nested FunctionDef", node)
+
+    recursive? = self_referential?(body, name)
+
+    {param_asts, context} = build_param_asts(args, context)
+    param_names = arg_names(args)
+    return_mode = decide_return_mode(body)
+
+    saved_scopes = context.scopes
+    saved_self = context.recursive_self_binding
+    saved_return_mode = context.return_mode
+
+    inner_scope_names =
+      if recursive?, do: param_names ++ ["self"], else: param_names
+
+    context = %{
+      context
+      | scopes: [MapSet.new(inner_scope_names) | context.scopes],
+        recursive_self_binding: if(recursive?, do: name, else: saved_self),
+        return_mode: return_mode
+    }
+
+    {body_asts, context} = convert_each(body, context)
+
+    context = %{
+      context
+      | scopes: saved_scopes,
+        recursive_self_binding: saved_self,
+        return_mode: saved_return_mode
+    }
+
+    body_block =
+      case body_asts do
+        [] -> nil
+        _ -> body_to_block(body_asts)
+      end
+
+    body_block = maybe_wrap_return_catch(body_block, return_mode)
+
+    fn_params = if recursive?, do: param_asts ++ [{:self, [], nil}], else: param_asts
+    fn_ast = {:fn, [], [{:->, [], [fn_params, body_block]}]}
+
+    name_atom = name |> Naming.rewrite() |> String.to_atom()
+
+    context = bind_name(context, name)
+
+    context =
+      if recursive? do
+        %{context | recursive_lambdas: MapSet.put(context.recursive_lambdas, name)}
+      else
+        context
+      end
+
+    {{:=, [], [{name_atom, [], nil}, fn_ast]}, context}
+  end
+
+  # --- Comprehensions (T24 + T24b) --------------------------------------
+
+  defp emit_comprehension(kind, elt_node, generators, context) do
+    {pipeline, context} = build_comp(generators, elt_node, kind, context)
+
+    final =
+      case kind do
+        :list -> pipeline
+        :gen -> pipeline
+        :set -> {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [pipeline]}
+        :dict -> {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [pipeline]}
+      end
+
+    {final, context}
+  end
+
+  # Single (last) generator: filter + map.
+  defp build_comp([%{"target" => target, "iter" => iter, "ifs" => ifs}], elt_node, kind, context) do
+    {iter_ast, context} = convert(iter, context)
+    saved_scopes = context.scopes
+    {target_ast, _, context} = convert_loop_target(target, context)
+    {filtered_iter, context} = apply_filter(iter_ast, target_ast, ifs, context)
+    {leaf, context} = comp_leaf(elt_node, kind, context)
+
+    pipeline =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [],
+       [filtered_iter, {:fn, [], [{:->, [], [[target_ast], leaf]}]}]}
+
+    context = %{context | scopes: saved_scopes}
+    {pipeline, context}
+  end
+
+  # Multiple generators: flat_map of the rest.
+  defp build_comp([%{"target" => target, "iter" => iter, "ifs" => ifs} | rest], elt_node, kind, context) do
+    {iter_ast, context} = convert(iter, context)
+    saved_scopes = context.scopes
+    {target_ast, _, context} = convert_loop_target(target, context)
+    {filtered_iter, context} = apply_filter(iter_ast, target_ast, ifs, context)
+    {inner, context} = build_comp(rest, elt_node, kind, context)
+
+    pipeline =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :flat_map]}, [],
+       [filtered_iter, {:fn, [], [{:->, [], [[target_ast], inner]}]}]}
+
+    context = %{context | scopes: saved_scopes}
+    {pipeline, context}
+  end
+
+  defp apply_filter(iter_ast, _target_ast, [], context), do: {iter_ast, context}
+
+  defp apply_filter(iter_ast, target_ast, ifs, context) do
+    {if_asts, context} =
+      Enum.reduce(ifs, {[], context}, fn cond_node, {acc, ctx} ->
+        {test_ast, ctx} = convert_test(cond_node, ctx)
+        {[test_ast | acc], ctx}
+      end)
+
+    combined =
+      if_asts
+      |> Enum.reverse()
+      |> Enum.reduce(fn ast, acc -> {:&&, [], [acc, ast]} end)
+
+    filter_call =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [],
+       [iter_ast, {:fn, [], [{:->, [], [[target_ast], combined]}]}]}
+
+    {filter_call, context}
+  end
+
+  defp comp_leaf(elt_node, kind, context) when kind in [:list, :set, :gen] do
+    convert(elt_node, context)
+  end
+
+  defp comp_leaf({key_node, value_node}, :dict, context) do
+    {k_ast, context} = convert(key_node, context)
+    {v_ast, context} = convert(value_node, context)
+    {{k_ast, v_ast}, context}
+  end
+
+  defp self_referential?(body, name) do
+    Enum.any?(body, fn stmt ->
+      Walk.walk_scope(stmt, false, fn
+        %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => id}}, _ when id == name ->
+          true
+
+        _, acc ->
+          acc
+      end)
+    end)
+  end
+
   # --- FunctionDef emission (T19) ---------------------------------------
 
   defp emit_function_def(node, context) do
@@ -705,6 +922,17 @@ defmodule Pylixir.Converter do
 
   defp arg_names(args) do
     args |> Map.get("args", []) |> Enum.map(& &1["arg"])
+  end
+
+  defp reject_defaults!(args, kind, node) do
+    if Map.get(args, "defaults", []) != [] do
+      raise UnsupportedNodeError,
+        node_type: "FunctionDef",
+        hint:
+          "default arguments on a #{kind} are not supported — Elixir `fn` does not accept defaults",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
   end
 
   defp build_param_asts(args, context) do
@@ -1028,6 +1256,31 @@ defmodule Pylixir.Converter do
     Enum.any?(context.scopes, &MapSet.member?(&1, name))
   end
 
+  defp convert_keywords([], context), do: {%{}, context}
+
+  defp convert_keywords(keywords, context) do
+    Enum.reduce(keywords, {%{}, context}, fn
+      %{"arg" => nil}, _ ->
+        raise UnsupportedNodeError,
+          node_type: "Call",
+          hint: "double-star kwargs unpack (**d) at call sites is not supported"
+
+      %{"arg" => name, "value" => value}, {acc, ctx} ->
+        {ast, ctx} = convert(value, ctx)
+        {Map.put(acc, name, ast), ctx}
+    end)
+  end
+
+  defp no_kwargs!(kwargs, _id, _node) when map_size(kwargs) == 0, do: :ok
+
+  defp no_kwargs!(_kwargs, id, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint: "keyword arguments at call sites are not supported for `#{id}`",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
   defp tuple_pattern([a, b]), do: {a, b}
   defp tuple_pattern(refs), do: {:{}, [], refs}
 
@@ -1262,6 +1515,9 @@ defmodule Pylixir.Converter do
     {rest_asts, context} = convert_module_attrs(rest, context)
     {[attr | rest_asts], context}
   end
+
+  defp convert_optional(nil, context), do: {nil, context}
+  defp convert_optional(node, context), do: convert(node, context)
 
   defp convert_each(nodes, context) do
     {asts, context} =
