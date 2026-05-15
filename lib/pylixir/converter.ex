@@ -10,7 +10,7 @@ defmodule Pylixir.Converter do
   catch-all clause raises `Pylixir.UnsupportedNodeError`.
   """
 
-  alias Pylixir.{Context, HelpersCodegen, ModuleAnalysis, UnsupportedNodeError}
+  alias Pylixir.{Context, HelpersCodegen, ModuleAnalysis, Naming, UnsupportedNodeError}
 
   @type elixir_ast :: Macro.t()
 
@@ -53,6 +53,31 @@ defmodule Pylixir.Converter do
   recursive calls so nested constructs can update scope / counters.
   """
   @spec convert(map(), Context.t()) :: {elixir_ast(), Context.t()}
+  def convert(%{"_type" => "Name"} = node, context) do
+    id = Map.fetch!(node, "id")
+
+    cond do
+      id == "__name__" ->
+        {"__main__", context}
+
+      Naming.reserved_prefix?(id) ->
+        raise UnsupportedNodeError,
+          node_type: "Name",
+          hint:
+            "Python identifier `#{id}` starts with a reserved Pylixir prefix (`var_`/`py_`) — rename it",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      MapSet.member?(context.module_attrs, id) ->
+        attr_name = String.to_atom("var_" <> id)
+        {{:@, [], [{attr_name, [], nil}]}, context}
+
+      true ->
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        {{atom, [], nil}, context}
+    end
+  end
+
   def convert(%{"_type" => "Constant"} = node, context) do
     case Map.fetch!(node, "value") do
       %{"_unsupported_literal" => kind} = tagged ->
