@@ -53,12 +53,50 @@ defmodule Pylixir.Converter do
   recursive calls so nested constructs can update scope / counters.
   """
   @spec convert(map(), Context.t()) :: {elixir_ast(), Context.t()}
+  def convert(%{"_type" => "Constant"} = node, context) do
+    case Map.fetch!(node, "value") do
+      %{"_unsupported_literal" => kind} = tagged ->
+        raise UnsupportedNodeError,
+          node_type: "Constant",
+          hint: unsupported_literal_hint(kind, tagged),
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+
+      value when is_integer(value) or is_float(value) or is_binary(value) ->
+        {value, context}
+
+      value when is_boolean(value) or is_nil(value) ->
+        {value, context}
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "Constant",
+          hint: "unrecognised constant value shape: #{inspect(other, limit: 3)}",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
   def convert(%{"_type" => type} = node, _context) do
     raise UnsupportedNodeError,
       node_type: type,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
+
+  # --- Constant unsupported-literal hint --------------------------------
+
+  defp unsupported_literal_hint("complex", %{"repr" => repr}),
+    do: "Python complex literal `#{repr}` is not supported"
+
+  defp unsupported_literal_hint("bytes", %{"repr" => repr}),
+    do: "Python bytes literal `#{repr}` is not supported"
+
+  defp unsupported_literal_hint("ellipsis", _),
+    do: "Python Ellipsis literal `...` is not supported"
+
+  defp unsupported_literal_hint(kind, _),
+    do: "Python literal of kind `#{kind}` is not supported"
 
   # --- Module-wrapper emission helpers ----------------------------------
 
