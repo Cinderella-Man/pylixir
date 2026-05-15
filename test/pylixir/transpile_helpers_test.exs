@@ -85,12 +85,19 @@ defmodule Pylixir.TranspileHelpersTest do
     end
   end
 
-  describe "transpile_and_run/1 — end-to-end (waits on T05's Module clause)" do
-    test "currently raises UnsupportedNodeError since T05 hasn't shipped" do
-      # When T05 lands, replace this with an end-to-end success test.
-      assert_raise Pylixir.UnsupportedNodeError, ~r/Module/, fn ->
+  describe "transpile_and_run/1 — end-to-end via Pylixir.to_source/1" do
+    test "empty Module compiles cleanly and py_main returns nil" do
+      {source, value, stdout, diagnostics} =
         TranspileHelpers.transpile_and_run(%{"_type" => "Module", "body" => []})
-      end
+
+      assert source =~ "defmodule TranslatedCode"
+      assert value == nil
+      assert stdout == ""
+      assert diagnostics == []
+    end
+
+    test "transpile_and_capture/1 returns the empty stdout for an empty Module" do
+      assert TranspileHelpers.transpile_and_capture(%{"_type" => "Module", "body" => []}) == ""
     end
   end
 end
