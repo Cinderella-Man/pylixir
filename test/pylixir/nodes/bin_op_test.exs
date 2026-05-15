@@ -18,9 +18,9 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert ast == {:py_add, [], [1, 2]}
     end
 
-    test "Sub emits a direct minus (no helper — RFC §6 no dispatch for Sub)" do
+    test "Sub emits py_sub — handles bool→int coercion per RFC §6.11" do
       {ast, _} = Converter.convert(binop("Sub", const(5), const(3)), Context.new())
-      assert ast == {:-, [], [5, 3]}
+      assert ast == {:py_sub, [], [5, 3]}
     end
 
     test "Mult emits py_mult(left, right)" do
@@ -28,9 +28,9 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert ast == {:py_mult, [], [2, 3]}
     end
 
-    test "Div emits a direct slash (Python `/` is float div, same as Elixir)" do
+    test "Div emits py_div — handles bool→int coercion per RFC §6.11" do
       {ast, _} = Converter.convert(binop("Div", const(10), const(4)), Context.new())
-      assert ast == {:/, [], [10, 4]}
+      assert ast == {:py_div, [], [10, 4]}
     end
 
     test "Pow emits py_pow(left, right)" do

@@ -51,6 +51,15 @@ defmodule Pylixir.RuntimeHelpers do
   def py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
   def py_add(a, b), do: a + b
 
+  # RFC §6.11 — booleans coerce to ints in arithmetic.
+  def py_sub(a, b) when is_boolean(a), do: py_sub(py_bool_to_int(a), b)
+  def py_sub(a, b) when is_boolean(b), do: py_sub(a, py_bool_to_int(b))
+  def py_sub(a, b), do: a - b
+
+  def py_div(a, b) when is_boolean(a), do: py_div(py_bool_to_int(a), b)
+  def py_div(a, b) when is_boolean(b), do: py_div(a, py_bool_to_int(b))
+  def py_div(a, b), do: a / b
+
   def py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
   def py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
 

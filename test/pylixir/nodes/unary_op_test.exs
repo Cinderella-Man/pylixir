@@ -18,9 +18,9 @@ defmodule Pylixir.Nodes.UnaryOpTest do
       assert ast == 5
     end
 
-    test "USub emits unary minus" do
+    test "USub emits py_sub(0, x) — handles bool→int coercion per RFC §6.11" do
       {ast, _} = Converter.convert(unary("USub", const(5)), Context.new())
-      assert ast == {:-, [], [5]}
+      assert ast == {:py_sub, [], [0, 5]}
     end
 
     test "Invert emits Bitwise.bnot (fully-qualified — no import Bitwise)" do

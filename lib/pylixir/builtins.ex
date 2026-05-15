@@ -84,7 +84,17 @@ defmodule Pylixir.Builtins do
   def emit("zip", [a, b | rest], _kw),
     do: {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [[a, b | rest]]}
 
-  def emit("sum", [xs], _kw), do: {{:., [], [{:__aliases__, [], [:Enum]}, :sum]}, [], [xs]}
+  def emit("sum", [xs], _kw) do
+    # Python sum() coerces booleans (RFC §6.11). Use py_add to retain that.
+    reducer =
+      {:fn, [],
+       [
+         {:->, [],
+          [[{:a, [], nil}, {:b, [], nil}], {:py_add, [], [{:a, [], nil}, {:b, [], nil}]}]}
+       ]}
+
+    {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, 0, reducer]}
+  end
 
   def emit("min", [xs], kw), do: minmax_call(:min, xs, kw)
   def emit("max", [xs], kw), do: minmax_call(:max, xs, kw)

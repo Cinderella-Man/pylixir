@@ -30,9 +30,9 @@ defmodule Pylixir.Nodes.AugAssignTest do
       assert ast == {:=, [], [{:x, [], nil}, {:py_add, [], [{:x, [], nil}, 1]}]}
     end
 
-    test "x -= 1 uses the direct binary op (no helper, per T10)" do
+    test "x -= 1 routes through py_sub (handles bool coercion per RFC §6.11)" do
       {ast, _} = Converter.convert(aug_assign(name("x"), "Sub", const(1)), Context.new())
-      assert ast == {:=, [], [{:x, [], nil}, {:-, [], [{:x, [], nil}, 1]}]}
+      assert ast == {:=, [], [{:x, [], nil}, {:py_sub, [], [{:x, [], nil}, 1]}]}
     end
 
     test "x *= 2 rewrites via py_mult" do

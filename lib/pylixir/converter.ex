@@ -462,7 +462,7 @@ defmodule Pylixir.Converter do
   # --- Operator emission -------------------------------------------------
 
   defp unary_op_ast(%{"_type" => "UAdd"}, operand_ast, _node), do: operand_ast
-  defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node), do: {:-, [], [operand_ast]}
+  defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node), do: {:py_sub, [], [0, operand_ast]}
 
   defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node) do
     {{:., [], [{:__aliases__, [], [:Bitwise]}, :bnot]}, [], [operand_ast]}
@@ -481,9 +481,9 @@ defmodule Pylixir.Converter do
   end
 
   defp bin_op_ast(%{"_type" => "Add"}, l, r, _node), do: {:py_add, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Sub"}, l, r, _node), do: {:-, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Sub"}, l, r, _node), do: {:py_sub, [], [l, r]}
   defp bin_op_ast(%{"_type" => "Mult"}, l, r, _node), do: {:py_mult, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Div"}, l, r, _node), do: {:/, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Div"}, l, r, _node), do: {:py_div, [], [l, r]}
   defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node), do: {:py_pow, [], [l, r]}
   defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node), do: {:py_floor_div, [], [l, r]}
   defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node), do: {:py_mod, [], [l, r]}
