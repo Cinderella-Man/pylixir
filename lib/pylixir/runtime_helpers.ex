@@ -236,6 +236,13 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str_count(s, ""), do: String.length(s) + 1
   def py_str_count(s, sub), do: length(String.split(s, sub)) - 1
 
+  def py_str_index(s, sub) do
+    case py_str_find(s, sub) do
+      -1 -> raise RuntimeError, "substring not found"
+      idx -> idx
+    end
+  end
+
   def py_list_index(list, x) do
     case Enum.find_index(list, fn v -> v == x end) do
       nil -> raise RuntimeError, "#{inspect(x)} is not in list"

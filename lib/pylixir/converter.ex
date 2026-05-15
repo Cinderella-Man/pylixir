@@ -74,49 +74,61 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  # Module-top `import math` and `from __future__ import ...` silently
+  # emit nothing (per T31 anticipation).
+  def convert(%{"_type" => "Import", "names" => names}, context) do
+    if Enum.all?(names, fn %{"name" => n} -> n == "math" end) do
+      {{:__block__, [], []}, context}
+    else
+      not_math = Enum.find(names, fn %{"name" => n} -> n != "math" end)
+
+      raise UnsupportedNodeError,
+        node_type: "Import",
+        hint: "only `import math` is supported; saw `import #{not_math["name"]}`"
+    end
+  end
+
+  def convert(%{"_type" => "ImportFrom", "module" => "__future__"}, context),
+    do: {{:__block__, [], []}, context}
+
+  def convert(%{"_type" => "ImportFrom", "module" => mod}, _context) do
+    raise UnsupportedNodeError,
+      node_type: "ImportFrom",
+      hint: "`from #{mod} import ...` is not supported (only `from __future__` and `import math`)"
+  end
+
   # Minimal Call clause — supports `Name(args)` calls only. T28 will
   # generalize to `Attribute` calls, builtins, math, kwargs, local-scope
   # shadowing precedence with explicit `.(args)` for shadowed names.
   def convert(%{"_type" => "Call"} = node, context) do
     case node["func"] do
       %{"_type" => "Name", "id" => id} ->
-        {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
-        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+        emit_name_call(id, node, context)
 
-        cond do
-          id == context.recursive_self_binding ->
-            self_ref = {:self, [], nil}
-            atom = id |> Naming.rewrite() |> String.to_atom()
-            _ = atom
-            no_kwargs!(kwargs, id, node)
-            {{{:., [], [self_ref]}, [], arg_asts ++ [self_ref]}, context}
-
-          MapSet.member?(context.recursive_lambdas, id) ->
-            atom = id |> Naming.rewrite() |> String.to_atom()
-            ref = {atom, [], nil}
-            no_kwargs!(kwargs, id, node)
-            {{{:., [], [ref]}, [], arg_asts ++ [ref]}, context}
-
-          name_in_scope?(context, id) ->
-            atom = id |> Naming.rewrite() |> String.to_atom()
-            ref = {atom, [], nil}
-            no_kwargs!(kwargs, id, node)
-            {{{:., [], [ref]}, [], arg_asts}, context}
-
-          Builtins.supported?(id) ->
-            {Builtins.emit(id, arg_asts, kwargs), context}
-
-          true ->
-            atom = id |> Naming.rewrite() |> String.to_atom()
-            no_kwargs!(kwargs, id, node)
-            {{atom, [], arg_asts}, context}
-        end
+      %{"_type" => "Attribute", "value" => target, "attr" => attr} ->
+        emit_attribute_call(target, attr, node, context)
 
       _ ->
         raise UnsupportedNodeError,
           node_type: "Call",
           hint:
-            "only `Name(args)` call shapes are supported pre-T28; got `#{Map.get(node["func"], "_type")}`",
+            "unsupported call-target shape `#{Map.get(node["func"], "_type")}`; expected `Name` or `Attribute`",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  # Bare `Attribute` access (no Call) — math.pi etc.
+  def convert(%{"_type" => "Attribute", "value" => target, "attr" => attr} = node, context) do
+    case target do
+      %{"_type" => "Name", "id" => "math"} ->
+        emit_math_attribute(attr, node, context)
+
+      _ ->
+        raise UnsupportedNodeError,
+          node_type: "Attribute",
+          hint:
+            "non-`math` attribute access (`obj.attr`) is not supported; got `<#{Map.get(target, "_type")}>.#{attr}`",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
@@ -267,11 +279,18 @@ defmodule Pylixir.Converter do
     end
   end
 
-  # Minimal Expr clause: unwrap and convert the inner value. The full
-  # plan T31 also drops the result unless it's a recognised mutation —
-  # that distinction matters for statement-context method calls (T30)
-  # but is a no-op for the T06–T15 features exercised here.
-  def convert(%{"_type" => "Expr", "value" => value}, context), do: convert(value, context)
+  # Expr: drop the result unless the inner value is a recognised
+  # mutation method, in which case T30 rewrites it to a target
+  # reassignment.
+  def convert(%{"_type" => "Expr", "value" => value}, context) do
+    case statement_mutation_target(value) do
+      nil ->
+        convert(value, context)
+
+      {target_name, method, args, kwargs, source_node} ->
+        emit_statement_mutation(target_name, method, args, kwargs, source_node, context)
+    end
+  end
 
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
     case orelse do
@@ -1254,6 +1273,378 @@ defmodule Pylixir.Converter do
 
   defp name_in_scope?(context, name) do
     Enum.any?(context.scopes, &MapSet.member?(&1, name))
+  end
+
+  # --- Call routing (T28) ------------------------------------------------
+
+  defp emit_name_call(id, node, context) do
+    {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+    {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+
+    cond do
+      id == context.recursive_self_binding ->
+        no_kwargs!(kwargs, id, node)
+        self_ref = {:self, [], nil}
+        {{{:., [], [self_ref]}, [], arg_asts ++ [self_ref]}, context}
+
+      MapSet.member?(context.recursive_lambdas, id) ->
+        no_kwargs!(kwargs, id, node)
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        ref = {atom, [], nil}
+        {{{:., [], [ref]}, [], arg_asts ++ [ref]}, context}
+
+      name_in_scope?(context, id) ->
+        no_kwargs!(kwargs, id, node)
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        ref = {atom, [], nil}
+        {{{:., [], [ref]}, [], arg_asts}, context}
+
+      Builtins.supported?(id) ->
+        {Builtins.emit(id, arg_asts, kwargs), context}
+
+      true ->
+        no_kwargs!(kwargs, id, node)
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        {{atom, [], arg_asts}, context}
+    end
+  end
+
+  defp emit_attribute_call(target, attr, node, context) do
+    case target do
+      %{"_type" => "Name", "id" => "math"} ->
+        {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+        {_kw, context} = convert_keywords(Map.get(node, "keywords", []), context)
+        {emit_math_call(attr, arg_asts, node), context}
+
+      _ ->
+        {target_ast, context} = convert(target, context)
+        {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+        {dispatch_method(attr, target_ast, arg_asts, kwargs, node), context}
+    end
+  end
+
+  @dict_methods ~w(keys values items get)
+  @string_methods ~w(lower upper strip lstrip rstrip startswith endswith
+                     split replace find count index zfill isdigit isalpha isalnum
+                     join)
+
+  @mutation_methods ~w(append sort reverse insert extend remove clear pop add discard update)
+
+  defp dispatch_method("keys", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :keys]}, [], [target]}
+
+  defp dispatch_method("values", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :values]}, [], [target]}
+
+  defp dispatch_method("items", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :to_list]}, [], [target]}
+
+  defp dispatch_method("get", target, [k], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :get]}, [], [target, k]}
+
+  defp dispatch_method("get", target, [k, default], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :get]}, [], [target, k, default]}
+
+  # --- T29a string methods: case / whitespace / prefix-suffix / join ---
+
+  defp dispatch_method("lower", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :downcase]}, [], [target]}
+
+  defp dispatch_method("upper", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :upcase]}, [], [target]}
+
+  defp dispatch_method("strip", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target]}
+
+  defp dispatch_method("strip", target, [chars], _kw, node) do
+    reject_multichar_strip!(chars, node)
+    {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target, chars]}
+  end
+
+  defp dispatch_method("lstrip", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :trim_leading]}, [], [target]}
+
+  defp dispatch_method("rstrip", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :trim_trailing]}, [], [target]}
+
+  defp dispatch_method("startswith", target, [prefix], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :starts_with?]}, [], [target, prefix]}
+
+  defp dispatch_method("endswith", target, [suffix], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :ends_with?]}, [], [target, suffix]}
+
+  # sep.join(items) — RFC §10.1 arg-swap (Python: sep.join(items); Elixir: Enum.join(items, sep))
+  defp dispatch_method("join", sep, [items], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [items, sep]}
+
+  # --- T29b string methods: search / split / replace / classification ---
+
+  defp dispatch_method("split", target, [], _kw, _node) do
+    # No args: split on whitespace.
+    {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target]}
+  end
+
+  defp dispatch_method("split", _target, [""], _kw, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "str.split(\"\") is unsupported (Python raises ValueError; Elixir would behave differently — RFC §6.20)",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp dispatch_method("split", target, [sep], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target, sep]}
+
+  defp dispatch_method("split", target, [sep, maxsplit], _kw, _node),
+    do:
+      {{:., [], [{:__aliases__, [], [:String]}, :split]}, [],
+       [target, sep, [parts: {:+, [], [maxsplit, 1]}]]}
+
+  defp dispatch_method("replace", target, [old, new], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :replace]}, [], [target, old, new]}
+
+  defp dispatch_method("replace", target, [old, new, 1], _kw, _node),
+    do:
+      {{:., [], [{:__aliases__, [], [:String]}, :replace]}, [],
+       [target, old, new, [global: false]]}
+
+  defp dispatch_method("replace", _target, [_old, _new, count], _kw, node)
+       when is_integer(count) and count > 1 do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "str.replace(old, new, count) with count>1 is not supported (RFC §6.23); use count=1 or omit",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp dispatch_method("find", target, [sub], _kw, _node),
+    do: {:py_str_find, [], [target, sub]}
+
+  defp dispatch_method("count", target, [sub], _kw, _node),
+    do: {:py_str_count, [], [target, sub]}
+
+  defp dispatch_method("index", target, [sub], _kw, _node),
+    do: {:py_str_index, [], [target, sub]}
+
+  defp dispatch_method("zfill", target, [width], _kw, _node) do
+    # "5".zfill(3) → "005". Elixir's String.pad_leading/3 with "0".
+    {{:., [], [{:__aliases__, [], [:String]}, :pad_leading]}, [], [target, width, "0"]}
+  end
+
+  defp dispatch_method("isdigit", target, [], _kw, _node) do
+    # Naive: check every char is in 0..9.
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[0-9]+$")]}
+  end
+
+  defp dispatch_method("isalpha", target, [], _kw, _node) do
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[A-Za-z]+$")]}
+  end
+
+  defp dispatch_method("isalnum", target, [], _kw, _node) do
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[A-Za-z0-9]+$")]}
+  end
+
+  defp dispatch_method(attr, _target, _args, _kw, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods, ", ")})",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- T30 statement-context mutations -----------------------------------
+
+  defp statement_mutation_target(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => name},
+             "attr" => attr
+           },
+           "args" => args
+         } = source
+       )
+       when attr != nil do
+    if attr in @mutation_methods do
+      kwargs_raw = Map.get(source, "keywords", [])
+      {name, attr, args, kwargs_raw, source}
+    end
+  end
+
+  defp statement_mutation_target(_), do: nil
+
+  defp emit_statement_mutation(target_name, method, args, kwargs_raw, source, context) do
+    {arg_asts, context} = convert_each(args, context)
+    {kwargs, context} = convert_keywords(kwargs_raw, context)
+
+    target_atom = target_name |> Naming.rewrite() |> String.to_atom()
+    target_ast = {target_atom, [], nil}
+    new_value = mutation_rhs(method, target_ast, arg_asts, kwargs, source)
+
+    context = bind_name(context, target_name)
+    {{:=, [], [target_ast, new_value]}, context}
+  end
+
+  defp mutation_rhs("append", target, [x], _kw, _node),
+    do: {:++, [], [target, [x]]}
+
+  defp mutation_rhs("sort", target, [], kw, _node) do
+    base =
+      case Map.get(kw, "key") do
+        nil -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [target]}
+        f -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [target, f]}
+      end
+
+    case Map.get(kw, "reverse") do
+      nil -> base
+      true -> {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}
+      _ -> base
+    end
+  end
+
+  defp mutation_rhs("reverse", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [target]}
+
+  defp mutation_rhs("insert", target, [i, x], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:List]}, :insert_at]}, [], [target, i, x]}
+
+  defp mutation_rhs("extend", target, [other], _kw, _node),
+    do: {:++, [], [target, other]}
+
+  defp mutation_rhs("remove", target, [x], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:List]}, :delete]}, [], [target, x]}
+
+  defp mutation_rhs("clear", target, [], _kw, _node) do
+    # Heuristic at codegen time — emit a runtime branch.
+    is_struct_call = {:is_struct, [], [target, {:__aliases__, [], [:MapSet]}]}
+    new_mapset = {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], []}
+    is_list_call = {:is_list, [], [target]}
+    is_map_call = {:is_map, [], [target]}
+
+    {:cond, [],
+     [
+       [
+         do: [
+           {:->, [], [[is_struct_call], new_mapset]},
+           {:->, [], [[is_list_call], []]},
+           {:->, [], [[is_map_call], {:%{}, [], []}]},
+           {:->, [], [[true], nil]}
+         ]
+       ]
+     ]}
+  end
+
+  defp mutation_rhs("pop", target, [], _kw, _node) do
+    # Statement-context pop() — discard the popped element, keep the list.
+    elem_call =
+      {{:., [], [{:__aliases__, [], [:Kernel]}, :elem]}, [],
+       [{{:., [], [{:__aliases__, [], [:List]}, :pop_at]}, [], [target, -1]}, 1]}
+
+    elem_call
+  end
+
+  defp mutation_rhs("pop", target, [i], _kw, _node) do
+    {{:., [], [{:__aliases__, [], [:Kernel]}, :elem]}, [],
+     [{{:., [], [{:__aliases__, [], [:List]}, :pop_at]}, [], [target, i]}, 1]}
+  end
+
+  defp mutation_rhs("add", target, [x], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :put]}, [], [target, x]}
+
+  defp mutation_rhs("discard", target, [x], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :delete]}, [], [target, x]}
+
+  defp mutation_rhs("update", target, [other], _kw, _node) do
+    # dict.update(other) → Map.merge; MapSet.update(other) → MapSet.union.
+    # Branch at runtime.
+    {:cond, [], [[
+      do: [
+        {:->, [], [[{:is_struct, [], [target, {:__aliases__, [], [:MapSet]}]}],
+                   {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}]},
+        {:->, [], [[true], {{:., [], [{:__aliases__, [], [:Map]}, :merge]}, [], [target, other]}]}
+      ]
+    ]]}
+  end
+
+  defp mutation_rhs(method, _target, args, _kw, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint: "mutation method `.#{method}(#{length(args)} args)` is not supported",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp regex_match(target, pattern) do
+    {{:., [], [{:__aliases__, [], [:Regex]}, :match?]}, [],
+     [{:sigil_r, [], [{:<<>>, [], [pattern]}, []]}, target]}
+  end
+
+  # The chars AST has already been converted by emit_attribute_call — for
+  # a Python Constant string, that's just the binary value. Reject if the
+  # resulting AST is a multi-char binary literal.
+  defp reject_multichar_strip!(chars_ast, node)
+       when is_binary(chars_ast) and byte_size(chars_ast) > 1 do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "str.strip(<multi-char>) is not supported — Python strips ANY of those chars from ends; Elixir's String.trim/2 strips exactly that string (RFC §6.24)",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp reject_multichar_strip!(_chars, _node), do: :ok
+
+  @math_unsupported_attrs ~w(inf nan)
+
+  defp emit_math_attribute(attr, node, _context) when attr in @math_unsupported_attrs do
+    raise UnsupportedNodeError,
+      node_type: "Attribute",
+      hint:
+        "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp emit_math_attribute("pi", _node, context),
+    do: {{{:., [], [:math, :pi]}, [], []}, context}
+
+  defp emit_math_attribute("e", _node, context),
+    do: {{{:., [], [:math, :e]}, [], []}, context}
+
+  defp emit_math_attribute("tau", _node, context),
+    do: {{:*, [], [2, {{:., [], [:math, :pi]}, [], []}]}, context}
+
+  defp emit_math_attribute(attr, node, _context) do
+    raise UnsupportedNodeError,
+      node_type: "Attribute",
+      hint: "`math.#{attr}` (bare attribute) is not supported",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  @math_unary ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp)
+  @math_binary ~w(pow atan2)
+
+  defp emit_math_call(attr, [x], _node) when attr in @math_unary do
+    {{:., [], [:math, String.to_atom(attr)]}, [], [x]}
+  end
+
+  defp emit_math_call(attr, [a, b], _node) when attr in @math_binary do
+    {{:., [], [:math, String.to_atom(attr)]}, [], [a, b]}
+  end
+
+  defp emit_math_call(attr, args, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "math.#{attr}/#{length(args)} is not supported (supported: #{Enum.join(@math_unary, "/1, ")}/1 + #{Enum.join(@math_binary, "/2, ")}/2)",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
   end
 
   defp convert_keywords([], context), do: {%{}, context}

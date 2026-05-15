@@ -14,7 +14,20 @@ defmodule Pylixir.Builtins do
 
   @t25a ~w(len range sorted reversed enumerate zip)
   @t25b ~w(sum min max abs map filter)
-  @supported MapSet.new(@t25a ++ @t25b)
+  @t26_conversions ~w(int float str bool list tuple set dict)
+  @t26_type_checks ~w(isinstance)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all)
+  @supported MapSet.new(@t25a ++ @t25b ++ @t26_conversions ++ @t26_type_checks ++ @t27_io_format)
+
+  @isinstance_map %{
+    "int" => :integer,
+    "float" => :float,
+    "str" => :binary,
+    "bool" => :boolean,
+    "list" => :list,
+    "tuple" => :tuple,
+    "dict" => :map
+  }
 
   @spec supported?(String.t()) :: boolean()
   def supported?(id), do: MapSet.member?(@supported, id)
@@ -83,6 +96,85 @@ defmodule Pylixir.Builtins do
   def emit("filter", [f, xs], _kw),
     do: {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [xs, f]}
 
+  # --- T26 conversions ---------------------------------------------------
+
+  def emit("int", [x], _kw), do: {:py_int, [], [x]}
+  def emit("str", [x], _kw), do: {:py_str, [], [x]}
+  def emit("bool", [x], _kw), do: {:truthy?, [], [x]}
+
+  def emit("float", [x], _kw) do
+    case x do
+      v when is_binary(v) ->
+        if String.downcase(String.trim(v)) in ~w(inf +inf -inf infinity +infinity -infinity nan) do
+          raise ArgumentError,
+                "Python `float(\"#{v}\")` is not supported (RFC §6.19 — Elixir has no inf/nan)"
+        else
+          {:py_float, [], [x]}
+        end
+
+      _ ->
+        {:py_float, [], [x]}
+    end
+  end
+
+  def emit("list", [x], _kw),
+    do: {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}
+
+  def emit("tuple", [x], _kw) do
+    {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [],
+     [{{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}]}
+  end
+
+  def emit("set", [x], _kw),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}
+
+  def emit("dict", [x], _kw),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}
+
+  # --- T26 type checks ---------------------------------------------------
+
+  # isinstance(x, T) where T is a Name → guard call.
+  def emit("isinstance", [_x, _type_ast] = [x, type_ast], _kw),
+    do: isinstance_call(x, type_ast)
+
+  # --- T27 IO + formatting ----------------------------------------------
+
+  def emit("print", args, kw), do: emit_print(args, kw)
+
+  def emit("input", [], _kw),
+    do: {:py_input, [], [""]}
+
+  def emit("input", [prompt], _kw),
+    do: {:py_input, [], [prompt]}
+
+  def emit("chr", [x], _kw),
+    do: {{:., [], [{:__aliases__, [], [:List]}, :to_string]}, [], [[x]]}
+
+  def emit("ord", [x], _kw) do
+    charlist_call = {{:., [], [{:__aliases__, [], [:String]}, :to_charlist]}, [], [x]}
+    {:hd, [], [charlist_call]}
+  end
+
+  def emit("hex", [x], _kw), do: {:py_hex, [], [x]}
+  def emit("oct", [x], _kw), do: {:py_oct, [], [x]}
+  def emit("bin", [x], _kw), do: {:py_bin, [], [x]}
+
+  def emit("round", [x], _kw), do: {:py_round, [], [x]}
+  def emit("round", [x, n], _kw), do: {:py_round, [], [x, n]}
+
+  def emit("divmod", [a, b], _kw) do
+    # Python: (a // b, a % b)
+    fdiv = {:py_floor_div, [], [a, b]}
+    mod = {:py_mod, [], [a, b]}
+    {fdiv, mod}
+  end
+
+  def emit("any", [xs], _kw),
+    do: enum_truthy_call(:any?, xs)
+
+  def emit("all", [xs], _kw),
+    do: enum_truthy_call(:all?, xs)
+
   def emit(name, _args, _kw),
     do: raise(ArgumentError, "Pylixir.Builtins.emit/3 has no clause for `#{name}` with these args")
 
@@ -120,5 +212,86 @@ defmodule Pylixir.Builtins do
 
   defp minmax_variadic(op, args) do
     {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [args]}
+  end
+
+  # isinstance(x, T): the second arg is the converted AST of the type
+  # reference. For a Python `int`, my T07 Name converter produces
+  # `{:int, [], nil}` (or the Naming-rewritten form). We detect this
+  # bare-name shape at codegen time.
+  defp isinstance_call(x_ast, {type_atom, _meta, nil}) when is_atom(type_atom) do
+    type_str = Atom.to_string(type_atom)
+
+    case Map.get(@isinstance_map, type_str) do
+      :integer ->
+        # RFC §6.13: isinstance(True, int) == True in Python.
+        {:||, [], [{:is_integer, [], [x_ast]}, {:is_boolean, [], [x_ast]}]}
+
+      :float ->
+        {:is_float, [], [x_ast]}
+
+      :binary ->
+        {:is_binary, [], [x_ast]}
+
+      :boolean ->
+        {:is_boolean, [], [x_ast]}
+
+      :list ->
+        {:is_list, [], [x_ast]}
+
+      :tuple ->
+        {:is_tuple, [], [x_ast]}
+
+      :map ->
+        {:&&, [], [{:is_map, [], [x_ast]}, {:!, [], [{:is_struct, [], [x_ast]}]}]}
+
+      nil ->
+        raise ArgumentError,
+              "isinstance/2 with type `#{type_str}` is not supported; allowed: " <>
+                inspect(Map.keys(@isinstance_map))
+    end
+  end
+
+  defp isinstance_call(_x_ast, type_ast),
+    do:
+      raise(ArgumentError,
+        "isinstance/2 second arg must be a bare type name; got #{inspect(type_ast, limit: 3)}"
+      )
+
+  defp enum_truthy_call(op, xs) do
+    fn_ast = {:fn, [], [{:->, [], [[{:x, [], nil}], {:truthy?, [], [{:x, [], nil}]}]}]}
+    {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [xs, fn_ast]}
+  end
+
+  defp emit_print(args, kw) do
+    sep_ast = Map.get(kw, "sep", " ")
+    end_ast = Map.get(kw, "end", "\n")
+
+    if Map.has_key?(kw, "file") do
+      raise ArgumentError,
+            "print(file=...) is not supported (RFC §6.7 — redirecting stdout requires IO.puts(device, ...))"
+    end
+
+    str_args =
+      Enum.map(args, fn arg -> {:py_str, [], [arg]} end)
+
+    joined =
+      case str_args do
+        [] ->
+          ""
+
+        [only] ->
+          only
+
+        _ ->
+          {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [str_args, sep_ast]}
+      end
+
+    full =
+      case end_ast do
+        "" -> joined
+        _ -> {:<>, [], [joined, end_ast]}
+      end
+
+    {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [full]}
   end
 end
