@@ -53,6 +53,44 @@ defmodule Pylixir.Converter do
   recursive calls so nested constructs can update scope / counters.
   """
   @spec convert(map(), Context.t()) :: {elixir_ast(), Context.t()}
+  def convert(%{"_type" => "UnaryOp", "op" => op, "operand" => operand} = node, context) do
+    {operand_ast, context} = convert(operand, context)
+    {unary_op_ast(op, operand_ast, node), context}
+  end
+
+  def convert(%{"_type" => "BinOp", "op" => op, "left" => left, "right" => right} = node, context) do
+    {left_ast, context} = convert(left, context)
+    {right_ast, context} = convert(right, context)
+    {bin_op_ast(op, left_ast, right_ast, node), context}
+  end
+
+  def convert(%{"_type" => "List", "elts" => elts}, context) do
+    reject_starred!(elts, "List")
+    {asts, context} = convert_each(elts, context)
+    {asts, context}
+  end
+
+  def convert(%{"_type" => "Tuple", "elts" => elts}, context) do
+    reject_starred!(elts, "Tuple")
+    {asts, context} = convert_each(elts, context)
+
+    tuple_ast =
+      case asts do
+        [a, b] -> {a, b}
+        _ -> {:{}, [], asts}
+      end
+
+    {tuple_ast, context}
+  end
+
+  def convert(%{"_type" => "Dict", "keys" => keys, "values" => values} = node, context) do
+    reject_dict_unpack!(keys, node)
+    {key_asts, context} = convert_each(keys, context)
+    {value_asts, context} = convert_each(values, context)
+    pairs = Enum.zip(key_asts, value_asts)
+    {{:%{}, [], pairs}, context}
+  end
+
   def convert(%{"_type" => "Name"} = node, context) do
     id = Map.fetch!(node, "id")
 
@@ -107,6 +145,68 @@ defmodule Pylixir.Converter do
       node_type: type,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- Operator emission -------------------------------------------------
+
+  defp unary_op_ast(%{"_type" => "UAdd"}, operand_ast, _node), do: operand_ast
+  defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node), do: {:-, [], [operand_ast]}
+
+  defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node) do
+    {{:., [], [{:__aliases__, [], [:Bitwise]}, :bnot]}, [], [operand_ast]}
+  end
+
+  defp unary_op_ast(%{"_type" => "Not"}, operand_ast, _node) do
+    {:!, [], [{:truthy?, [], [operand_ast]}]}
+  end
+
+  defp unary_op_ast(%{"_type" => other}, _operand_ast, node) do
+    raise UnsupportedNodeError,
+      node_type: other,
+      hint: "unary operator `#{other}` is not supported",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  defp bin_op_ast(%{"_type" => "Add"}, l, r, _node), do: {:py_add, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Sub"}, l, r, _node), do: {:-, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Mult"}, l, r, _node), do: {:py_mult, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Div"}, l, r, _node), do: {:/, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node), do: {:py_pow, [], [l, r]}
+
+  defp bin_op_ast(%{"_type" => other}, _l, _r, node) do
+    raise UnsupportedNodeError,
+      node_type: other,
+      hint: "binary operator `#{other}` is not supported",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- Literal-container rejections --------------------------------------
+
+  defp reject_starred!(elts, container_type) do
+    Enum.each(elts, fn
+      %{"_type" => "Starred"} = starred ->
+        raise UnsupportedNodeError,
+          node_type: "Starred",
+          hint:
+            "star-unpack inside a #{container_type} literal (`[*xs, ...]`) is not supported; use `xs + [...]` instead",
+          lineno: Map.get(starred, "lineno"),
+          col_offset: Map.get(starred, "col_offset")
+
+      _ ->
+        :ok
+    end)
+  end
+
+  defp reject_dict_unpack!(keys, dict_node) do
+    if Enum.any?(keys, &is_nil/1) do
+      raise UnsupportedNodeError,
+        node_type: "Dict",
+        hint: "dict-unpack (`{**d}`) is not supported",
+        lineno: Map.get(dict_node, "lineno"),
+        col_offset: Map.get(dict_node, "col_offset")
+    end
   end
 
   # --- Constant unsupported-literal hint --------------------------------
