@@ -18,8 +18,11 @@ defmodule Pylixir.Converter do
   recursive calls so nested constructs can update scope / counters.
   """
   @spec convert(map(), Context.t()) :: {elixir_ast(), Context.t()}
-  def convert(%{"_type" => type}, _context) do
-    raise UnsupportedNodeError, node_type: type
+  def convert(%{"_type" => type} = node, _context) do
+    raise UnsupportedNodeError,
+      node_type: type,
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
   end
 
   @doc """

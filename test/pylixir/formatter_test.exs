@@ -36,5 +36,23 @@ defmodule Pylixir.FormatterTest do
       # mix format strips parens around defmodule and uses do/end blocks
       refute String.contains?(result, "defmodule(Foo)")
     end
+
+    test "output is a fixed point under Code.format_string! (idempotency)" do
+      # The formatter pipeline must not emit syntax that the formatter only
+      # partly normalizes. If a future ticket emits AST that requires two
+      # passes to stabilize, this test fails — catching the issue at T04
+      # rather than in T32's golden corpus.
+      ast =
+        quote do
+          defmodule Foo do
+            def bar, do: 1 + 2
+          end
+        end
+
+      once = Formatter.format(ast)
+      twice = once |> Code.format_string!() |> IO.iodata_to_binary()
+
+      assert once == twice
+    end
   end
 end

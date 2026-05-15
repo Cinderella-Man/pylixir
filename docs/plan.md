@@ -5,7 +5,7 @@
 Repo is empty (`docs/rfc.md` only). RFC-001 v10 specifies an Elixir library:
 `Pylixir.to_source/1` takes a Python AST as decoded-JSON map, returns Elixir source string. Optional `Pylixir.transpile/1` shells out to `python3` for convenience.
 
-Local env: Elixir 1.19.5 / OTP 28 ✓ (RFC needs 1.19+/26+). Python 3.14.5 ✓ (RFC requires 3.14+). All fixtures generated on 3.14.5; CI pinned to 3.14.5; no version-skipping in any ticket.
+Local env: Elixir 1.19.5 / OTP 28 ✓ (RFC needs 1.19+/26+). Python 3.14.5 ✓ (RFC requires 3.14+). All fixtures generated on 3.14.5; no version-skipping in any ticket. No CI in MVP — verification is local-only.
 
 Goal of this plan: ordered list of ~40 small tickets (≈ ½–1 day each), each shippable as its own PR. Tests live inline with each ticket. Each ticket lists the RFC section(s) it depends on plus the edge-case traps it must handle.
 
@@ -38,12 +38,11 @@ Output ordering follows §12 of the RFC but splits the fat steps. Helpers (`trut
 - `.gitignore` (defaults + `/tmp/`).
 - Acceptance: `mix test` runs (one trivial test); `mix compile` warns about nothing.
 
-**T02. CI + tooling**
-- `.github/workflows/ci.yml`: Elixir 1.19 / OTP 28 + Python 3.14.5 (`actions/setup-python@v5` with `python-version: '3.14.5'`). Run `mix deps.get`, `mix format --check-formatted`, `mix test`, `mix credo --strict`.
-- Trap: Ubuntu 24.04 system `python3` is 3.12. Ensure the setup-python install is on `PATH` ahead of system Python, or invoke via `$pythonLocation/python3` — otherwise `T33` shells out to the wrong interpreter.
-- Add `:credo` to deps (dev/test only). (Skip `:dialyxir` — opt-in later if useful.)
+**T02. Tooling (Credo + formatter)**
+- Add `:credo` to deps (dev/test only). (Skip `:dialyxir` — opt-in later if useful.) Generate `.credo.exs` via `mix credo.gen.config`.
 - `.formatter.exs` already created by `mix new`; verify.
-- Acceptance: green CI on a no-op push; `python3 --version` step prints `3.14.5`.
+- No GitHub CI in MVP — verification is local. Maintainers run `mix deps.get`, `mix format --check-formatted`, `mix test`, `mix credo --strict` before commits.
+- Acceptance: all four local commands pass on a no-op checkout.
 
 **T03. Errors + Context struct + dispatch skeleton + scope-walk primitive**
 - `lib/pylixir/errors.ex`: `Pylixir.UnsupportedNodeError` with fields `node_type: String.t()`, `hint: String.t() | nil`, `lineno: pos_integer() | nil`, `col_offset: non_neg_integer() | nil`. `message/1` callback formats as `"#{node_type} at line #{lineno}, col #{col_offset}: #{hint || "not supported"}"` when lineno present, falls back to `"#{node_type}: #{hint || "not supported"}"` otherwise.
@@ -398,9 +397,9 @@ Output ordering follows §12 of the RFC but splits the fat steps. Helpers (`trut
 - Pre-serialise the 12 algorithms in §11.2 (Python source + JSON AST + expected Elixir output) using `python3` 3.14.5.
 - `priv/python/.python-version` pins to `3.14.5`. Each fixture's Python version recorded in a sidecar `.meta` file (or header comment if format allows).
 - Add a regen script (`mix pylixir.regen_fixtures` or `priv/python/regen_fixtures.sh`) that walks `test/fixtures/python/*.py`, runs `serialize.py` on each, and writes the JSON. Idempotent.
-- CI job runs the regen script, then `git diff --exit-code test/fixtures/` — fails if any maintainer pushed fixtures without regenerating.
+- Maintainer workflow: run the regen script before committing fixture changes, then `git diff --exit-code test/fixtures/` locally to confirm no drift. Document in CONTRIBUTING (or top of regen script) as a manual step.
 - Test runner: for each fixture, run `to_source/1` on the JSON; compile+eval the result; capture stdout; assert stdout matches `expected_output.txt`. Also assert `Code.format_string!(output) |> IO.iodata_to_binary() == output` (formatter idempotency from T04 extended to the full corpus).
-- Acceptance: all 12 fixtures green; CI regen-diff clean; formatter-idempotent on each; CI runs them.
+- Acceptance: all 12 fixtures green via `mix test`; regen script idempotent (running it twice produces no diff); formatter-idempotent on each.
 
 ### Phase 9 — Convenience wrapper
 
@@ -420,7 +419,7 @@ Output ordering follows §12 of the RFC but splits the fat steps. Helpers (`trut
   - `Pylixir.transpile("print(1+1)") |> compile+eval` prints `2`.
   - Negative-path: `Pylixir.transpile("class A: pass")` raises `UnsupportedNodeError` whose message contains `"at line 1"`.
   - **New negative-path**: `Pylixir.transpile("def )")` raises `Pylixir.PythonParseError` with a non-nil `:lineno` and the original message; assertion confirms it's NOT a `Jason.DecodeError`.
-  - Test runs unconditionally on CI (3.14.5 is pinned in T02).
+  - Test runs unconditionally as part of `mix test` on a local machine with `python3 == 3.14.5`.
 
 ---
 
@@ -448,7 +447,7 @@ Output ordering follows §12 of the RFC but splits the fat steps. Helpers (`trut
 | `lib/pylixir/ast/walk.ex` (shared scope-aware walk primitive) | T03 |
 | `lib/pylixir/scope.ex` (for-loop analyzer; if extracted from Context) | T16a |
 | `priv/python/serialize.py` | T33 |
-| `.github/workflows/ci.yml` | T02 |
+| `.credo.exs` | T02 |
 
 ---
 
@@ -481,7 +480,7 @@ Per-ticket verification = the inline tests in that ticket + every prior ticket's
 - **Comprehension coverage** — `ListComp` in T24, `SetComp`/`DictComp`/`GeneratorExp` in T24b. Verification example needs T24b to actually run.
 - **For-loop scope analysis** — split into T16a (pure analyzer, unit-tested in isolation) + T16b (codegen). Over-thread policy: loop var + every LHS name + root of subscript/attr targets. Reused by T17 and T18.
 - **Additional unsupported nodes** — `Delete`, `Global`, `Nonlocal`, `Starred`-in-call, `AnnAssign`, `JoinedStr`/`FormattedValue`, `Yield`/`YieldFrom`, slice-target assignment all explicitly raise (T31).
-- **Python 3.14.5 everywhere** — local + CI + fixtures all pinned to 3.14.5. T33 wrapper test runs unconditionally; no version-skipping. `priv/python/.python-version` pins it; CI uses `actions/setup-python@v5`.
+- **Python 3.14.5 everywhere** — local + fixtures all pinned to 3.14.5. T33 wrapper test runs unconditionally as part of `mix test`; no version-skipping. `priv/python/.python-version` pins the interpreter for local environments (asdf/pyenv pick it up). **No CI in MVP**; verification is local.
 - **Reserved-name policy (T07)** — Helpers use `py_<name>`; rewritten user identifiers use `var_<name>` (distinct namespaces). Three collision categories enumerated in `Pylixir.Naming`: hard keywords, special-form atoms, and `Kernel.__info__(:functions ++ :macros)` baked at Pylixir's compile time. Python identifiers matching `^var_` or `^py_` raise `UnsupportedNodeError`.
 - **Error-message format** — `Pylixir.UnsupportedNodeError` carries `node_type`, `hint`, `lineno`, `col_offset`. Hint table in T03; filled out in T31. `serialize.py` deviates from RFC §4.2 by keeping `lineno`/`col_offset` (drops `end_*` variants).
 - **Formatter round-trip guarantee** — Option B (self-consistency). Output must be a fixed point under the formatter Pylixir was compiled with. Tested in T04 (trivial) and T32 (full corpus). No promise about user `.formatter.exs` settings; README documents the caveat.

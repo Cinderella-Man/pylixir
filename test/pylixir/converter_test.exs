@@ -25,6 +25,58 @@ defmodule Pylixir.ConverterTest do
 
       assert err.node_type == "AsyncFunctionDef"
     end
+
+    test "the exception carries lineno and col_offset when the node provides them" do
+      ctx = Context.new()
+
+      err =
+        try do
+          Converter.convert(
+            %{"_type" => "ClassDef", "lineno" => 14, "col_offset" => 2},
+            ctx
+          )
+
+          flunk("expected UnsupportedNodeError")
+        rescue
+          e in UnsupportedNodeError -> e
+        end
+
+      assert err.lineno == 14
+      assert err.col_offset == 2
+      assert err.message =~ "line 14"
+      assert err.message =~ "col 2"
+    end
+
+    test "looks up a hint from the @hints table for known unsupported types" do
+      ctx = Context.new()
+
+      err =
+        try do
+          Converter.convert(%{"_type" => "ClassDef", "lineno" => 1, "col_offset" => 0}, ctx)
+          flunk("expected UnsupportedNodeError")
+        rescue
+          e in UnsupportedNodeError -> e
+        end
+
+      assert err.hint != nil
+      assert err.message =~ "classes are not supported"
+    end
+
+    test "falls back gracefully when the node has no location info (synthesized nodes)" do
+      ctx = Context.new()
+
+      err =
+        try do
+          Converter.convert(%{"_type" => "ClassDef"}, ctx)
+          flunk("expected UnsupportedNodeError")
+        rescue
+          e in UnsupportedNodeError -> e
+        end
+
+      assert err.lineno == nil
+      assert err.col_offset == nil
+      refute err.message =~ "line"
+    end
   end
 
   describe "collect_function_names/1" do

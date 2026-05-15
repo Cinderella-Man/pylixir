@@ -12,3 +12,10 @@ Full specification: [`docs/rfc.md`](docs/rfc.md).
 ## Status
 
 Pre-alpha. See `docs/rfc.md` for scope and roadmap.
+
+## Formatting
+
+Output is formatted with Elixir's default formatter at Pylixir's compile time.
+Running `mix format` on the output in a project with custom `.formatter.exs`
+settings (e.g., different `line_length`) may produce further changes — this is
+expected.

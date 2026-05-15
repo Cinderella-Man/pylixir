@@ -20,5 +20,19 @@ defmodule Pylixir.ContextTest do
 
       assert ctx.known_functions == names
     end
+
+    test "initializes the single-evaluation temp counter to zero" do
+      assert Context.new().temp_counter == 0
+    end
+
+    test "initializes module_attrs to an empty MapSet" do
+      ctx = Context.new()
+
+      assert MapSet.size(ctx.module_attrs) == 0
+    end
+
+    test "starts at :module_top so the first FunctionDef encountered is a top-level def" do
+      assert Context.new().def_position == :module_top
+    end
   end
 end
