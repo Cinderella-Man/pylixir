@@ -74,6 +74,25 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  def convert(%{"_type" => "Assert", "test" => test} = node, context) do
+    {test_ast, context} = convert_test(test, context)
+
+    msg_ast =
+      case Map.get(node, "msg") do
+        nil ->
+          "AssertionError"
+
+        msg ->
+          {ast, _} = convert(msg, context)
+          ast
+      end
+
+    raise_call =
+      {:raise, [], [{{:., [], [{:__aliases__, [], [:RuntimeError]}, :exception]}, [], [msg_ast]}]}
+
+    {{:unless, [], [test_ast, [do: raise_call]]}, context}
+  end
+
   # Module-top `import math` and `from __future__ import ...` silently
   # emit nothing (per T31 anticipation).
   def convert(%{"_type" => "Import", "names" => names}, context) do
@@ -1711,28 +1730,70 @@ defmodule Pylixir.Converter do
   # --- If / IfExp emission ----------------------------------------------
 
   defp emit_if_only(test, body, context) do
+    assigned = if_assigned_vars(body, [])
     {test_ast, context} = convert_test(test, context)
-    {body_block, context} = convert_body_block(body, context)
-    {{:if, [], [test_ast, [do: body_block]]}, context}
+
+    if assigned == [] do
+      {body_block, context} = convert_body_block(body, context)
+      {{:if, [], [test_ast, [do: body_block]]}, context}
+    else
+      {body_block, context} = convert_body_with_acc(body, assigned, context)
+      else_block = state_tuple_value(assigned)
+      pattern = state_tuple_pattern(assigned)
+      context = Enum.reduce(assigned, context, &bind_name(&2, &1))
+
+      {{:=, [],
+        [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
+    end
   end
 
   defp emit_if_else(test, body, orelse, context) do
+    assigned = if_assigned_vars(body, orelse)
     {test_ast, context} = convert_test(test, context)
-    {body_block, context} = convert_body_block(body, context)
-    {else_block, context} = convert_body_block(orelse, context)
-    {{:if, [], [test_ast, [do: body_block, else: else_block]]}, context}
+
+    if assigned == [] do
+      {body_block, context} = convert_body_block(body, context)
+      {else_block, context} = convert_body_block(orelse, context)
+      {{:if, [], [test_ast, [do: body_block, else: else_block]]}, context}
+    else
+      {body_block, context} = convert_body_with_acc(body, assigned, context)
+      {else_block, context} = convert_body_with_acc(orelse, assigned, context)
+      pattern = state_tuple_pattern(assigned)
+      context = Enum.reduce(assigned, context, &bind_name(&2, &1))
+
+      {{:=, [],
+        [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
+    end
   end
 
   defp emit_cond_chain(test, body, orelse, context) do
-    {clauses, terminal_else, context} = collect_cond_chain(test, body, orelse, context, [])
+    assigned = cond_assigned_vars(test, body, orelse)
 
-    arrow_clauses =
-      Enum.map(Enum.reverse(clauses), fn {t, b} -> {:->, [], [[t], b]} end)
+    if assigned == [] do
+      {clauses, terminal_else, context} = collect_cond_chain(test, body, orelse, context, [])
 
-    fallthrough_body = terminal_else || nil
-    all_clauses = arrow_clauses ++ [{:->, [], [[true], fallthrough_body]}]
+      arrow_clauses =
+        Enum.map(Enum.reverse(clauses), fn {t, b} -> {:->, [], [[t], b]} end)
 
-    {{:cond, [], [[do: all_clauses]]}, context}
+      fallthrough_body = terminal_else || nil
+      all_clauses = arrow_clauses ++ [{:->, [], [[true], fallthrough_body]}]
+
+      {{:cond, [], [[do: all_clauses]]}, context}
+    else
+      {clauses, terminal_else, context} =
+        collect_cond_chain_threaded(test, body, orelse, assigned, context, [])
+
+      arrow_clauses =
+        Enum.map(Enum.reverse(clauses), fn {t, b} -> {:->, [], [[t], b]} end)
+
+      fallthrough_body = terminal_else || state_tuple_value(assigned)
+      all_clauses = arrow_clauses ++ [{:->, [], [[true], fallthrough_body]}]
+
+      pattern = state_tuple_pattern(assigned)
+      context = Enum.reduce(assigned, context, &bind_name(&2, &1))
+
+      {{:=, [], [pattern, {:cond, [], [[do: all_clauses]]}]}, context}
+    end
   end
 
   defp collect_cond_chain(test, body, orelse, context, acc) do
@@ -1752,6 +1813,68 @@ defmodule Pylixir.Converter do
         {acc, else_block, context}
     end
   end
+
+  defp collect_cond_chain_threaded(test, body, orelse, assigned, context, acc) do
+    {test_ast, context} = convert_test(test, context)
+    {body_block, context} = convert_body_with_acc(body, assigned, context)
+    acc = [{test_ast, body_block} | acc]
+
+    case orelse do
+      [] ->
+        {acc, nil, context}
+
+      [%{"_type" => "If", "test" => t, "body" => b, "orelse" => o}] ->
+        collect_cond_chain_threaded(t, b, o, assigned, context, acc)
+
+      _ ->
+        {else_block, context} = convert_body_with_acc(orelse, assigned, context)
+        {acc, else_block, context}
+    end
+  end
+
+  # Collect names assigned anywhere in either branch of an If.
+  defp if_assigned_vars(body, orelse) do
+    body_a = LoopAnalysis.analyze(body).assigned_vars
+    else_a = LoopAnalysis.analyze(orelse).assigned_vars
+
+    body_a |> MapSet.union(else_a) |> MapSet.to_list() |> Enum.sort()
+  end
+
+  defp cond_assigned_vars(_test, body, orelse) do
+    collect_cond_assigned(body, orelse, MapSet.new())
+    |> MapSet.to_list()
+    |> Enum.sort()
+  end
+
+  defp collect_cond_assigned(body, orelse, acc) do
+    acc = MapSet.union(acc, LoopAnalysis.analyze(body).assigned_vars)
+
+    case orelse do
+      [%{"_type" => "If", "body" => b, "orelse" => o}] ->
+        collect_cond_assigned(b, o, acc)
+
+      stmts ->
+        MapSet.union(acc, LoopAnalysis.analyze(stmts).assigned_vars)
+    end
+  end
+
+  defp convert_body_with_acc(body, assigned, context) do
+    {asts, context} = convert_each(body, context)
+    tail = state_tuple_value(assigned)
+    {body_to_block(asts ++ [tail]), context}
+  end
+
+  defp state_tuple_value([single]),
+    do: {single |> Naming.rewrite() |> String.to_atom(), [], nil}
+
+  defp state_tuple_value(names) do
+    refs =
+      Enum.map(names, fn n -> {n |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    tuple_pattern(refs)
+  end
+
+  defp state_tuple_pattern(names), do: state_tuple_value(names)
 
   defp convert_test(test_node, context) do
     {test_ast, context} = convert(test_node, context)
