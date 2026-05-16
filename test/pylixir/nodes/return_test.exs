@@ -62,7 +62,10 @@ defmodule Pylixir.Nodes.ReturnTest do
 
       {source, value, _, _} = TranspileHelpers.transpile_and_run(ast)
       assert value == 1
-      refute source =~ "throw"
+      # Scoped: `f`'s body must be the bare constant — no Return-wrap.
+      # (A bare "throw" check would now catch py_main's exit-catch
+      # wrapper, which is unrelated to Return.)
+      assert source =~ ~r/defp\s+f\(\)\s+do\s+1\s+end/
       refute source =~ ":pylixir_return"
     end
 

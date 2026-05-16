@@ -16,7 +16,7 @@ defmodule Pylixir.Builtins do
   @t25b ~w(sum min max abs map filter)
   @t26_conversions ~w(int float str bool list tuple set dict)
   @t26_type_checks ~w(isinstance)
-  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit)
   @supported MapSet.new(@t25a ++ @t25b ++ @t26_conversions ++ @t26_type_checks ++ @t27_io_format)
 
   @isinstance_map %{
@@ -205,6 +205,16 @@ defmodule Pylixir.Builtins do
 
   def emit("all", [xs], _kw),
     do: enum_truthy_call(:all?, xs)
+
+  # `exit()` / `exit(code)` throw `{:pylixir_exit, code}`; py_main's
+  # try/catch wrapper (see `Pylixir.Converter.py_main_def/1`) catches
+  # the throw and returns the code so the BEAM survives — `System.halt`
+  # would kill the test VM during the golden-corpus run.
+  def emit("exit", [], _kw),
+    do: {:throw, [], [{:pylixir_exit, 0}]}
+
+  def emit("exit", [code], _kw),
+    do: {:throw, [], [{:pylixir_exit, code}]}
 
   def emit(name, _args, _kw),
     do:

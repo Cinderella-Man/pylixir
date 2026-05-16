@@ -170,6 +170,36 @@ defmodule Pylixir.Nodes.BuiltinsTest do
       end
     end
 
+    test "exit() short-circuits py_main and surfaces code 0" do
+      case run("""
+           print("before")
+           exit()
+           print("after")
+           """) do
+        :skip ->
+          :ok
+
+        {_, value, stdout, _} ->
+          assert stdout == "before\n"
+          assert value == 0
+      end
+    end
+
+    test "exit(7) surfaces the exit code through py_main's return value" do
+      case run("""
+           print("before")
+           exit(7)
+           print("after")
+           """) do
+        :skip ->
+          :ok
+
+        {_, value, stdout, _} ->
+          assert stdout == "before\n"
+          assert value == 7
+      end
+    end
+
     test "local binding shadows the builtin: `int = ...; map(int, ...)` uses the local" do
       # Python semantics: a local `int` shadows the builtin. Pylixir's
       # bare-Name converter must honour scope before falling through to

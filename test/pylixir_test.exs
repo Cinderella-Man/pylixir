@@ -128,6 +128,35 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: bare `exit()` lowered to `var_exit()` (undefined) —
+  # `exit` collides with Kernel.exit/1 so Naming rewrites it, and there was
+  # no Builtins emit clause to short-circuit. Fix adds an `exit` emit clause
+  # that throws `:pylixir_exit` and a py_main try/catch that returns the code.
+  describe "transpile/1 — exit() (Builtins emit + py_main catch wrapper)" do
+    test "29_exit_early fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "29_exit_early.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the lowering shape: exit() emits a tagged throw, py_main
+        # catches and returns the code. Without both halves, the
+        # generated module either fails to compile or runs past exit().
+        assert elixir_src =~ "throw({:pylixir_exit"
+        assert elixir_src =~ ":throw, {:pylixir_exit, code}"
+
+        {_, value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        # `exit()` short-circuits: only the pre-exit print runs.
+        assert stdout == "0\n"
+        # py_main's catch surfaces the exit code (0 for bare `exit()`).
+        assert value == 0
+      end
+    end
+  end
+
   # Eval-corpus repro: `map(int, xs)` / `map(str, xs)` produced Elixir source
   # with bare `int` / `str` references (undefined variables). Pylixir's Call
   # router rewrites direct calls (`int(x) → py_int(x)`), but bare-Name uses

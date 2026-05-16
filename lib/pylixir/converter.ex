@@ -2104,10 +2104,21 @@ defmodule Pylixir.Converter do
   end
 
   defp py_main_def([single]) do
-    {:def, [], [{:py_main, [], nil}, [do: single]]}
+    {:def, [], [{:py_main, [], nil}, [do: wrap_exit_catch(single)]]}
   end
 
   defp py_main_def(many) do
-    {:def, [], [{:py_main, [], nil}, [do: {:__block__, [], many}]]}
+    {:def, [], [{:py_main, [], nil}, [do: wrap_exit_catch({:__block__, [], many})]]}
+  end
+
+  # py_main catches `{:pylixir_exit, code}` so Python's `exit(code)`
+  # (lowered to a throw by `Builtins.emit("exit", ...)`) returns the code
+  # instead of killing the process. Always wrapped — the runtime cost is
+  # one stack frame, and conditional wrapping would need a Module-scope
+  # exit-usage scan.
+  defp wrap_exit_catch(body) do
+    code_ref = {:code, [], nil}
+    catch_clause = {:->, [], [[:throw, {:pylixir_exit, code_ref}], code_ref]}
+    {:try, [], [[do: body, catch: [catch_clause]]]}
   end
 end
