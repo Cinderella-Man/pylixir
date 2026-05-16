@@ -128,6 +128,29 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `.copy()` raised "method not supported". Elixir's
+  # immutability makes the copy identical to the value itself; the
+  # existing mutation rewrites preserve the original. See
+  # `Pylixir.Nodes.AttributeMethods.@noop_methods`.
+  describe "transpile/1 — .copy() (immutability no-op)" do
+    test "32_container_copy fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "32_container_copy.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+
+        # List: original unchanged, copy lost its 2. Dict: original
+        # unchanged, copy's "a" became 99.
+        assert stdout == "[1, 2, 3, 4]\n[1, 3, 4]\n1\n99\n"
+      end
+    end
+  end
+
   # Eval-corpus repro: `for _ in xs:` inside an `if` body produced
   # `_ = if ... do _ else _ end` (the if/else state-tuple wrapper tried
   # to thread `_` through both branches). Elixir's `_` is pattern-only.

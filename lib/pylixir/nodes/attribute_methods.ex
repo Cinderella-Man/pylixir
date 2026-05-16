@@ -32,11 +32,25 @@ defmodule Pylixir.Nodes.AttributeMethods do
   @string_methods ~w(lower upper strip lstrip rstrip startswith endswith
                      split replace find count index zfill isdigit isalpha isalnum
                      join)
+  # Methods that are no-ops under Elixir's immutability — Python's
+  # `xs.copy()` returns a shallow copy so subsequent mutations on the
+  # copy don't affect the original; Elixir's containers are already
+  # immutable, so the existing mutation-rewrite (`xs = xs ++ [y]` etc.)
+  # already preserves the original. `.copy()` lowers to its target.
+  @noop_methods ~w(copy)
 
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
     do_dispatch(attr, target_ast, arg_asts, kwargs, node)
   end
+
+  # --- Immutability no-ops -----------------------------------------------
+
+  # `xs.copy()` / `d.copy()` / `s.copy()` — Elixir is immutable, so the
+  # copy is the value itself. The target_ast is emitted *as the
+  # expression* — single-eval semantics are preserved because the
+  # surrounding expression evaluates it once.
+  defp do_dispatch("copy", target, [], _kw, _node), do: target
 
   # --- T28 dict methods --------------------------------------------------
 
@@ -159,7 +173,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
     raise UnsupportedNodeError,
       node_type: "Call",
       hint:
-        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods, ", ")})",
+        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods, ", ")})",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end

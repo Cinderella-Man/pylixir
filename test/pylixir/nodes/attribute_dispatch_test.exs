@@ -129,4 +129,24 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
       end
     end
   end
+
+  # `.copy()` on any container is an immutability no-op — Elixir's
+  # data structures are already immutable. The subsequent mutation
+  # rewrites (`xs.remove(y)` → `xs = List.delete(xs, y)`) preserve
+  # the original because the copy and original alias the same value.
+  describe ".copy() (immutability no-op)" do
+    test "list copy + mutation on copy leaves original intact" do
+      case run("xs = [1, 2, 3]\nys = xs.copy()\nys.remove(2)\n(xs, ys)\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {[1, 2, 3], [1, 3]}
+      end
+    end
+
+    test "dict copy + mutation on copy leaves original intact" do
+      case run(~s|d = {"a": 1}\ne = d.copy()\ne["a"] = 99\n(d, e)\n|) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {%{"a" => 1}, %{"a" => 99}}
+      end
+    end
+  end
 end
