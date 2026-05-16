@@ -108,8 +108,11 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       assert_raises_unsupported(~s|x = 3.14\nf"{x:.2f}"\n|, "FormattedValue")
     end
 
-    test "Set literal" do
-      assert_raises_unsupported("{1, 2, 3}\n", "Set")
+    # Set literals are now supported — `{1, 2, 3}` lowers to
+    # `MapSet.new([1, 2, 3])`. (Test kept for the negative case:
+    # set comprehensions containing Starred elements still raise.)
+    test "Set literal with Starred raises" do
+      assert_raises_unsupported("xs = [1, 2]\n{*xs, 3}\n", "Starred")
     end
 
     test "Walrus / NamedExpr" do

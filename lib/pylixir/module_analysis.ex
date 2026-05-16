@@ -192,6 +192,40 @@ defmodule Pylixir.ModuleAnalysis do
   defp mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
     do: target == name
 
+  # `del coll[k]` — rebinds `coll`, so a top-level dict/list that's
+  # later `del`'d-from must not be promoted to a module attribute.
+  defp mutates_name?(%{"_type" => "Delete", "targets" => targets}, name) do
+    Enum.any?(targets, fn
+      %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => target_name}} ->
+        target_name == name
+
+      _ ->
+        false
+    end)
+  end
+
+  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — Pylixir
+  # rebinds `heap` (Converter Expr clause); ModuleAnalysis must
+  # recognise these as mutations so an empty-list initialiser
+  # (`heap = []`) isn't promoted to a module attribute.
+  defp mutates_name?(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{
+               "_type" => "Attribute",
+               "value" => %{"_type" => "Name", "id" => "heapq"},
+               "attr" => method
+             },
+             "args" => [%{"_type" => "Name", "id" => target_name} | _]
+           }
+         },
+         name
+       )
+       when method in ["heappush", "heapify"],
+       do: target_name == name
+
   defp mutates_name?(_, _), do: false
 
   defp aug_target_root_name(%{"_type" => "Name", "id" => id}), do: id

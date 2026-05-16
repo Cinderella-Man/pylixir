@@ -27,6 +27,16 @@ defmodule Pylixir.Stdlib.Math do
   def attribute(_path, _node), do: :no_clause
 
   @impl true
+  # Python's `math.floor`/`math.ceil` return *int*; Erlang's
+  # `:math.floor`/`:math.ceil` return float. Wrap in `trunc/1` so
+  # the runtime type matches Python's. Other unary functions return
+  # float in both Python and Erlang — pass through directly.
+  def call(["floor"], [x], _kwargs, _node),
+    do: {:ok, {:trunc, [], [{{:., [], [:math, :floor]}, [], [x]}]}}
+
+  def call(["ceil"], [x], _kwargs, _node),
+    do: {:ok, {:trunc, [], [{{:., [], [:math, :ceil]}, [], [x]}]}}
+
   def call([attr], [x], _kwargs, _node) when attr in @unary,
     do: {:ok, {{:., [], [:math, String.to_atom(attr)]}, [], [x]}}
 

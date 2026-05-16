@@ -86,6 +86,25 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  # `del coll[k]` — rebind `coll` via `py_delitem` (polymorphic on
+  # list/map/MapSet). Multi-target `del a, b` becomes a block. Other
+  # target shapes (bare Name `del x`, Attribute, Tuple) still raise.
+  def convert(%{"_type" => "Delete", "targets" => targets} = node, context) do
+    {asts, context} =
+      Enum.reduce(targets, {[], context}, fn target, {acc, ctx} ->
+        {ast, ctx} = convert_del_target(target, node, ctx)
+        {[ast | acc], ctx}
+      end)
+
+    body =
+      case Enum.reverse(asts) do
+        [single] -> single
+        many -> {:__block__, [], many}
+      end
+
+    {body, context}
+  end
+
   def convert(%{"_type" => "Assert", "test" => test} = node, context) do
     {test_ast, context} = convert_test(test, context)
 
@@ -123,6 +142,27 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "ImportFrom", "module" => "__future__"}, context),
     do: {{:__block__, [], []}, context}
+
+  # `from math import gcd, sqrt, ...` — emit each name as a local
+  # lambda that delegates to the matching `Pylixir.Stdlib.Math` AST.
+  # Subsequent calls go through the in-scope-anonymous-call path
+  # (`gcd.(t, n)` etc.). Unsupported math names raise.
+  def convert(%{"_type" => "ImportFrom", "module" => "math", "names" => names}, context) do
+    {stmts, context} =
+      Enum.reduce(names, {[], context}, fn %{"name" => n}, {acc, ctx} ->
+        {stmt, ctx} = math_import_alias(n, ctx)
+        {[stmt | acc], ctx}
+      end)
+
+    body =
+      case Enum.reverse(stmts) do
+        [] -> {:__block__, [], []}
+        [single] -> single
+        many -> {:__block__, [], many}
+      end
+
+    {body, context}
+  end
 
   # `from collections import deque` — silent no-op. `deque` is then
   # used as a bare name and translated as a builtin (`deque()` →
@@ -281,17 +321,33 @@ defmodule Pylixir.Converter do
 
   # Expr: drop the result unless the inner value is a recognised
   # mutation method, in which case T30 rewrites it to a target
-  # reassignment.
+  # reassignment. Also handles the heapq statement idiom
+  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — both
+  # mutate `heap` in Python and need a rebind in Pylixir.
   def convert(%{"_type" => "Expr", "value" => value}, context) do
-    case Nodes.Mutations.detect(value) do
+    case heapq_statement_mutation(value) do
+      {:ok, heap_name, fn_name, args} ->
+        emit_heapq_statement_rebind(heap_name, fn_name, args, context)
+
       :none ->
-        convert(value, context)
+        case Nodes.Mutations.detect(value) do
+          :none ->
+            convert(value, context)
 
-      {:name, target_name, method, args, kwargs, source_node} ->
-        Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
+          {:name, target_name, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
 
-      {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
-        Nodes.Mutations.emit_subscript(coll_name, slice, method, args, kwargs, source_node, context)
+          {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit_subscript(
+              coll_name,
+              slice,
+              method,
+              args,
+              kwargs,
+              source_node,
+              context
+            )
+        end
     end
   end
 
@@ -343,6 +399,15 @@ defmodule Pylixir.Converter do
     reject_starred!(elts, "List")
     {asts, context} = convert_each(elts, context)
     {asts, context}
+  end
+
+  # Python's `{1, 2, 3}` set literal — lowered to `MapSet.new([…])`.
+  # The empty-set case `{}` is a *Dict* in Python AST, not a Set, so
+  # this clause always has at least one element.
+  def convert(%{"_type" => "Set", "elts" => elts}, context) do
+    reject_starred!(elts, "Set")
+    {asts, context} = convert_each(elts, context)
+    {{{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [asts]}, context}
   end
 
   def convert(%{"_type" => "Tuple", "elts" => elts}, context) do
@@ -448,6 +513,42 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
+  # --- heapq statement-mutation helpers (called from the Expr clause) ---
+
+  # Recognise `heapq.heappush(heap, item)` and `heapq.heapify(heap)`
+  # at statement position. Both are documented as in-place mutations
+  # in Python; the rebind happens here so user code can keep its
+  # `heap = []; heapq.heappush(heap, x)` shape verbatim.
+  defp heapq_statement_mutation(%{
+         "_type" => "Call",
+         "func" => %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => "heapq"},
+           "attr" => method
+         },
+         "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
+       })
+       when method in ["heappush", "heapify"] do
+    {:ok, heap_name, method, rest}
+  end
+
+  defp heapq_statement_mutation(_), do: :none
+
+  defp emit_heapq_statement_rebind(heap_name, "heappush", [item_node], context) do
+    {item_ast, context} = convert(item_node, context)
+    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
+    heap_ref = {heap_atom, [], nil}
+    context = bind_name(context, heap_name)
+    {{:=, [], [heap_ref, {:py_heappush, [], [heap_ref, item_ast]}]}, context}
+  end
+
+  defp emit_heapq_statement_rebind(heap_name, "heapify", [], context) do
+    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
+    heap_ref = {heap_atom, [], nil}
+    context = bind_name(context, heap_name)
+    {{:=, [], [heap_ref, {:py_heapify, [], [heap_ref]}]}, context}
+  end
+
   # --- Operator emission -------------------------------------------------
 
   defp unary_op_ast(%{"_type" => "UAdd"}, operand_ast, _node), do: operand_ast
@@ -549,11 +650,69 @@ defmodule Pylixir.Converter do
     {{:=, [], [pattern, coll_ref]}, context}
   end
 
-  defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
-    {value_ast, context} = convert(value, context)
+  # `x = heapq.heappop(heap)` — py_heappop returns `{head, tail}`, so
+  # the Assign rebinds BOTH `x` (head) and `heap` (tail) in one
+  # destructure-match.
+  defp single_target_assign(
+         %{"_type" => "Name", "id" => id},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "heapq"},
+             "attr" => "heappop"
+           },
+           "args" => [%{"_type" => "Name", "id" => heap_name}]
+         },
+         _node,
+         context
+       ) do
     context = bind_name(context, id)
-    {target_ast, context} = convert(target, context)
-    {{:=, [], [target_ast, value_ast]}, context}
+    context = bind_name(context, heap_name)
+    head_atom = id |> Naming.rewrite() |> String.to_atom()
+    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
+    head_ref = {head_atom, [], nil}
+    heap_ref = {heap_atom, [], nil}
+    {{:=, [], [{head_ref, heap_ref}, {:py_heappop, [], [heap_ref]}]}, context}
+  end
+
+  defp single_target_assign(
+         %{"_type" => "Tuple", "elts" => elts},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "heapq"},
+             "attr" => "heappop"
+           },
+           "args" => [%{"_type" => "Name", "id" => heap_name}]
+         },
+         _node,
+         context
+       ) do
+    Enum.each(elts, fn
+      %{"_type" => "Name"} ->
+        :ok
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "Assign",
+          hint:
+            "tuple-destructure of `heapq.heappop()` requires Name elements; got `#{Map.get(other, "_type")}`"
+    end)
+
+    context = bind_tuple_names!(elts, context)
+    context = bind_name(context, heap_name)
+
+    head_refs =
+      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    head_pattern = tuple_pattern(head_refs)
+    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
+    heap_ref = {heap_atom, [], nil}
+    {{:=, [], [{head_pattern, heap_ref}, {:py_heappop, [], [heap_ref]}]}, context}
   end
 
   # `x, y = q.popleft()` — tuple-destructure of the deque-head value.
@@ -662,6 +821,13 @@ defmodule Pylixir.Converter do
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
+  end
+
+  defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
+    {value_ast, context} = convert(value, context)
+    context = bind_name(context, id)
+    {target_ast, context} = convert(target, context)
+    {{:=, [], [target_ast, value_ast]}, context}
   end
 
   defp single_target_assign(target, _value, node, _context) do
@@ -1105,21 +1271,9 @@ defmodule Pylixir.Converter do
     reject_starred!(elts, "Tuple")
 
     {refs, names, context} =
-      Enum.reduce(elts, {[], [], context}, fn
-        %{"_type" => "Name", "id" => id}, {refs, names, ctx}
-        when is_binary(id) and id != "" ->
-          if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
-            {[{:_, [], nil} | refs], names, ctx}
-          else
-            ctx = bind_name(ctx, id)
-            atom = id |> Naming.rewrite() |> String.to_atom()
-            {[{atom, [], nil} | refs], [id | names], ctx}
-          end
-
-        other, _acc ->
-          raise UnsupportedNodeError,
-            node_type: "For",
-            hint: "for-loop tuple-target element must be a Name; got `#{Map.get(other, "_type")}`"
+      Enum.reduce(elts, {[], [], context}, fn elt, {refs, names, ctx} ->
+        {ref, new_names, ctx} = convert_loop_target_elt(elt, ctx)
+        {[ref | refs], Enum.reverse(new_names) ++ names, ctx}
       end)
 
     {tuple_pattern(Enum.reverse(refs)), Enum.reverse(names), context}
@@ -1130,6 +1284,40 @@ defmodule Pylixir.Converter do
       node_type: "For",
       hint:
         "for-loop target shape `#{Map.get(target, "_type")}` is not supported (use a Name or Tuple of Names)"
+  end
+
+  # Per-element helper for tuple-target recursion. Allows nested
+  # tuples of Names — `for (a, b), c in pairs:` / `for (r, c), v in
+  # bonuses.items():` etc. Each Name is treated like the single-Name
+  # case (discard-rules, scope binding); each nested Tuple recurses.
+  defp convert_loop_target_elt(%{"_type" => "Name", "id" => id}, context)
+       when is_binary(id) and id != "" do
+    if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
+      {{:_, [], nil}, [], context}
+    else
+      context = bind_name(context, id)
+      atom = id |> Naming.rewrite() |> String.to_atom()
+      {{atom, [], nil}, [id], context}
+    end
+  end
+
+  defp convert_loop_target_elt(%{"_type" => "Tuple", "elts" => inner_elts}, context) do
+    reject_starred!(inner_elts, "Tuple")
+
+    {refs, names, context} =
+      Enum.reduce(inner_elts, {[], [], context}, fn elt, {refs, names, ctx} ->
+        {ref, new_names, ctx} = convert_loop_target_elt(elt, ctx)
+        {[ref | refs], Enum.reverse(new_names) ++ names, ctx}
+      end)
+
+    {tuple_pattern(Enum.reverse(refs)), Enum.reverse(names), context}
+  end
+
+  defp convert_loop_target_elt(other, _context) do
+    raise UnsupportedNodeError,
+      node_type: "For",
+      hint:
+        "for-loop tuple-target element must be a Name or nested Tuple of Names; got `#{Map.get(other, "_type")}`"
   end
 
   @doc false
@@ -1199,6 +1387,60 @@ defmodule Pylixir.Converter do
   end
 
   # --- Literal-container rejections --------------------------------------
+
+  defp convert_del_target(
+         %{
+           "_type" => "Subscript",
+           "value" => %{"_type" => "Name", "id" => coll_id} = collection,
+           "slice" => slice
+         },
+         _node,
+         context
+       ) do
+    {slice_ast, context} = convert(slice, context)
+    {coll_ast, context} = convert(collection, context)
+    context = bind_name(context, coll_id)
+    {{:=, [], [coll_ast, {:py_delitem, [], [coll_ast, slice_ast]}]}, context}
+  end
+
+  defp convert_del_target(other, node, _context) do
+    raise UnsupportedNodeError,
+      node_type: "Delete",
+      hint:
+        "`del` target shape `#{Map.get(other, "_type")}` is not supported (only depth-1 subscript on a bare Name)",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
+
+  # `from math import <name>` — emit `<name> = fn ... -> <math AST> end`.
+  # Routes through `Pylixir.Stdlib.Math.call/4`'s existing clauses so
+  # there's no duplication of the lowering.
+  defp math_import_alias(name, context) do
+    params =
+      cond do
+        name in ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp isqrt) ->
+          [{:x, [], nil}]
+
+        name in ~w(pow atan2 gcd) ->
+          [{:a, [], nil}, {:b, [], nil}]
+
+        true ->
+          raise UnsupportedNodeError,
+            node_type: "ImportFrom",
+            hint:
+              "`from math import #{name}` is not supported (allowed: " <>
+                "sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp " <>
+                "isqrt pow atan2 gcd)"
+      end
+
+    {:ok, body} =
+      Pylixir.Stdlib.Math.call([name], params, %{}, %{"_type" => "Call", "lineno" => nil})
+
+    fn_ast = {:fn, [], [{:->, [], [params, body]}]}
+    name_atom = name |> Naming.rewrite() |> String.to_atom()
+    context = bind_name(context, name)
+    {{:=, [], [{name_atom, [], nil}, fn_ast]}, context}
+  end
 
   defp reject_starred!(elts, container_type) do
     Enum.each(elts, fn

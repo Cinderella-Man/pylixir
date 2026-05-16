@@ -186,6 +186,14 @@ defmodule Pylixir.RuntimeHelpers do
   def py_setitem(c, k, v) when is_list(c), do: List.replace_at(c, k, v)
   def py_setitem(c, k, v) when is_map(c), do: Map.put(c, k, v)
 
+  # `del coll[k]` — Python's subscript deletion. Polymorphic on the
+  # collection: list → `List.delete_at`, map → `Map.delete`,
+  # MapSet → `MapSet.delete`. Pylixir lowers the surrounding
+  # `Delete` to `coll = py_delitem(coll, k)`.
+  def py_delitem(c, k) when is_list(c), do: List.delete_at(c, k)
+  def py_delitem(%MapSet{} = c, k), do: MapSet.delete(c, k)
+  def py_delitem(c, k) when is_map(c), do: Map.delete(c, k)
+
   def py_in(x, c) when is_list(c), do: x in c
   def py_in(x, c) when is_binary(c), do: String.contains?(c, x)
   def py_in(x, %MapSet{} = c), do: MapSet.member?(c, x)
@@ -308,6 +316,23 @@ defmodule Pylixir.RuntimeHelpers do
     multiplier = :math.pow(10, n)
     py_round(x * multiplier) / multiplier
   end
+
+  # === heapq (min-heap on sorted list) ===
+
+  # Pylixir backs Python's `heapq` with a *sorted list* — O(n) push/pop
+  # vs `heapq`'s O(log n). Adequate for competitive-programming inputs;
+  # a true binary heap would need a tree-backed structure. Heap items
+  # compare via Erlang's term order — works for tuples like
+  # `{dist, vertex}` (Dijkstra / A* / etc.) which is the dominant
+  # heapq use case.
+
+  def py_heappush(heap, item) when is_list(heap),
+    do: Enum.sort([item | heap])
+
+  def py_heappop([head | tail]), do: {head, tail}
+  def py_heappop([]), do: raise(RuntimeError, "heappop from empty heap")
+
+  def py_heapify(list) when is_list(list), do: Enum.sort(list)
 
   # === Bitwise / set polymorphism ===
 

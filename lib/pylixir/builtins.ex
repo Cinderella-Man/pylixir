@@ -191,10 +191,17 @@ defmodule Pylixir.Builtins do
     case x do
       v when is_binary(v) ->
         case classify_float_literal(v) do
-          :positive_infinity -> {:ok, 1.0e308}
-          :negative_infinity -> {:ok, -1.0e308}
-          :nan -> {:error, "Python `float(\"#{v}\")` (NaN) is not supported (Elixir has no IEEE NaN)"}
-          :finite -> {:ok, {:py_float, [], [x]}}
+          :positive_infinity ->
+            {:ok, 1.0e308}
+
+          :negative_infinity ->
+            {:ok, -1.0e308}
+
+          :nan ->
+            {:error, "Python `float(\"#{v}\")` (NaN) is not supported (Elixir has no IEEE NaN)"}
+
+          :finite ->
+            {:ok, {:py_float, [], [x]}}
         end
 
       _ ->

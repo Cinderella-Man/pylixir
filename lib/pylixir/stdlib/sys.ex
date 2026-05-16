@@ -61,5 +61,11 @@ defmodule Pylixir.Stdlib.Sys do
   def call(["stdout", "write"], [s], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [s]}}
 
+  # `sys.setrecursionlimit(n)` — Python sets the interpreter's
+  # recursion limit. Elixir/BEAM has no equivalent (stack depth is
+  # only bounded by available memory + process heap), so this is a
+  # no-op. Returns `nil` like a statement-level no-op.
+  def call(["setrecursionlimit"], [_n], _kwargs, _node), do: {:ok, nil}
+
   def call(_path, _args, _kwargs, _node), do: :no_clause
 end

@@ -97,7 +97,15 @@ defmodule Pylixir.Nodes.Mutations do
   # single-eval semantics hold for non-trivial slices (the slice
   # appears twice in the output: once in `py_getitem`, once in
   # `py_setitem`).
-  @spec emit_subscript(String.t(), map(), String.t(), [map()], [map()], map(), Pylixir.Context.t()) ::
+  @spec emit_subscript(
+          String.t(),
+          map(),
+          String.t(),
+          [map()],
+          [map()],
+          map(),
+          Pylixir.Context.t()
+        ) ::
           {Macro.t(), Pylixir.Context.t()}
   def emit_subscript(coll_name, slice_node, method, args, kwargs_raw, source, context) do
     {arg_asts, context} = Converter.convert_each(args, context)

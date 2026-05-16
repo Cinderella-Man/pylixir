@@ -103,42 +103,66 @@ defmodule Pylixir.LoopAnalysis do
   # would emit `results = results ++ [i]` inside the Enum.reduce fn
   # without `results` being in the accumulator, so each iteration's
   # update is discarded.
-  defp names_assigned_in(
-         %{
-           "_type" => "Expr",
-           "value" => %{
-             "_type" => "Call",
-             "func" => %{
-               "_type" => "Attribute",
-               "value" => %{"_type" => "Name", "id" => name},
-               "attr" => method
-             }
+  defp names_assigned_in(%{
+         "_type" => "Expr",
+         "value" => %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => name},
+             "attr" => method
            }
          }
-       )
+       })
        when method in @mutation_methods,
        do: MapSet.new([name])
 
   # Same for subscript-rooted mutations: `adj[i].append(x)` rebinds
   # `adj`. Already supported by Mutations + ModuleAnalysis; tracked
   # here so for-loop bodies thread the root through the accumulator.
-  defp names_assigned_in(
-         %{
-           "_type" => "Expr",
-           "value" => %{
-             "_type" => "Call",
-             "func" => %{
-               "_type" => "Attribute",
-               "value" => %{
-                 "_type" => "Subscript",
-                 "value" => %{"_type" => "Name", "id" => name}
-               },
-               "attr" => method
-             }
+  defp names_assigned_in(%{
+         "_type" => "Expr",
+         "value" => %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{
+               "_type" => "Subscript",
+               "value" => %{"_type" => "Name", "id" => name}
+             },
+             "attr" => method
            }
          }
-       )
+       })
        when method in @mutation_methods,
+       do: MapSet.new([name])
+
+  # `del coll[k]` — rebinds `coll`.
+  defp names_assigned_in(%{"_type" => "Delete", "targets" => targets}) do
+    targets
+    |> Enum.flat_map(fn
+      %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => name}} -> [name]
+      _ -> []
+    end)
+    |> MapSet.new()
+  end
+
+  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — rebinds
+  # `heap` via Pylixir's Expr-clause rewrite. For-loop bodies must
+  # thread `heap` through the accumulator.
+  defp names_assigned_in(%{
+         "_type" => "Expr",
+         "value" => %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "heapq"},
+             "attr" => method
+           },
+           "args" => [%{"_type" => "Name", "id" => name} | _]
+         }
+       })
+       when method in ["heappush", "heapify"],
        do: MapSet.new([name])
 
   defp names_assigned_in(_), do: MapSet.new()
