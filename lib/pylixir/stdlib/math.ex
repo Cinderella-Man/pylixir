@@ -33,6 +33,18 @@ defmodule Pylixir.Stdlib.Math do
   def call([attr], [a, b], _kwargs, _node) when attr in @binary,
     do: {:ok, {{:., [], [:math, String.to_atom(attr)]}, [], [a, b]}}
 
+  # Integer-arithmetic helpers — not in Erlang's :math, but in
+  # Elixir's stdlib.
+  def call(["gcd"], [a, b], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Integer]}, :gcd]}, [], [a, b]}}
+
+  # `math.isqrt(n)` — floor of integer square root. Erlang's :math.sqrt
+  # is a float op, so we trunc; precision loss for n > 2^53 is the
+  # known tradeoff (Python's exact-arithmetic isqrt would need a
+  # Newton-iteration helper).
+  def call(["isqrt"], [n], _kwargs, _node),
+    do: {:ok, {:trunc, [], [{{:., [], [:math, :sqrt]}, [], [n]}]}}
+
   def call([attr], args, _kwargs, _node) when attr in @unary or attr in @binary,
     do:
       {:error,

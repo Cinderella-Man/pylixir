@@ -152,6 +152,11 @@ defmodule Pylixir.Builtins do
   def emit("int", [], _kw), do: {:ok, 0}
   def emit("int", [x], _kw), do: {:ok, {:py_int, [], [x]}}
 
+  # `int(string, base)` — Python's base-aware parse. Lowers to
+  # `String.to_integer/2`, which is the matching Elixir BIF.
+  def emit("int", [x, base], _kw),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:String]}, :to_integer]}, [], [x, base]}}
+
   def emit("str", [], _kw), do: {:ok, ""}
   def emit("str", [x], _kw), do: {:ok, {:py_str, [], [x]}}
 

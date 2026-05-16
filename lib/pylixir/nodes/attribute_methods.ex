@@ -39,6 +39,11 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # already preserves the original. `.copy()` lowers to its target.
   @noop_methods ~w(copy)
 
+  # Methods on Python's `int`. Pylixir's dispatch is ducktyped — these
+  # are emitted assuming the target is an integer; the runtime helper
+  # has integer guards so non-integer targets crash visibly.
+  @int_methods ~w(bit_length)
+
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
     do_dispatch(attr, target_ast, arg_asts, kwargs, node)
@@ -51,6 +56,55 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # expression* — single-eval semantics are preserved because the
   # surrounding expression evaluates it once.
   defp do_dispatch("copy", target, [], _kw, _node), do: target
+
+  # --- Integer methods ---------------------------------------------------
+
+  defp do_dispatch("bit_length", target, [], _kw, _node),
+    do: {:py_int_bit_length, [], [target]}
+
+  # --- String formatting -------------------------------------------------
+
+  # `"<template>".format(args...)` — handled only when the template is a
+  # *literal* string (the common case) so we can parse the spec at
+  # codegen time. Supported templates: `{}` / `{0}` (bare positional),
+  # `{:.Nf}` / `{0:.Nf}` (float with N decimal places). Other shapes
+  # raise with a clearer hint.
+  defp do_dispatch("format", template, args, _kw, node) when is_binary(template) do
+    case parse_format_template(template) do
+      {:bare_pos, idx} when idx < length(args) ->
+        {:py_str, [], [Enum.at(args, idx)]}
+
+      {:float_fixed, idx, decimals} when idx < length(args) ->
+        # `:erlang.float_to_binary/2` is the non-deprecated path
+        # (Elixir's `Float.to_string/2` deprecated 2024). Note: rounds
+        # half-up, not banker's — Python's `.format` uses banker's, so
+        # `{:.0f}".format(2.5)` differs (`3` here vs `2` in Python).
+        # Higher-precision uses (the eval-corpus shapes `{:.6f}`,
+        # `{:.9f}`) don't hit the disagreement.
+        coerced = {:py_float, [], [Enum.at(args, idx)]}
+
+        {{:., [], [:erlang, :float_to_binary]}, [], [coerced, [decimals: decimals]]}
+
+      _ ->
+        raise UnsupportedNodeError,
+          node_type: "Call",
+          hint:
+            "`\"#{template}\".format(...)` — only `{}` / `{N}` / `{:.Nf}` / `{N:.Nf}` " <>
+              "single-placeholder forms are supported at codegen time",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  defp do_dispatch("format", _target, _args, _kw, node) do
+    raise UnsupportedNodeError,
+      node_type: "Call",
+      hint:
+        "`.format(...)` is only supported when the template is a literal string with one of: " <>
+          "`{}` / `{N}` / `{:.Nf}` / `{N:.Nf}`",
+      lineno: Map.get(node, "lineno"),
+      col_offset: Map.get(node, "col_offset")
+  end
 
   # --- T28 dict methods --------------------------------------------------
 
@@ -173,9 +227,34 @@ defmodule Pylixir.Nodes.AttributeMethods do
     raise UnsupportedNodeError,
       node_type: "Call",
       hint:
-        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods, ", ")})",
+        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods ++ @int_methods, ", ")})",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # Classify a `.format()` template literal into one of the supported
+  # shapes. Returns `{:bare_pos, idx}` or `{:float_fixed, idx, decimals}`
+  # or `:unsupported`. The default index when omitted is `0`.
+  defp parse_format_template(template) do
+    cond do
+      template == "{}" ->
+        {:bare_pos, 0}
+
+      Regex.match?(~r/^\{(\d+)\}$/, template) ->
+        [_, idx] = Regex.run(~r/^\{(\d+)\}$/, template)
+        {:bare_pos, String.to_integer(idx)}
+
+      Regex.match?(~r/^\{:\.(\d+)f\}$/, template) ->
+        [_, n] = Regex.run(~r/^\{:\.(\d+)f\}$/, template)
+        {:float_fixed, 0, String.to_integer(n)}
+
+      Regex.match?(~r/^\{(\d+):\.(\d+)f\}$/, template) ->
+        [_, idx, n] = Regex.run(~r/^\{(\d+):\.(\d+)f\}$/, template)
+        {:float_fixed, String.to_integer(idx), String.to_integer(n)}
+
+      true ->
+        :unsupported
+    end
   end
 
   defp regex_match(target, pattern) do

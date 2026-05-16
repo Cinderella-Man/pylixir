@@ -44,6 +44,20 @@ defmodule Pylixir.Nodes.ConversionsTest do
       end
     end
 
+    test "int(string, base) — 2-arg form parses with base" do
+      case run(~s|int("FF", 16)\n|) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 255
+      end
+    end
+
+    test "int(string, 2) — common binary-string parse" do
+      case run(~s|int("101", 2)\n|) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 5
+      end
+    end
+
     # `float('inf')` and friends — Elixir has no IEEE infinity, so we
     # emit a large-magnitude sentinel float. Pinning the actual literal
     # so an accidental constant change shows up here, not in user code.

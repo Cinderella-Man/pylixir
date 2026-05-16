@@ -294,6 +294,15 @@ defmodule Pylixir.RuntimeHelpers do
     py_round(x * multiplier) / multiplier
   end
 
+  # === Integer methods ===
+
+  # Python's `int.bit_length()` — bits required to represent the int
+  # in binary (excluding sign and leading zeros). `0` returns `0`;
+  # negative numbers behave as their absolute value.
+  def py_int_bit_length(0), do: 0
+  def py_int_bit_length(n) when n < 0, do: py_int_bit_length(-n)
+  def py_int_bit_length(n) when is_integer(n), do: length(Integer.digits(n, 2))
+
   # === Input ===
   def py_input(prompt) do
     case IO.gets(prompt) do
