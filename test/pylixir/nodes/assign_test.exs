@@ -120,6 +120,46 @@ defmodule Pylixir.Nodes.AssignTest do
       assert MapSet.member?(hd(ctx.scopes), "matrix")
     end
 
+    test "tuple-Assign with Subscript elements (swap idiom `t[i], t[j] = t[j], t[i]`)" do
+      target =
+        %{
+          "_type" => "Tuple",
+          "elts" => [
+            %{"_type" => "Subscript", "value" => name("t"), "slice" => const(0)},
+            %{"_type" => "Subscript", "value" => name("t"), "slice" => const(1)}
+          ]
+        }
+
+      value =
+        %{
+          "_type" => "Tuple",
+          "elts" => [
+            %{"_type" => "Subscript", "value" => name("t"), "slice" => const(1)},
+            %{"_type" => "Subscript", "value" => name("t"), "slice" => const(0)}
+          ]
+        }
+
+      {ast, ctx} = Converter.convert(assign([target], value), Context.new())
+
+      # Block: two RHS temp-binds, then two setitem rebinds of `t`.
+      assert {:__block__, [], stmts} = ast
+      assert length(stmts) == 4
+
+      [bind0, bind1, set0, set1] = stmts
+      assert match?({:=, [], [{:py_tmp_0, [], nil}, _]}, bind0)
+      assert match?({:=, [], [{:py_tmp_1, [], nil}, _]}, bind1)
+
+      assert set0 ==
+               {:=, [],
+                [{:t, [], nil}, {:py_setitem, [], [{:t, [], nil}, 0, {:py_tmp_0, [], nil}]}]}
+
+      assert set1 ==
+               {:=, [],
+                [{:t, [], nil}, {:py_setitem, [], [{:t, [], nil}, 1, {:py_tmp_1, [], nil}]}]}
+
+      assert MapSet.member?(hd(ctx.scopes), "t")
+    end
+
     test "non-Name-rooted nested subscript (`obj.attr[i][j] = v`) still raises" do
       # The chain bottoms out at an Attribute, not a Name.
       attr = %{"_type" => "Attribute", "value" => name("obj"), "attr" => "field"}

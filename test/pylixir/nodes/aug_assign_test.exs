@@ -45,15 +45,12 @@ defmodule Pylixir.Nodes.AugAssignTest do
       assert ast == {:=, [], [{:x, [], nil}, {:py_floor_div, [], [{:x, [], nil}, 2]}]}
     end
 
-    test "bitwise AugAssign routes through fully-qualified Bitwise (T11)" do
+    test "bitwise/set-overload AugAssign routes through py_bxor helper" do
+      # Python's `^=` overloads set symmetric-difference on top of
+      # int XOR. The helper dispatches on operand type.
       {ast, _} = Converter.convert(aug_assign(name("x"), "BitXor", const(3)), Context.new())
 
-      assert ast ==
-               {:=, [],
-                [
-                  {:x, [], nil},
-                  {{:., [], [{:__aliases__, [], [:Bitwise]}, :bxor]}, [], [{:x, [], nil}, 3]}
-                ]}
+      assert ast == {:=, [], [{:x, [], nil}, {:py_bxor, [], [{:x, [], nil}, 3]}]}
     end
   end
 

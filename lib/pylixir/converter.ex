@@ -124,6 +124,25 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "ImportFrom", "module" => "__future__"}, context),
     do: {{:__block__, [], []}, context}
 
+  # `from collections import deque` — silent no-op. `deque` is then
+  # used as a bare name and translated as a builtin (`deque()` →
+  # `[]`, `deque(iter)` → `Enum.to_list(iter)`). Other collections
+  # symbols (Counter, defaultdict, …) fall through to the catch-all.
+  def convert(%{"_type" => "ImportFrom", "module" => "collections", "names" => names}, context) do
+    allowed = ~w(deque Counter)
+
+    unknown = Enum.find(names, fn %{"name" => n} -> n not in allowed end)
+
+    if unknown do
+      raise UnsupportedNodeError,
+        node_type: "ImportFrom",
+        hint:
+          "`from collections import #{unknown["name"]}` is not supported (allowed: #{Enum.join(allowed, ", ")})"
+    end
+
+    {{:__block__, [], []}, context}
+  end
+
   def convert(%{"_type" => "ImportFrom", "module" => mod}, _context) do
     raise UnsupportedNodeError,
       node_type: "ImportFrom",
@@ -459,9 +478,13 @@ defmodule Pylixir.Converter do
   defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node), do: {:py_mod, [], [l, r]}
   defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node), do: bitwise_call(:bsl, l, r)
   defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node), do: bitwise_call(:bsr, l, r)
-  defp bin_op_ast(%{"_type" => "BitOr"}, l, r, _node), do: bitwise_call(:bor, l, r)
-  defp bin_op_ast(%{"_type" => "BitAnd"}, l, r, _node), do: bitwise_call(:band, l, r)
-  defp bin_op_ast(%{"_type" => "BitXor"}, l, r, _node), do: bitwise_call(:bxor, l, r)
+  # Python's `|` / `&` / `^` are overloaded: bitwise on ints, set ops
+  # on MapSets. Route through `py_bor` / `py_band` / `py_bxor` helpers
+  # which dispatch at runtime. (LShift/RShift stay direct — there's
+  # no set equivalent.)
+  defp bin_op_ast(%{"_type" => "BitOr"}, l, r, _node), do: {:py_bor, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "BitAnd"}, l, r, _node), do: {:py_band, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "BitXor"}, l, r, _node), do: {:py_bxor, [], [l, r]}
 
   defp bin_op_ast(%{"_type" => "MatMult"}, _l, _r, node) do
     raise UnsupportedNodeError,
@@ -496,6 +519,36 @@ defmodule Pylixir.Converter do
 
   # --- Assign target dispatch -------------------------------------------
 
+  # `x = q.popleft()` — Python's deque.popleft returns the leftmost
+  # element AND removes it. Pylixir's deque-as-list rep lowers to a
+  # cons-pattern destructure: `[x | q] = q` binds `x` to the head and
+  # rebinds `q` to the tail in one match. Runtime crash on empty list
+  # (Python raises `IndexError`; close enough).
+  defp single_target_assign(
+         %{"_type" => "Name", "id" => id},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => coll_id},
+             "attr" => "popleft"
+           },
+           "args" => args
+         },
+         _node,
+         context
+       )
+       when args == [] do
+    context = bind_name(context, id)
+    context = bind_name(context, coll_id)
+    head_atom = id |> Naming.rewrite() |> String.to_atom()
+    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
+    head_ref = {head_atom, [], nil}
+    coll_ref = {coll_atom, [], nil}
+    pattern = [{:|, [], [head_ref, coll_ref]}]
+    {{:=, [], [pattern, coll_ref]}, context}
+  end
+
   defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
     {value_ast, context} = convert(value, context)
     context = bind_name(context, id)
@@ -503,12 +556,24 @@ defmodule Pylixir.Converter do
     {{:=, [], [target_ast, value_ast]}, context}
   end
 
-  defp single_target_assign(%{"_type" => "Tuple", "elts" => elts} = target, value, _node, context) do
+  defp single_target_assign(%{"_type" => "Tuple", "elts" => elts} = target, value, node, context) do
     reject_starred!(elts, "Tuple")
-    {value_ast, context} = convert(value, context)
-    context = bind_tuple_names!(elts, context)
-    {target_ast, context} = convert(target, context)
-    {{:=, [], [target_ast, value_ast]}, context}
+
+    if Enum.all?(elts, &match?(%{"_type" => "Name"}, &1)) do
+      # Pure tuple-of-Names destructure (e.g. `a, b = (1, 2)`).
+      {value_ast, context} = convert(value, context)
+      context = bind_tuple_names!(elts, context)
+      {target_ast, context} = convert(target, context)
+      {{:=, [], [target_ast, value_ast]}, context}
+    else
+      # Mixed Name/Subscript targets (e.g. the swap idiom
+      # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
+      # destructure-match because Subscript isn't a valid pattern.
+      # Strategy: temp-bind every RHS value once (single-eval), then
+      # apply each LHS in order — Names become normal binds, Subscripts
+      # become py_setitem rebinds of the root.
+      emit_mixed_tuple_assign(elts, value, node, context)
+    end
   end
 
   defp single_target_assign(
@@ -611,6 +676,86 @@ defmodule Pylixir.Converter do
           hint:
             "tuple-Assign target requires all elements to be `Name` nodes; got `#{Map.get(other, "_type")}`"
     end)
+  end
+
+  # Mixed-target tuple-Assign emitter. Handles `a, b[i] = x, y`-shape
+  # cases where at least one LHS is a depth-1 Subscript rooted at a
+  # bare Name. RHS must be a Tuple literal with matching arity (the
+  # general-RHS case — `a, b = some_call()` with subscript LHS — would
+  # need destructure-then-index machinery; not implemented yet).
+  defp emit_mixed_tuple_assign(elts, value, node, context) do
+    rhs_elts =
+      case value do
+        %{"_type" => "Tuple", "elts" => rhs} when length(rhs) == length(elts) ->
+          rhs
+
+        _ ->
+          raise UnsupportedNodeError,
+            node_type: "Assign",
+            hint:
+              "tuple-Assign with a Subscript target requires a literal tuple RHS of matching arity",
+            lineno: Map.get(node, "lineno"),
+            col_offset: Map.get(node, "col_offset")
+      end
+
+    # Phase 1 — temp-bind every RHS value so writes can't clobber later
+    # reads. The swap idiom (`t[i], t[i+1] = t[i+1], t[i]`) and the
+    # mixed case (`y, xs[0] = xs[0], y` — where `y` is both LHS and
+    # RHS) both need it. `maybe_temp_bind` skips trivial expressions,
+    # but trivial-name RHS still gets clobbered when the same name is
+    # ALSO a LHS target — so we always emit a temp here.
+    {temps, bindings, context} =
+      Enum.reduce(rhs_elts, {[], [], context}, fn rhs, {temps, binds, ctx} ->
+        {ast, ctx} = convert(rhs, ctx)
+        {temp_atom, ctx} = next_temp(ctx)
+        temp_ref = {temp_atom, [], nil}
+        binding = {:=, [], [temp_ref, ast]}
+        {[temp_ref | temps], [binding | binds], ctx}
+      end)
+
+    temps = Enum.reverse(temps)
+    bindings = Enum.reverse(bindings)
+
+    # Phase 2 — apply each LHS in order using the matching temp.
+    {assigns, context} =
+      elts
+      |> Enum.zip(temps)
+      |> Enum.reduce({[], context}, fn {lhs, temp}, {acc, ctx} ->
+        {ast, ctx} = apply_mixed_tuple_target(lhs, temp, ctx)
+        {[ast | acc], ctx}
+      end)
+
+    assigns = Enum.reverse(assigns)
+    {{:__block__, [], bindings ++ assigns}, context}
+  end
+
+  defp apply_mixed_tuple_target(%{"_type" => "Name", "id" => id}, temp, context) do
+    context = bind_name(context, id)
+    atom = id |> Naming.rewrite() |> String.to_atom()
+    {{:=, [], [{atom, [], nil}, temp]}, context}
+  end
+
+  defp apply_mixed_tuple_target(
+         %{
+           "_type" => "Subscript",
+           "value" => %{"_type" => "Name", "id" => coll_id} = collection,
+           "slice" => slice
+         },
+         temp,
+         context
+       ) do
+    {slice_ast, context} = convert(slice, context)
+    {coll_ast, context} = convert(collection, context)
+    setitem = {:py_setitem, [], [coll_ast, slice_ast, temp]}
+    context = bind_name(context, coll_id)
+    {{:=, [], [coll_ast, setitem]}, context}
+  end
+
+  defp apply_mixed_tuple_target(other, _temp, _context) do
+    raise UnsupportedNodeError,
+      node_type: "Assign",
+      hint:
+        "tuple-Assign element shape `#{Map.get(other, "_type")}` is not supported (only Name and depth-1 Subscript)"
   end
 
   # Walk a Subscript chain ending at a bare Name. Returns

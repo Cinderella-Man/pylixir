@@ -25,7 +25,19 @@ defmodule Pylixir.Builtins do
   @t26_conversions ~w(int float str bool list tuple set dict)
   @t26_type_checks ~w(isinstance)
   @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit)
-  @supported MapSet.new(@t25a ++ @t25b ++ @t26_conversions ++ @t26_type_checks ++ @t27_io_format)
+
+  # `collections.deque` is technically not a builtin — it's imported
+  # via `from collections import deque`. But the import is a no-op in
+  # Pylixir (see Converter's ImportFrom clause), and bare `deque(…)`
+  # calls land here. Backing rep is a plain Elixir list — `append`
+  # already works via the mutation-method rewrite; `popleft` is
+  # special-cased in `single_target_assign`.
+  @t_collections ~w(deque Counter)
+
+  @supported MapSet.new(
+               @t25a ++
+                 @t25b ++ @t26_conversions ++ @t26_type_checks ++ @t27_io_format ++ @t_collections
+             )
 
   @isinstance_map %{
     "int" => :integer,
@@ -213,6 +225,21 @@ defmodule Pylixir.Builtins do
 
   def emit("dict", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}}
+
+  # `deque()` / `deque(iter)` — backing rep is a plain Elixir list.
+  def emit("deque", [], _kw), do: {:ok, []}
+
+  def emit("deque", [x], _kw),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}}
+
+  # `Counter(iter)` → dict-of-counts. Elixir's `Enum.frequencies/1` is
+  # the exact equivalent. (Counter's other features — most_common,
+  # arithmetic — aren't supported yet; standard `.get`/`.items` work
+  # since the result IS a plain map.)
+  def emit("Counter", [], _kw), do: {:ok, {:%{}, [], []}}
+
+  def emit("Counter", [x], _kw),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [], [x]}}
 
   # --- T26 type checks ---------------------------------------------------
 

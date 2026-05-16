@@ -55,15 +55,22 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert ast == {{:., [], [{:__aliases__, [], [:Bitwise]}, :bsl]}, [], [1, 3]}
     end
 
-    test "RShift, BitOr, BitAnd, BitXor each route to their Bitwise function" do
-      for {op_name, fn_name} <- [
-            {"RShift", :bsr},
-            {"BitOr", :bor},
-            {"BitAnd", :band},
-            {"BitXor", :bxor}
+    test "RShift routes to Bitwise.bsr (no set-overload, direct call)" do
+      {ast, _} = Converter.convert(binop("RShift", const(5), const(3)), Context.new())
+      assert ast == {{:., [], [{:__aliases__, [], [:Bitwise]}, :bsr]}, [], [5, 3]}
+    end
+
+    test "BitOr / BitAnd / BitXor route through py_bor / py_band / py_bxor helpers" do
+      # Python overloads `|` / `&` / `^` for set operations on top of
+      # bitwise. The runtime helpers dispatch on operand type
+      # (MapSet → set op; else → Bitwise.*).
+      for {op_name, helper} <- [
+            {"BitOr", :py_bor},
+            {"BitAnd", :py_band},
+            {"BitXor", :py_bxor}
           ] do
         {ast, _} = Converter.convert(binop(op_name, const(5), const(3)), Context.new())
-        assert ast == {{:., [], [{:__aliases__, [], [:Bitwise]}, fn_name]}, [], [5, 3]}
+        assert ast == {helper, [], [5, 3]}
       end
     end
 

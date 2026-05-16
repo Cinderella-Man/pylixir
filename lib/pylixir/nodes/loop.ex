@@ -209,6 +209,14 @@ defmodule Pylixir.Nodes.Loop do
     pre_loop_context = context
 
     {iter_ast, context} = Converter.convert(iter, context)
+
+    # Save scopes BEFORE convert_loop_target (which binds the target)
+    # so we can drop the target binding after the loop. Pylixir's
+    # for-loop emission uses `Enum.each`/`Enum.reduce` with the target
+    # as a callback parameter — the target isn't visible after the
+    # callback, so the context-level binding mustn't outlive the loop
+    # either. Body-assigned threaded vars get re-bound below.
+    saved_scopes = context.scopes
     {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
 
     analysis = LoopAnalysis.analyze(body)
@@ -227,33 +235,42 @@ defmodule Pylixir.Nodes.Loop do
     {body_asts, context} = Converter.convert_each(body, context)
     context = %{context | loop_break_payload: saved}
 
-    case {threaded, flow} do
-      {[], _} ->
-        emit_for_each(iter_ast, target_ast, body_asts, flow, context)
+    {result_ast, context} =
+      case {threaded, flow} do
+        {[], _} ->
+          emit_for_each(iter_ast, target_ast, body_asts, flow, context)
 
-      {[single], _} ->
-        emit_for_reduce_single(
-          iter_ast,
-          target_ast,
-          single,
-          body_asts,
-          pre_loop_context,
-          flow,
-          context
-        )
+        {[single], _} ->
+          emit_for_reduce_single(
+            iter_ast,
+            target_ast,
+            single,
+            body_asts,
+            pre_loop_context,
+            flow,
+            context
+          )
 
-      {_multi, _} ->
-        emit_for_reduce_tuple(
-          iter_ast,
-          target_ast,
-          threaded,
-          acc_refs,
-          body_asts,
-          pre_loop_context,
-          flow,
-          context
-        )
-    end
+        {_multi, _} ->
+          emit_for_reduce_tuple(
+            iter_ast,
+            target_ast,
+            threaded,
+            acc_refs,
+            body_asts,
+            pre_loop_context,
+            flow,
+            context
+          )
+      end
+
+    # Restore scopes — drops target binding AND any body-locals — then
+    # re-bind only the threaded vars (those that the emitter explicitly
+    # threads through the accumulator and are visible post-loop).
+    context = %{context | scopes: saved_scopes}
+    context = Enum.reduce(threaded, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
+
+    {result_ast, context}
   end
 
   # --- Shared loop machinery ---------------------------------------------

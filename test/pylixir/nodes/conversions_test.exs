@@ -265,5 +265,49 @@ defmodule Pylixir.Nodes.ConversionsTest do
         {_, value, _, _} -> assert value == %{}
       end
     end
+
+    test "deque() → []" do
+      case run("from collections import deque\ndeque()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == []
+      end
+    end
+
+    test "deque([…]) → Enum.to_list(…)" do
+      case run("from collections import deque\ndeque([1, 2, 3])\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [1, 2, 3]
+      end
+    end
+
+    test "deque + popleft round-trip preserves order" do
+      case run("""
+           from collections import deque
+           q = deque([1, 2, 3])
+           a = q.popleft()
+           b = q.popleft()
+           (a, b, q)
+           """) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {1, 2, [3]}
+      end
+    end
+
+    test "Counter(iter) returns a dict-of-counts (Enum.frequencies)" do
+      case run("""
+           from collections import Counter
+           Counter(["a", "b", "a", "c"])
+           """) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == %{"a" => 2, "b" => 1, "c" => 1}
+      end
+    end
+
+    test "Counter([]) → empty map" do
+      case run("from collections import Counter\nCounter([])\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == %{}
+      end
+    end
   end
 end

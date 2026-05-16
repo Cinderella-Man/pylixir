@@ -36,6 +36,13 @@ defmodule Pylixir.LoopAnalysis do
   # The values *are* MapSets at runtime — this is a known false positive.
   @dialyzer {:nowarn_function, analyze: 1}
 
+  # Same list as `Pylixir.Nodes.Mutations.@methods` — Elixir's flat
+  # constants don't compose, so we re-declare here. Drift would mean
+  # LoopAnalysis tracks something Mutations doesn't rewrite (or vice
+  # versa); the helpers-linkage spirit applies to behavioural pairs
+  # like this, but we don't have a programmatic check yet.
+  @mutation_methods ~w(append sort update add discard clear pop remove extend insert reverse)
+
   @type t :: %__MODULE__{
           assigned_vars: MapSet.t(String.t()),
           referenced_vars: MapSet.t(String.t())
@@ -88,6 +95,51 @@ defmodule Pylixir.LoopAnalysis do
   # same reason; this just stops manifesting the breakage as a
   # cryptic if-side compile error.
   defp names_assigned_in(%{"_type" => "For"}), do: MapSet.new()
+
+  # Statement-context mutation methods (`xs.append(x)`, `d.update(o)`,
+  # etc.) get rewritten by `Pylixir.Nodes.Mutations` to a reassignment
+  # of the root (`xs = xs ++ [x]`). Mirror `ModuleAnalysis` and track
+  # those — without this, a body like `for i in xs: results.append(i)`
+  # would emit `results = results ++ [i]` inside the Enum.reduce fn
+  # without `results` being in the accumulator, so each iteration's
+  # update is discarded.
+  defp names_assigned_in(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{
+               "_type" => "Attribute",
+               "value" => %{"_type" => "Name", "id" => name},
+               "attr" => method
+             }
+           }
+         }
+       )
+       when method in @mutation_methods,
+       do: MapSet.new([name])
+
+  # Same for subscript-rooted mutations: `adj[i].append(x)` rebinds
+  # `adj`. Already supported by Mutations + ModuleAnalysis; tracked
+  # here so for-loop bodies thread the root through the accumulator.
+  defp names_assigned_in(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{
+               "_type" => "Attribute",
+               "value" => %{
+                 "_type" => "Subscript",
+                 "value" => %{"_type" => "Name", "id" => name}
+               },
+               "attr" => method
+             }
+           }
+         }
+       )
+       when method in @mutation_methods,
+       do: MapSet.new([name])
 
   defp names_assigned_in(_), do: MapSet.new()
 

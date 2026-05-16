@@ -294,6 +294,24 @@ defmodule Pylixir.RuntimeHelpers do
     py_round(x * multiplier) / multiplier
   end
 
+  # === Bitwise / set polymorphism ===
+
+  # Python's `&` / `|` / `^` are overloaded: bitwise on ints, set ops
+  # on sets. Pylixir can't tell at codegen time which the operands are,
+  # so dispatch at runtime. `MapSet` covers the set case; everything
+  # else routes to `Bitwise.band/2` etc. (Erlang's BIFs raise loudly
+  # on truly unsupported types — matching Python's TypeError shape.)
+  def py_band(%MapSet{} = a, %MapSet{} = b), do: MapSet.intersection(a, b)
+  def py_band(a, b), do: Bitwise.band(a, b)
+
+  def py_bor(%MapSet{} = a, %MapSet{} = b), do: MapSet.union(a, b)
+  def py_bor(a, b), do: Bitwise.bor(a, b)
+
+  def py_bxor(%MapSet{} = a, %MapSet{} = b),
+    do: MapSet.union(MapSet.difference(a, b), MapSet.difference(b, a))
+
+  def py_bxor(a, b), do: Bitwise.bxor(a, b)
+
   # === Bisect (sorted-list insertion-point search) ===
 
   # Mirrors Python's `bisect.bisect_left(a, x)` — index where `x` should
