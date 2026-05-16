@@ -83,6 +83,15 @@ defmodule Pylixir.LoopAnalysis do
 
   defp names_assigned_in(_), do: MapSet.new()
 
+  # Python's idiomatic throwaway `_` is *not* tracked as an assigned
+  # name. Elixir's `_` is pattern-only — it can't appear in expression
+  # position — so threading it through a surrounding state tuple (when
+  # the for-loop sits inside an `if`) generates code the Elixir parser
+  # rejects. Treating `_` as discard everywhere matches the Python
+  # convention; reading `_` after a loop is rare and would surface as
+  # a clear "undefined variable" instead of the cryptic
+  # "invalid use of _" error.
+  defp target_names(%{"_type" => "Name", "id" => "_"}), do: []
   defp target_names(%{"_type" => "Name", "id" => id}), do: [id]
 
   defp target_names(%{"_type" => "Tuple", "elts" => elts}),

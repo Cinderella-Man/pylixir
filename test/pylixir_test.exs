@@ -128,6 +128,30 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `for _ in xs:` inside an `if` body produced
+  # `_ = if ... do _ else _ end` (the if/else state-tuple wrapper tried
+  # to thread `_` through both branches). Elixir's `_` is pattern-only.
+  describe "transpile/1 — underscore loop targets (discard semantics)" do
+    test "31_underscore_loop_target fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "31_underscore_loop_target.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the discard semantics: bare `_` patterns in the
+        # for-loops, no `_ = if ...` state-tuple wrapper.
+        assert elixir_src =~ ~r/fn _ ->/
+        refute elixir_src =~ ~r/_ =\s+if /
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        assert stdout == "hi\nhi\nhi\n10\n20\ndone\n"
+      end
+    end
+  end
+
   # Eval-corpus repro: `import sys` raised `UnsupportedNodeError("Import")`
   # because the Converter hardcoded `math` as the only allowed module name.
   # Fix: `Pylixir.Stdlib` registry — adding a new stdlib module is now one

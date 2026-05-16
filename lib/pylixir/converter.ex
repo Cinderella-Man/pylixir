@@ -790,6 +790,13 @@ defmodule Pylixir.Converter do
   def tuple_pattern(refs), do: {:{}, [], refs}
 
   @doc false
+  # Python's throwaway `_` — emit Elixir's discard pattern, don't bind
+  # it to scope, don't return it in the `names` list. See `LoopAnalysis`
+  # for the matching exclusion (and the rationale).
+  def convert_loop_target(%{"_type" => "Name", "id" => "_"}, context) do
+    {{:_, [], nil}, [], context}
+  end
+
   def convert_loop_target(%{"_type" => "Name", "id" => id}, context) do
     context = bind_name(context, id)
     atom = id |> Naming.rewrite() |> String.to_atom()
@@ -801,6 +808,9 @@ defmodule Pylixir.Converter do
 
     {refs, names, context} =
       Enum.reduce(elts, {[], [], context}, fn
+        %{"_type" => "Name", "id" => "_"}, {refs, names, ctx} ->
+          {[{:_, [], nil} | refs], names, ctx}
+
         %{"_type" => "Name", "id" => id}, {refs, names, ctx} ->
           ctx = bind_name(ctx, id)
           atom = id |> Naming.rewrite() |> String.to_atom()
