@@ -145,9 +145,20 @@ defmodule Pylixir.Builtins do
 
   # --- T26 conversions ---------------------------------------------------
 
+  # Python's `int()` / `str()` / `bool()` / `float()` / `list()` /
+  # `tuple()` / `set()` / `dict()` with no args all return the
+  # "empty/zero value" of their respective type. Pylixir handles them
+  # at codegen time as their corresponding Elixir literals.
+  def emit("int", [], _kw), do: {:ok, 0}
   def emit("int", [x], _kw), do: {:ok, {:py_int, [], [x]}}
+
+  def emit("str", [], _kw), do: {:ok, ""}
   def emit("str", [x], _kw), do: {:ok, {:py_str, [], [x]}}
+
+  def emit("bool", [], _kw), do: {:ok, false}
   def emit("bool", [x], _kw), do: {:ok, {:truthy?, [], [x]}}
+
+  def emit("float", [], _kw), do: {:ok, 0.0}
 
   def emit("float", [x], _kw) do
     case x do
@@ -164,8 +175,12 @@ defmodule Pylixir.Builtins do
     end
   end
 
+  def emit("list", [], _kw), do: {:ok, []}
+
   def emit("list", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}}
+
+  def emit("tuple", [], _kw), do: {:ok, {:{}, [], []}}
 
   def emit("tuple", [x], _kw) do
     {:ok,
@@ -173,8 +188,13 @@ defmodule Pylixir.Builtins do
       [{{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}]}}
   end
 
+  def emit("set", [], _kw),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], []}}
+
   def emit("set", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}}
+
+  def emit("dict", [], _kw), do: {:ok, {:%{}, [], []}}
 
   def emit("dict", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}}

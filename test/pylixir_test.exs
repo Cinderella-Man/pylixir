@@ -128,6 +128,27 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `set()` raised "`set/0` is not a supported Python
+  # builtin call shape" — the zero-arg conversion-constructor form was
+  # missing. Fix adds zero-arg clauses for the full
+  # int/str/bool/float/list/tuple/set/dict family.
+  describe "transpile/1 — zero-arg conversion constructors" do
+    test "33_empty_constructors fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "33_empty_constructors.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        # set() membership probe (1/0/1) + each empty-constructor's Python repr.
+        assert stdout == "1\n0\n1\n0\n\nFalse\n0.0\n[]\n{}\n"
+      end
+    end
+  end
+
   # Eval-corpus repro: `.copy()` raised "method not supported". Elixir's
   # immutability makes the copy identical to the value itself; the
   # existing mutation rewrites preserve the original. See

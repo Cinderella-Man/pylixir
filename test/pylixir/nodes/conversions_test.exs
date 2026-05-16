@@ -145,4 +145,64 @@ defmodule Pylixir.Nodes.ConversionsTest do
       end
     end
   end
+
+  # Zero-arg forms of the conversion-constructor builtins — Python
+  # returns the empty/zero value of each type.
+  describe "zero-arg conversion constructors" do
+    test "int() → 0" do
+      case run("int()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 0
+      end
+    end
+
+    test "str() → empty string" do
+      case run("str()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == ""
+      end
+    end
+
+    test "bool() → false" do
+      case run("bool()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == false
+      end
+    end
+
+    test "float() → 0.0" do
+      case run("float()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 0.0
+      end
+    end
+
+    test "list() → []" do
+      case run("list()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == []
+      end
+    end
+
+    test "tuple() → {}" do
+      case run("tuple()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {}
+      end
+    end
+
+    test "set() → empty MapSet" do
+      case run("set()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == MapSet.new()
+      end
+    end
+
+    test "dict() → %{}" do
+      case run("dict()\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == %{}
+      end
+    end
+  end
 end
