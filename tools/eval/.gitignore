@@ -1,5 +1,6 @@
 /_build/
 /deps/
 /reports/run-*
+/tmp/
 erl_crash.dump
 *.ez

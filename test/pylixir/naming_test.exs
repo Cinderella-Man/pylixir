@@ -40,12 +40,31 @@ defmodule Pylixir.NamingTest do
     end
   end
 
+  describe "reserved?/1 — Category 4: alias-shaped (ASCII uppercase first)" do
+    test "single-letter uppercase names that the Elixir parser treats as aliases" do
+      for id <- ~w(W H I A Z) do
+        assert Naming.reserved?(id), "expected #{inspect(id)} to be reserved (alias-shaped)"
+      end
+    end
+
+    test "longer uppercase-leading names — Python-idiomatic constants and locals" do
+      for id <- ~w(PI COLORS CONFIG MaxRetries CamelCase) do
+        assert Naming.reserved?(id), "expected #{inspect(id)} to be reserved (alias-shaped)"
+      end
+    end
+  end
+
   describe "reserved?/1 — non-reserved" do
     test "plain user identifiers are not reserved" do
       refute Naming.reserved?("foo")
       refute Naming.reserved?("my_variable")
       refute Naming.reserved?("counter")
       refute Naming.reserved?("x")
+    end
+
+    test "leading underscore is not alias-shaped (Elixir treats _Foo as a variable)" do
+      refute Naming.reserved?("_W")
+      refute Naming.reserved?("_private")
     end
   end
 
@@ -78,9 +97,16 @@ defmodule Pylixir.NamingTest do
       assert Naming.rewrite("when") == "var_when"
     end
 
+    test "alias-shaped names get the var_ prefix" do
+      assert Naming.rewrite("W") == "var_W"
+      assert Naming.rewrite("PI") == "var_PI"
+      assert Naming.rewrite("MaxRetries") == "var_MaxRetries"
+    end
+
     test "plain names pass through unchanged" do
       assert Naming.rewrite("foo") == "foo"
       assert Naming.rewrite("my_counter") == "my_counter"
+      assert Naming.rewrite("_W") == "_W"
     end
   end
 end

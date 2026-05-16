@@ -3,7 +3,7 @@ defmodule Pylixir.Naming do
   Collision policy for translating Python identifiers into Elixir
   identifiers without compile errors or silent shadowing.
 
-  ## Three categories of reserved names
+  ## Four categories of reserved names
 
   A Python identifier is **reserved** if it would either fail to compile or
   silently shadow something important when used bare in Elixir output:
@@ -22,6 +22,14 @@ defmodule Pylixir.Naming do
        call would call `5.(x)` instead of `Kernel.length/1`. Derived
        programmatically via `Kernel.__info__/1` at Pylixir's compile time
        so future Kernel additions are tracked automatically.
+    4. **Alias-shaped identifiers**: any identifier whose first character is
+       an ASCII uppercase letter (`A`–`Z`). Elixir parses these as
+       aliases (module references), not variables, so emission as a bare
+       atom would either fail to compile (`Code.compile_quoted` on a
+       pattern like `{W, H} = ...`) or silently match an alias literal
+       instead of binding. Python idiomatically uses uppercase names for
+       constants and short loop locals (`for I in ...`), so this is a
+       routine collision rather than an edge case.
 
   A reserved name is rewritten with the `var_` prefix on emission
   (`length` → `var_length`). The original Python name lives unchanged in
@@ -54,10 +62,12 @@ defmodule Pylixir.Naming do
   @reserved MapSet.new(@hard_keywords ++ @special_forms ++ @kernel_names)
 
   @doc """
-  True if `id` collides with an Elixir hard keyword, special form, or
-  Kernel auto-import. Such names must be rewritten with the `var_` prefix.
+  True if `id` collides with an Elixir hard keyword, special form, Kernel
+  auto-import, or is alias-shaped (starts with ASCII `A`–`Z`). Such names
+  must be rewritten with the `var_` prefix.
   """
   @spec reserved?(String.t()) :: boolean()
+  def reserved?(<<c, _::binary>>) when c >= ?A and c <= ?Z, do: true
   def reserved?(id) when is_binary(id), do: MapSet.member?(@reserved, id)
 
   @doc """

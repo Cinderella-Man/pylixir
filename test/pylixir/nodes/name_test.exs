@@ -53,10 +53,12 @@ defmodule Pylixir.Nodes.NameTest do
       assert ast == {:@, [], [{:var_PI, [], nil}]}
     end
 
-    test "non-module-attr names with the same id outside the set stay as plain refs" do
+    test "non-module-attr uppercase names get the var_ rewrite (alias-shape collision)" do
       # `PI` is a module attr in some other module; here it's a plain local.
+      # Bare emission of `:PI` would render as the Elixir alias `PI`, not a
+      # variable — so Naming's alias-shape rule rewrites it to `var_PI`.
       {ast, _} = Converter.convert(name("PI"), Context.new())
-      assert ast == {:PI, [], nil}
+      assert ast == {:var_PI, [], nil}
     end
 
     test "a reserved name in module_attrs still emits @var_<id> (the var_ prefix is uniform)" do
