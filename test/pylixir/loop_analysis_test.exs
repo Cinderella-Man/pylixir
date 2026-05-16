@@ -105,7 +105,7 @@ defmodule Pylixir.LoopAnalysisTest do
   end
 
   describe "scope barriers — FunctionDef inside the loop body" do
-    test "Assign inside a nested FunctionDef does NOT leak (walk_scope boundary)" do
+    test "Assign inside a nested FunctionDef does NOT leak (walk_scope boundary), but the def's name does bind" do
       nested_def = %{
         "_type" => "FunctionDef",
         "name" => "helper",
@@ -115,7 +115,11 @@ defmodule Pylixir.LoopAnalysisTest do
       outer = assign(name("outer"), const(0))
       analysis = LoopAnalysis.analyze([outer, nested_def])
 
-      assert vars(analysis) == ["outer"]
+      # `local` (inside the def body) is correctly hidden by the
+      # walk_scope boundary. `helper` itself binds at the surrounding
+      # scope — Pylixir emits nested FunctionDefs as `helper = fn ... end`,
+      # so the state-tuple machinery must thread it like any other Assign.
+      assert vars(analysis) == ["helper", "outer"]
     end
 
     test "Assign inside a Lambda body does not leak" do

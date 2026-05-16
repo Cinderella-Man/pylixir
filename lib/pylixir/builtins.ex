@@ -24,7 +24,7 @@ defmodule Pylixir.Builtins do
   @t25b ~w(sum min max abs map filter)
   @t26_conversions ~w(int float str bool list tuple set dict)
   @t26_type_checks ~w(isinstance)
-  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow)
 
   # `collections.deque` is technically not a builtin — it's imported
   # via `from collections import deque`. But the import is a no-op in
@@ -291,6 +291,12 @@ defmodule Pylixir.Builtins do
     mod = {:py_mod, [], [a, b]}
     {:ok, {fdiv, mod}}
   end
+
+  # Python's `pow(base, exp)` — same as `base ** exp` (delegates to py_pow).
+  # Python's `pow(base, exp, mod)` — modular exponentiation, common in
+  # competitive code for Fermat-based modular inverses.
+  def emit("pow", [base, exp], _kw), do: {:ok, {:py_pow, [], [base, exp]}}
+  def emit("pow", [base, exp, mod], _kw), do: {:ok, {:py_pow_mod, [], [base, exp, mod]}}
 
   def emit("any", [xs], _kw), do: {:ok, enum_truthy_call(:any?, xs)}
   def emit("all", [xs], _kw), do: {:ok, enum_truthy_call(:all?, xs)}

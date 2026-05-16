@@ -9,7 +9,7 @@ defmodule Pylixir.IntegrationTest do
   """
   use ExUnit.Case, async: true
 
-  alias Pylixir.{PythonParseError, TranspileHelpers, UnsupportedNodeError}
+  alias Pylixir.{PythonParseError, TranspileHelpers}
 
   defp python_available? do
     python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
@@ -558,17 +558,21 @@ else:
       end
     end
 
-    test "function inside If raises (def_position :other)" do
+    test "function inside If is lowered as a lambda binding (matches Python's runtime-binding semantics)" do
       source = """
       if True:
           def foo():
               return 1
+      print(foo())
       """
 
       if python_available?() do
-        assert_raise UnsupportedNodeError, ~r/control flow/, fn ->
-          Pylixir.transpile(source)
-        end
+        out = Pylixir.transpile(source)
+        assert is_binary(out)
+        # `def` inside an if-branch becomes `foo = fn ... end` — matching
+        # Python's behaviour where the name is only bound if the branch
+        # executes. (Was previously an unconditional raise.)
+        assert out =~ "fn ->"
       end
     end
   end

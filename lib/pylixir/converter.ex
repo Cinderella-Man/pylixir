@@ -42,9 +42,14 @@ defmodule Pylixir.Converter do
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
     {fn_asts, context} = convert_each(analysis.function_defs, context)
 
-    # Runtime statements live inside py_main; nested FunctionDefs there
-    # are inside control flow (or `If`/`For`/etc.) and must raise per T19.
-    context = %{context | def_position: :other}
+    # Runtime statements live inside py_main. FunctionDefs that appear
+    # here are either (a) top-level defs demoted by ModuleAnalysis
+    # because they close over mutable module state, or (b) Python defs
+    # inside control flow (`if cond: def foo()`). Both are correctly
+    # emitted as `name = fn ... end` lambda bindings via the
+    # `:nested_fn` path — that closes over the surrounding py_main
+    # scope, which is what Python's `def` semantics require here.
+    context = %{context | def_position: :nested_fn}
     {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
     context = %{context | def_position: :module_top}
 
@@ -1486,7 +1491,12 @@ defmodule Pylixir.Converter do
   defp convert_module_attrs([], context), do: {[], context}
 
   defp convert_module_attrs([{name, value_node} | rest], context) do
-    {value_ast, context} = convert(value_node, context)
+    # ModuleAnalysis only promotes values that `Pylixir.LiteralFold` can
+    # evaluate, so the fold here is guaranteed to succeed — bypassing
+    # `convert/2` (which would emit runtime helper calls invalid at
+    # module-attribute scope) is the whole reason promotion exists.
+    {:ok, value} = Pylixir.LiteralFold.fold(value_node)
+    value_ast = Macro.escape(value)
     attr = {:@, [], [{:"var_#{name}", [], [value_ast]}]}
     {rest_asts, context} = convert_module_attrs(rest, context)
     {[attr | rest_asts], context}

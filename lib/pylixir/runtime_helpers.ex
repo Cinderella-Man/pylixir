@@ -96,6 +96,15 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_pow(base, exp), do: :math.pow(base, exp)
 
+  # Python's 3-arg `pow(base, exp, mod)` — modular exponentiation.
+  # Uses Erlang's :crypto.mod_pow (square-and-multiply, suitable for
+  # large exponents used in number-theoretic code like modular inverses
+  # via Fermat's little theorem).
+  def py_pow_mod(base, exp, mod)
+      when is_integer(base) and is_integer(exp) and is_integer(mod) and exp >= 0 and mod > 0 do
+    :crypto.mod_pow(base, exp, mod) |> :crypto.bytes_to_integer()
+  end
+
   # Python's `//` floor-divides; sign follows the divisor for negatives.
   # Integer.floor_div/2 matches Python for int operands; for mixed/float
   # operands, `:math.floor(a/b)` matches Python (returns float).

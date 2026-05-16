@@ -165,6 +165,12 @@ defmodule Pylixir.LoopAnalysis do
        when method in ["heappush", "heapify"],
        do: MapSet.new([name])
 
+  # `def f(...): ...` in a runtime / control-flow position is emitted
+  # by `Nodes.Functions` as `f = fn ... end` — same binding semantics
+  # as an Assign, so the If/For state-tuple must thread `f` out.
+  defp names_assigned_in(%{"_type" => "FunctionDef", "name" => name}),
+    do: MapSet.new([name])
+
   defp names_assigned_in(_), do: MapSet.new()
 
   # Python's idiomatic throwaway names (`_`, `__`, `___`, …) are *not*
