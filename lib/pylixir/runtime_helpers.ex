@@ -311,5 +311,16 @@ defmodule Pylixir.RuntimeHelpers do
     |> Enum.join("")
   end
 
+  # Reads one line from stdin, *including* the trailing newline if
+  # present — matching Python's `sys.stdin.readline()`. At EOF Python
+  # returns "" (not :eof / not a raise), so we surface the same.
+  def py_stdin_readline do
+    case IO.read(:stdio, :line) do
+      :eof -> ""
+      {:error, reason} -> raise RuntimeError, "stdin readline failed: #{inspect(reason)}"
+      line -> line
+    end
+  end
+
   # --- HELPERS END ---
 end

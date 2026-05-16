@@ -113,7 +113,8 @@ defmodule Pylixir.Nodes.AssignTest do
                {:=, [],
                 [
                   matrix,
-                  {:py_setitem, [], [matrix, 0, {:py_setitem, [], [{:py_getitem, [], [matrix, 0]}, 0, 5]}]}
+                  {:py_setitem, [],
+                   [matrix, 0, {:py_setitem, [], [{:py_getitem, [], [matrix, 0]}, 0, 5]}]}
                 ]}
 
       assert MapSet.member?(hd(ctx.scopes), "matrix")

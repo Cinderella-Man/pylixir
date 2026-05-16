@@ -33,7 +33,17 @@ defmodule Pylixir.GoldenCorpusTest do
   end
 
   defp python_stdout(file_path) do
-    {out, 0} = System.cmd(python_cmd(), [file_path], stderr_to_stdout: false)
+    # Redirect stdin from /dev/null so CPython sees immediate EOF on
+    # reads — matching the Pylixir side, where `capture_io/1` supplies
+    # no input. Without this redirect, any fixture that calls
+    # `sys.stdin.readline()` blocks for the test timeout (60s+).
+    # Shelling out is safe here: fixture paths under `test/fixtures/`
+    # are alphanumeric + `_` / `.`.
+    {out, 0} =
+      System.cmd("sh", ["-c", "exec '#{python_cmd()}' '#{file_path}' < /dev/null"],
+        stderr_to_stdout: false
+      )
+
     out
   end
 

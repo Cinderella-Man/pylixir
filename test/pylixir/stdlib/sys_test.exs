@@ -43,6 +43,11 @@ defmodule Pylixir.Stdlib.SysTest do
       assert Sys.call(["stdin", "read"], [], %{}, %{}) == {:ok, {:py_stdin_read, [], []}}
     end
 
+    test "sys.stdin.readline() lowers to a bare py_stdin_readline call" do
+      assert Sys.call(["stdin", "readline"], [], %{}, %{}) ==
+               {:ok, {:py_stdin_readline, [], []}}
+    end
+
     test "sys.stdout.write(s) lowers to IO.write(s)" do
       s_ast = "hi"
       assert {:ok, ast} = Sys.call(["stdout", "write"], [s_ast], %{}, %{})
@@ -51,7 +56,7 @@ defmodule Pylixir.Stdlib.SysTest do
 
     test "unknown call path returns :no_clause" do
       assert Sys.call(["nosuch"], [], %{}, %{}) == :no_clause
-      assert Sys.call(["stdin", "readline"], [], %{}, %{}) == :no_clause
+      assert Sys.call(["stdin", "no_such_method"], [], %{}, %{}) == :no_clause
     end
   end
 end

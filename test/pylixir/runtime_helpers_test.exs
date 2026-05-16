@@ -1,7 +1,27 @@
 defmodule Pylixir.RuntimeHelpersTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias Pylixir.RuntimeHelpers, as: H
+
+  describe "py_stdin_readline/0" do
+    test "returns one line including the trailing newline" do
+      assert capture_io("hello\nworld\n", fn ->
+               send(self(), {:line, H.py_stdin_readline()})
+             end)
+
+      assert_received {:line, "hello\n"}
+    end
+
+    test "returns empty string at EOF (not :eof, no raise)" do
+      assert capture_io("", fn ->
+               send(self(), {:line, H.py_stdin_readline()})
+             end)
+
+      assert_received {:line, ""}
+    end
+  end
 
   describe "truthy?/1 — Python truthiness (RFC §6.3)" do
     test "Python falsy: nil, false, 0, 0.0, empty string, empty list" do

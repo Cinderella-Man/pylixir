@@ -13,6 +13,8 @@ defmodule Pylixir.Stdlib.Sys do
       wrapper picks it up.
     * `sys.stdin.read()` — `py_stdin_read/0` runtime helper (consumes
       all of stdin and returns it as a binary).
+    * `sys.stdin.readline()` — `py_stdin_readline/0` runtime helper
+      (one line, *including* the trailing newline; `""` at EOF).
   """
 
   @behaviour Pylixir.Stdlib
@@ -42,6 +44,9 @@ defmodule Pylixir.Stdlib.Sys do
 
   def call(["stdin", "read"], [], _kwargs, _node),
     do: {:ok, {:py_stdin_read, [], []}}
+
+  def call(["stdin", "readline"], [], _kwargs, _node),
+    do: {:ok, {:py_stdin_readline, [], []}}
 
   def call(["stdout", "write"], [s], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [s]}}
