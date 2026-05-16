@@ -128,6 +128,31 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `-float('inf')` raised "RFC §6.19 — Elixir has no
+  # inf/nan". Fix: emit a large-magnitude sentinel float instead of
+  # rejecting; works for the algorithmic min/max-finding idiom.
+  describe "transpile/1 — float('inf') as a comparison sentinel" do
+    test "37_float_inf_sentinel fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "37_float_inf_sentinel.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the sentinel — both literal forms (with underscore from
+        # the formatter) should appear.
+        assert elixir_src =~ "1.0e308"
+        assert elixir_src =~ "-1.0e308"
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        # 9 (max of the list), 1 (min), then three `True`s.
+        assert stdout == "9\n1\nTrue\nTrue\nTrue\n"
+      end
+    end
+  end
+
   # Eval-corpus repro: `adj[A].append(B)` raised "method `.append()` is
   # not supported" — Mutations only recognised bare-Name targets. Fix
   # adds a depth-1 subscript clause + matching ModuleAnalysis hook.

@@ -160,14 +160,24 @@ defmodule Pylixir.Builtins do
 
   def emit("float", [], _kw), do: {:ok, 0.0}
 
+  # Elixir floats can't represent IEEE +/- infinity natively, but the
+  # idiomatic Python use of `float('inf')` is as a comparison sentinel
+  # in min/max-finding loops — for which a very-large-magnitude float
+  # is observationally equivalent. We emit `1.0e308` (positive) /
+  # `-1.0e308` (negative): bigger than any practical finite value, so
+  # `x < pos_inf` holds for every finite `x`. Fidelity loss is in IEEE
+  # corner cases — `inf - inf` becomes `0.0` instead of NaN, `inf * 2`
+  # overflows instead of saturating — none of which appear in
+  # algorithmic Python idioms. NaN itself stays unsupported (no good
+  # Elixir representation).
   def emit("float", [x], _kw) do
     case x do
       v when is_binary(v) ->
-        if String.downcase(String.trim(v)) in ~w(inf +inf -inf infinity +infinity -infinity nan) do
-          {:error,
-           "Python `float(\"#{v}\")` is not supported (RFC §6.19 — Elixir has no inf/nan)"}
-        else
-          {:ok, {:py_float, [], [x]}}
+        case classify_float_literal(v) do
+          :positive_infinity -> {:ok, 1.0e308}
+          :negative_infinity -> {:ok, -1.0e308}
+          :nan -> {:error, "Python `float(\"#{v}\")` (NaN) is not supported (Elixir has no IEEE NaN)"}
+          :finite -> {:ok, {:py_float, [], [x]}}
         end
 
       _ ->
@@ -252,6 +262,15 @@ defmodule Pylixir.Builtins do
 
   defp sub_one(ast) when is_integer(ast), do: ast - 1
   defp sub_one(ast), do: {:-, [], [ast, 1]}
+
+  defp classify_float_literal(v) do
+    case String.downcase(String.trim(v)) do
+      s when s in ~w(inf +inf infinity +infinity) -> :positive_infinity
+      s when s in ~w(-inf -infinity) -> :negative_infinity
+      "nan" -> :nan
+      _ -> :finite
+    end
+  end
 
   defp apply_sorted_kw(base, xs, kw) do
     base =

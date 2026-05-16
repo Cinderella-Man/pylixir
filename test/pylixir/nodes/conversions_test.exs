@@ -44,6 +44,53 @@ defmodule Pylixir.Nodes.ConversionsTest do
       end
     end
 
+    # `float('inf')` and friends — Elixir has no IEEE infinity, so we
+    # emit a large-magnitude sentinel float. Pinning the actual literal
+    # so an accidental constant change shows up here, not in user code.
+    test "float(\"inf\") emits a large positive sentinel" do
+      case run("float(\"inf\")\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == 1.0e308
+      end
+    end
+
+    test "float(\"-inf\") emits a large negative sentinel" do
+      case run("float(\"-inf\")\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == -1.0e308
+      end
+    end
+
+    test "float(\"Infinity\") / float(\"+inf\") normalise the same as `inf`" do
+      case run(~s|(float("Infinity"), float("+inf"))\n|) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {1.0e308, 1.0e308}
+      end
+    end
+
+    test "any finite-comparison sentinel: -float('inf') < every practical x" do
+      case run(~s|(-float("inf") < 1e9, float("inf") > 1e9)\n|) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == {true, true}
+      end
+    end
+
+    test "float(\"nan\") still raises (no good Elixir representation)" do
+      python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
+
+      case System.cmd(python, ["--version"], stderr_to_stdout: true) do
+        {out, 0} ->
+          if String.starts_with?(out, "Python 3.14") do
+            assert_raise Pylixir.UnsupportedNodeError, ~r/NaN/, fn ->
+              Pylixir.transpile(~s|float("nan")\n|)
+            end
+          end
+
+        _ ->
+          :ok
+      end
+    end
+
     test "str(42) → '42'" do
       case run("str(42)\n") do
         :skip -> :ok
