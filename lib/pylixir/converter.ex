@@ -422,6 +422,9 @@ defmodule Pylixir.Converter do
         attr_name = String.to_atom("var_" <> id)
         {{:@, [], [{attr_name, [], nil}]}, context}
 
+      not name_in_scope?(context, id) and Builtins.unary_capturable?(id) ->
+        {Builtins.unary_capture(id), context}
+
       true ->
         atom = id |> Naming.rewrite() |> String.to_atom()
         {{atom, [], nil}, context}
@@ -1322,6 +1325,29 @@ defmodule Pylixir.Converter do
   end
 
   # --- Call routing (T28) ------------------------------------------------
+
+  # `isinstance(x, T)` consumes T by inspecting the bare-Name shape
+  # (`Builtins.isinstance_call/2`). Routing T through the general Name
+  # converter would now lower it to a unary builtin capture
+  # (e.g. `fn x -> py_int(x) end`), which isinstance can't pattern-match
+  # on. Pull T directly out of the Python AST instead.
+  defp emit_name_call("isinstance", node, context) do
+    args = Map.get(node, "args", [])
+    {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+
+    case args do
+      [x_node, %{"_type" => "Name", "id" => type_id}] ->
+        {x_ast, context} = convert(x_node, context)
+        type_ast = {String.to_atom(type_id), [], nil}
+        {Builtins.emit("isinstance", [x_ast, type_ast], kwargs), context}
+
+      _ ->
+        # Non-Name second arg — let Builtins.emit raise its existing
+        # "must be a bare type name" error with the original shape.
+        {arg_asts, context} = convert_each(args, context)
+        {Builtins.emit("isinstance", arg_asts, kwargs), context}
+    end
+  end
 
   defp emit_name_call(id, node, context) do
     {arg_asts, context} = convert_each(Map.get(node, "args", []), context)

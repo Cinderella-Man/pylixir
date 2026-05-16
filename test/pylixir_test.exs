@@ -76,25 +76,6 @@ defmodule PylixirTest do
       assert stdout == "3 4\n"
     end
 
-    test "27_uppercase_var_unpack fixture transpiles end-to-end and matches CPython" do
-      if python_available?() do
-        fixture = Path.join(@fixtures_dir, "27_uppercase_var_unpack.py")
-        python_src = File.read!(fixture)
-
-        elixir_src = Pylixir.transpile(python_src)
-
-        # Pin the alias-shape rewrite: bare `W`/`H` would be Elixir aliases;
-        # the fix routes them through Naming Category 4 → `var_W`/`var_H`.
-        assert elixir_src =~ "var_W"
-        assert elixir_src =~ "var_H"
-
-        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
-        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
-        assert errors == [], "compile errors: " <> inspect(errors)
-        assert stdout == "12\n"
-      end
-    end
-
     test "for-loop target with an uppercase name compiles and runs cleanly" do
       # `for I in [10, 20]: print(I)` — exercises a different binding site
       # (the for-loop target) than the tuple-unpack repro above.
@@ -125,6 +106,51 @@ defmodule PylixirTest do
 
       assert diagnostics == []
       assert stdout == "10\n20\n"
+    end
+
+    test "27_uppercase_var_unpack fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "27_uppercase_var_unpack.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the alias-shape rewrite: bare `W`/`H` would be Elixir aliases;
+        # the fix routes them through Naming Category 4 → `var_W`/`var_H`.
+        assert elixir_src =~ "var_W"
+        assert elixir_src =~ "var_H"
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        assert stdout == "12\n"
+      end
+    end
+  end
+
+  # Eval-corpus repro: `map(int, xs)` / `map(str, xs)` produced Elixir source
+  # with bare `int` / `str` references (undefined variables). Pylixir's Call
+  # router rewrites direct calls (`int(x) → py_int(x)`), but bare-Name uses
+  # bypassed that rewrite. See Pylixir.Builtins.unary_capturable?/1.
+  describe "transpile/1 — bare builtin references (Builtins.unary_capturable?)" do
+    test "28_builtin_as_higher_order fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "28_builtin_as_higher_order.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the bare-builtin capture: pre-fix, `map(int, ...)` lowered
+        # to `Enum.map(..., int)` (undefined). The fix routes it to a
+        # unary lambda — `fn x -> py_int(x)` is enough to prove the path.
+        assert elixir_src =~ "fn x -> py_int(x)"
+        assert elixir_src =~ "fn x -> py_str(x)"
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        assert stdout == "10\n0 1 0 1 0\n"
+      end
     end
   end
 end

@@ -143,4 +143,44 @@ defmodule Pylixir.Nodes.BuiltinsTest do
       end
     end
   end
+
+  # Bare references to unary builtins must lower as unary lambdas
+  # delegating to the same emit/3 clause used for direct calls — without
+  # this, `map(int, xs)` and friends fall through to an undefined Elixir
+  # variable. See lib/pylixir/builtins.ex `@unary_capturable`.
+  describe "bare builtin references (unary capture)" do
+    test "map(int, [...]) coerces decimal strings" do
+      case run("(list(map(int, [\"1\", \"2\", \"3\", \"4\"])))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [1, 2, 3, 4]
+      end
+    end
+
+    test "map(str, [...]) renders ints as strings" do
+      case run("(list(map(str, [1, 2, 3])))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == ["1", "2", "3"]
+      end
+    end
+
+    test "map(abs, [...]) — bare unary helper" do
+      case run("(list(map(abs, [-1, 2, -3])))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [1, 2, 3]
+      end
+    end
+
+    test "local binding shadows the builtin: `int = ...; map(int, ...)` uses the local" do
+      # Python semantics: a local `int` shadows the builtin. Pylixir's
+      # bare-Name converter must honour scope before falling through to
+      # the builtin capture, otherwise this would call `py_int/1`.
+      case run("""
+           int = lambda x: x + 100
+           (list(map(int, [1, 2, 3])))
+           """) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [101, 102, 103]
+      end
+    end
+  end
 end

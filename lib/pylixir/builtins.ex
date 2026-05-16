@@ -32,6 +32,26 @@ defmodule Pylixir.Builtins do
   @spec supported?(String.t()) :: boolean()
   def supported?(id), do: MapSet.member?(@supported, id)
 
+  # Builtins with a clean single-arg `emit/3` clause. When a bare Python
+  # reference to one of these (e.g. `map(int, xs)`) reaches the Name
+  # converter, emit a unary lambda delegating to that clause rather than
+  # falling through as an undefined Elixir variable. Variadic / kw-bearing
+  # builtins (range, sorted, print, min, max, divmod, isinstance, ...)
+  # are excluded — passing them as HOFs is unusual and the arity is
+  # ambiguous without the call site.
+  @unary_capturable ~w(int float str bool list tuple set dict abs len reversed
+                       chr ord hex oct bin round)
+
+  @spec unary_capturable?(String.t()) :: boolean()
+  def unary_capturable?(id), do: id in @unary_capturable
+
+  @spec unary_capture(String.t()) :: Macro.t()
+  def unary_capture(id) do
+    arg = {:x, [], nil}
+    body = emit(id, [arg], %{})
+    {:fn, [], [{:->, [], [[arg], body]}]}
+  end
+
   @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) :: Macro.t()
   def emit("len", [x], _kw), do: {:py_len, [], [x]}
 
