@@ -36,16 +36,17 @@ defmodule Pylixir.Stdlib.Sys do
   def attribute(_path, _node), do: :no_clause
 
   @impl true
-  def call(["exit"], [], _node), do: {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
+  def call(["exit"], [], _kwargs, _node),
+    do: {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
 
-  def call(["exit"], [code], _node),
+  def call(["exit"], [code], _kwargs, _node),
     do: {:ok, {:throw, [], [{:pylixir_exit, code}]}}
 
-  def call(["stdin", "read"], [], _node),
+  def call(["stdin", "read"], [], _kwargs, _node),
     do: {:ok, {:py_stdin_read, [], []}}
 
-  def call(["stdout", "write"], [s], _node),
+  def call(["stdout", "write"], [s], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [s]}}
 
-  def call(_path, _args, _node), do: :no_clause
+  def call(_path, _args, _kwargs, _node), do: :no_clause
 end

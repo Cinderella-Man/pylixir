@@ -17,6 +17,7 @@ defmodule Pylixir.Converter do
     Context,
     HelpersCodegen,
     LoopAnalysis,
+    Lowering,
     ModuleAnalysis,
     Naming,
     Stdlib,
@@ -158,7 +159,13 @@ defmodule Pylixir.Converter do
     case stdlib_chain(node) do
       {:ok, mod_name, path} ->
         impl = Stdlib.impl(mod_name)
-        dispatch_stdlib(impl.attribute(path, node), mod_name, path, "attribute", node, context)
+
+        Lowering.dispatch(
+          impl.attribute(path, node),
+          "`#{mod_name}.#{Enum.join(path, ".")}` is not a supported stdlib attribute",
+          node,
+          context
+        )
 
       :no_stdlib ->
         attr = Map.fetch!(node, "attr")
@@ -1341,23 +1348,29 @@ defmodule Pylixir.Converter do
   # (`Builtins.isinstance_call/2`). Routing T through the general Name
   # converter would now lower it to a unary builtin capture
   # (e.g. `fn x -> py_int(x) end`), which isinstance can't pattern-match
-  # on. Pull T directly out of the Python AST instead.
+  # on. Pull T directly out of the Python AST instead. Builtins.emit
+  # itself returns `{:error, hint}` for non-bare-Name second args, which
+  # `Lowering.dispatch/4` surfaces with the existing hint.
   defp emit_name_call("isinstance", node, context) do
     args = Map.get(node, "args", [])
     {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
 
-    case args do
-      [x_node, %{"_type" => "Name", "id" => type_id}] ->
-        {x_ast, context} = convert(x_node, context)
-        type_ast = {String.to_atom(type_id), [], nil}
-        {Builtins.emit("isinstance", [x_ast, type_ast], kwargs), context}
+    {emit_args, context} =
+      case args do
+        [x_node, %{"_type" => "Name", "id" => type_id}] ->
+          {x_ast, context} = convert(x_node, context)
+          {[x_ast, {String.to_atom(type_id), [], nil}], context}
 
-      _ ->
-        # Non-Name second arg — let Builtins.emit raise its existing
-        # "must be a bare type name" error with the original shape.
-        {arg_asts, context} = convert_each(args, context)
-        {Builtins.emit("isinstance", arg_asts, kwargs), context}
-    end
+        _ ->
+          convert_each(args, context)
+      end
+
+    Lowering.dispatch(
+      Builtins.emit("isinstance", emit_args, kwargs),
+      "`isinstance/#{length(emit_args)}` is not a supported Python builtin call shape",
+      node,
+      context
+    )
   end
 
   defp emit_name_call(id, node, context) do
@@ -1383,7 +1396,12 @@ defmodule Pylixir.Converter do
         {{{:., [], [ref]}, [], arg_asts}, context}
 
       Builtins.supported?(id) ->
-        {Builtins.emit(id, arg_asts, kwargs), context}
+        Lowering.dispatch(
+          Builtins.emit(id, arg_asts, kwargs),
+          "`#{id}/#{length(arg_asts)}` is not a supported Python builtin call shape",
+          node,
+          context
+        )
 
       true ->
         no_kwargs!(kwargs, id, node)
@@ -1403,9 +1421,15 @@ defmodule Pylixir.Converter do
     case stdlib_chain(synthesized) do
       {:ok, mod_name, path} ->
         {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
-        {_kw, context} = convert_keywords(Map.get(node, "keywords", []), context)
+        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
         impl = Stdlib.impl(mod_name)
-        dispatch_stdlib(impl.call(path, arg_asts, node), mod_name, path, "call", node, context)
+
+        Lowering.dispatch(
+          impl.call(path, arg_asts, kwargs, node),
+          "`#{mod_name}.#{Enum.join(path, ".")}` is not a supported stdlib call",
+          node,
+          context
+        )
 
       :no_stdlib ->
         {target_ast, context} = convert(target, context)
@@ -1718,30 +1742,6 @@ defmodule Pylixir.Converter do
     do: attribute_root(v, [a | acc])
 
   defp attribute_root(_, _), do: :error
-
-  # Bridge Stdlib's lowering return tuple to Converter's
-  # `{ast, context}` / `raise` contract.
-  defp dispatch_stdlib({:ok, ast}, _mod_name, _path, _kind, _node, context),
-    do: {ast, context}
-
-  defp dispatch_stdlib({:error, hint}, _mod_name, _path, kind, node, _context) do
-    raise UnsupportedNodeError,
-      node_type: stdlib_node_type(kind),
-      hint: hint,
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
-
-  defp dispatch_stdlib(:no_clause, mod_name, path, kind, node, _context) do
-    raise UnsupportedNodeError,
-      node_type: stdlib_node_type(kind),
-      hint: "`#{mod_name}.#{Enum.join(path, ".")}` is not a supported stdlib #{kind}",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
-
-  defp stdlib_node_type("attribute"), do: "Attribute"
-  defp stdlib_node_type("call"), do: "Call"
 
   defp convert_keywords([], context), do: {%{}, context}
 

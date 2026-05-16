@@ -27,29 +27,31 @@ defmodule Pylixir.Stdlib.SysTest do
     end
   end
 
-  describe "call/3" do
+  describe "call/4" do
     test "sys.exit() throws {:pylixir_exit, 0} — same shape as the `exit` builtin" do
-      assert Sys.call(["exit"], [], %{}) == {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
+      assert Sys.call(["exit"], [], %{}, %{}) == {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
     end
 
     test "sys.exit(code) carries the code through the throw" do
       code_ast = {:n, [], nil}
-      assert Sys.call(["exit"], [code_ast], %{}) == {:ok, {:throw, [], [{:pylixir_exit, code_ast}]}}
+
+      assert Sys.call(["exit"], [code_ast], %{}, %{}) ==
+               {:ok, {:throw, [], [{:pylixir_exit, code_ast}]}}
     end
 
     test "sys.stdin.read() lowers to a bare py_stdin_read call (helper from RuntimeHelpers)" do
-      assert Sys.call(["stdin", "read"], [], %{}) == {:ok, {:py_stdin_read, [], []}}
+      assert Sys.call(["stdin", "read"], [], %{}, %{}) == {:ok, {:py_stdin_read, [], []}}
     end
 
     test "sys.stdout.write(s) lowers to IO.write(s)" do
       s_ast = "hi"
-      assert {:ok, ast} = Sys.call(["stdout", "write"], [s_ast], %{})
+      assert {:ok, ast} = Sys.call(["stdout", "write"], [s_ast], %{}, %{})
       assert match?({{:., _, [{:__aliases__, _, [:IO]}, :write]}, _, ["hi"]}, ast)
     end
 
     test "unknown call path returns :no_clause" do
-      assert Sys.call(["nosuch"], [], %{}) == :no_clause
-      assert Sys.call(["stdin", "readline"], [], %{}) == :no_clause
+      assert Sys.call(["nosuch"], [], %{}, %{}) == :no_clause
+      assert Sys.call(["stdin", "readline"], [], %{}, %{}) == :no_clause
     end
   end
 end

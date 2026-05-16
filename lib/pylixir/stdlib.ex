@@ -29,21 +29,20 @@ defmodule Pylixir.Stdlib do
 
   ## Return convention
 
-  Both callbacks return one of:
-
-    * `{:ok, ast}`       — translation succeeded.
-    * `{:error, hint}`   — the symbol is recognised but known-unsupported
-      (e.g. `math.inf`); Converter raises `UnsupportedNodeError` with
-      the hint.
-    * `:no_clause`       — the implementation does not handle this path;
-      Converter raises a generic "<mod>.<path> is not supported".
+  Both callbacks return a `Pylixir.Lowering.result()` — see that module
+  for the full contract. Implementations should not raise on
+  unsupported shapes; return `{:error, hint}` or `:no_clause` instead.
   """
 
   @type attr_path :: [String.t(), ...]
-  @type lowering :: {:ok, Macro.t()} | {:error, String.t()} | :no_clause
 
-  @callback attribute(attr_path(), node :: map()) :: lowering()
-  @callback call(attr_path(), args :: [Macro.t()], node :: map()) :: lowering()
+  @callback attribute(attr_path(), node :: map()) :: Pylixir.Lowering.result()
+  @callback call(
+              attr_path(),
+              args :: [Macro.t()],
+              kwargs :: %{optional(String.t()) => Macro.t()},
+              node :: map()
+            ) :: Pylixir.Lowering.result()
 
   @implementations %{
     "math" => Pylixir.Stdlib.Math,

@@ -6,10 +6,18 @@ defmodule Pylixir.Builtins do
   T25b covers aggregation / functional (`sum`, `min`, `max`, `abs`,
   `map`, `filter`).
 
-  T28's router will eventually own the dispatch precedence
-  (local-scope shadow → known module-fn → builtin → unsupported builtin).
-  Until then, the minimal `Call` clause in `Pylixir.Converter` consults
-  `supported?/1` and delegates to `emit/3`.
+  `emit/3` returns a `Pylixir.Lowering.result()` — `{:ok, ast}` for a
+  supported builtin call, `{:error, hint}` when the symbol is recognised
+  but the specific shape is known-unsupported (e.g.
+  `float("inf")`, `print(file=...)`), `:no_clause` when the name is in
+  `@supported` but no clause matches the arg shape. `Pylixir.Converter`
+  bridges the result to its `{ast, context}` contract through
+  `Pylixir.Lowering.dispatch/4`.
+
+  Builtins is deliberately *not* a `Pylixir.Stdlib` implementation —
+  Python builtins live in the implicit global namespace, not under a
+  module import. The two surfaces share the result type, not a
+  behaviour.
   """
 
   @t25a ~w(len range sorted reversed enumerate zip)
@@ -48,34 +56,42 @@ defmodule Pylixir.Builtins do
   @spec unary_capture(String.t()) :: Macro.t()
   def unary_capture(id) do
     arg = {:x, [], nil}
-    body = emit(id, [arg], %{})
+    # Every name in @unary_capturable has a one-arg `emit/3` clause that
+    # returns {:ok, _} — the match is intentional.
+    {:ok, body} = emit(id, [arg], %{})
     {:fn, [], [{:->, [], [[arg], body]}]}
   end
 
-  @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) :: Macro.t()
-  def emit("len", [x], _kw), do: {:py_len, [], [x]}
+  @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) ::
+          Pylixir.Lowering.result()
+  def emit("len", [x], _kw), do: {:ok, {:py_len, [], [x]}}
 
-  def emit("abs", [x], _kw), do: {:py_abs, [], [x]}
+  def emit("abs", [x], _kw), do: {:ok, {:py_abs, [], [x]}}
 
   def emit("range", [stop], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [{:.., [], [0, sub_one(stop)]}]}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [{:.., [], [0, sub_one(stop)]}]}}
 
   def emit("range", [start, stop], _kw),
     do:
-      {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [{:.., [], [start, sub_one(stop)]}]}
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
+        [{:.., [], [start, sub_one(stop)]}]}}
 
   def emit("range", [start, stop, step], _kw),
     do:
-      {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-       [{:..//, [], [start, sub_one(stop), step]}]}
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
+        [{:..//, [], [start, sub_one(stop), step]}]}}
 
   def emit("sorted", [xs], kw) do
     base = {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs]}
-    apply_sorted_kw(base, xs, kw)
+    {:ok, apply_sorted_kw(base, xs, kw)}
   end
 
   def emit("reversed", [xs], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [xs]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [xs]}}
 
   def emit("enumerate", [xs], kw) do
     start =
@@ -95,14 +111,14 @@ defmodule Pylixir.Builtins do
     swap_fn =
       {:fn, [], [{:->, [], [[{{:x, [], nil}, {:i, [], nil}}], {{:i, [], nil}, {:x, [], nil}}]}]}
 
-    {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [base, swap_fn]}
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [base, swap_fn]}}
   end
 
   def emit("zip", [a, b], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [a, b]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [a, b]}}
 
   def emit("zip", [a, b | rest], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [[a, b | rest]]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [[a, b | rest]]}}
 
   def emit("sum", [xs], _kw) do
     # Python sum() coerces booleans (RFC §6.11). Use py_add to retain that.
@@ -113,112 +129,106 @@ defmodule Pylixir.Builtins do
           [[{:a, [], nil}, {:b, [], nil}], {:py_add, [], [{:a, [], nil}, {:b, [], nil}]}]}
        ]}
 
-    {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, 0, reducer]}
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, 0, reducer]}}
   end
 
-  def emit("min", [xs], kw), do: minmax_call(:min, xs, kw)
-  def emit("max", [xs], kw), do: minmax_call(:max, xs, kw)
-  def emit("min", [a, b | rest], _kw), do: minmax_variadic(:min, [a, b | rest])
-  def emit("max", [a, b | rest], _kw), do: minmax_variadic(:max, [a, b | rest])
+  def emit("min", [xs], kw), do: {:ok, minmax_call(:min, xs, kw)}
+  def emit("max", [xs], kw), do: {:ok, minmax_call(:max, xs, kw)}
+  def emit("min", [a, b | rest], _kw), do: {:ok, minmax_variadic(:min, [a, b | rest])}
+  def emit("max", [a, b | rest], _kw), do: {:ok, minmax_variadic(:max, [a, b | rest])}
 
   def emit("map", [f, xs], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [xs, f]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [xs, f]}}
 
   def emit("filter", [f, xs], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [xs, f]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [xs, f]}}
 
   # --- T26 conversions ---------------------------------------------------
 
-  def emit("int", [x], _kw), do: {:py_int, [], [x]}
-  def emit("str", [x], _kw), do: {:py_str, [], [x]}
-  def emit("bool", [x], _kw), do: {:truthy?, [], [x]}
+  def emit("int", [x], _kw), do: {:ok, {:py_int, [], [x]}}
+  def emit("str", [x], _kw), do: {:ok, {:py_str, [], [x]}}
+  def emit("bool", [x], _kw), do: {:ok, {:truthy?, [], [x]}}
 
   def emit("float", [x], _kw) do
     case x do
       v when is_binary(v) ->
         if String.downcase(String.trim(v)) in ~w(inf +inf -inf infinity +infinity -infinity nan) do
-          raise ArgumentError,
-                "Python `float(\"#{v}\")` is not supported (RFC §6.19 — Elixir has no inf/nan)"
+          {:error,
+           "Python `float(\"#{v}\")` is not supported (RFC §6.19 — Elixir has no inf/nan)"}
         else
-          {:py_float, [], [x]}
+          {:ok, {:py_float, [], [x]}}
         end
 
       _ ->
-        {:py_float, [], [x]}
+        {:ok, {:py_float, [], [x]}}
     end
   end
 
   def emit("list", [x], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}}
 
   def emit("tuple", [x], _kw) do
-    {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [],
-     [{{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}]}
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [],
+      [{{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}]}}
   end
 
   def emit("set", [x], _kw),
-    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}}
 
   def emit("dict", [x], _kw),
-    do: {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}}
 
   # --- T26 type checks ---------------------------------------------------
 
   # isinstance(x, T) where T is a Name → guard call.
-  def emit("isinstance", [_x, _type_ast] = [x, type_ast], _kw),
-    do: isinstance_call(x, type_ast)
+  def emit("isinstance", [x, type_ast], _kw), do: isinstance_call(x, type_ast)
 
   # --- T27 IO + formatting ----------------------------------------------
 
   def emit("print", args, kw), do: emit_print(args, kw)
 
-  def emit("input", [], _kw),
-    do: {:py_input, [], [""]}
+  def emit("input", [], _kw), do: {:ok, {:py_input, [], [""]}}
 
-  def emit("input", [prompt], _kw),
-    do: {:py_input, [], [prompt]}
+  def emit("input", [prompt], _kw), do: {:ok, {:py_input, [], [prompt]}}
 
   def emit("chr", [x], _kw),
-    do: {{:., [], [{:__aliases__, [], [:List]}, :to_string]}, [], [[x]]}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:List]}, :to_string]}, [], [[x]]}}
 
   def emit("ord", [x], _kw) do
     charlist_call = {{:., [], [{:__aliases__, [], [:String]}, :to_charlist]}, [], [x]}
-    {:hd, [], [charlist_call]}
+    {:ok, {:hd, [], [charlist_call]}}
   end
 
-  def emit("hex", [x], _kw), do: {:py_hex, [], [x]}
-  def emit("oct", [x], _kw), do: {:py_oct, [], [x]}
-  def emit("bin", [x], _kw), do: {:py_bin, [], [x]}
+  def emit("hex", [x], _kw), do: {:ok, {:py_hex, [], [x]}}
+  def emit("oct", [x], _kw), do: {:ok, {:py_oct, [], [x]}}
+  def emit("bin", [x], _kw), do: {:ok, {:py_bin, [], [x]}}
 
-  def emit("round", [x], _kw), do: {:py_round, [], [x]}
-  def emit("round", [x, n], _kw), do: {:py_round, [], [x, n]}
+  def emit("round", [x], _kw), do: {:ok, {:py_round, [], [x]}}
+  def emit("round", [x, n], _kw), do: {:ok, {:py_round, [], [x, n]}}
 
   def emit("divmod", [a, b], _kw) do
     # Python: (a // b, a % b)
     fdiv = {:py_floor_div, [], [a, b]}
     mod = {:py_mod, [], [a, b]}
-    {fdiv, mod}
+    {:ok, {fdiv, mod}}
   end
 
-  def emit("any", [xs], _kw),
-    do: enum_truthy_call(:any?, xs)
-
-  def emit("all", [xs], _kw),
-    do: enum_truthy_call(:all?, xs)
+  def emit("any", [xs], _kw), do: {:ok, enum_truthy_call(:any?, xs)}
+  def emit("all", [xs], _kw), do: {:ok, enum_truthy_call(:all?, xs)}
 
   # `exit()` / `exit(code)` throw `{:pylixir_exit, code}`; py_main's
   # try/catch wrapper (see `Pylixir.Converter.py_main_def/1`) catches
   # the throw and returns the code so the BEAM survives — `System.halt`
   # would kill the test VM during the golden-corpus run.
-  def emit("exit", [], _kw),
-    do: {:throw, [], [{:pylixir_exit, 0}]}
+  def emit("exit", [], _kw), do: {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
 
-  def emit("exit", [code], _kw),
-    do: {:throw, [], [{:pylixir_exit, code}]}
+  def emit("exit", [code], _kw), do: {:ok, {:throw, [], [{:pylixir_exit, code}]}}
 
-  def emit(name, _args, _kw),
-    do:
-      raise(ArgumentError, "Pylixir.Builtins.emit/3 has no clause for `#{name}` with these args")
+  # Catch-all: name was in @supported (so the caller routed here) but no
+  # clause matched the arg shape. The caller (`Lowering.dispatch/4`)
+  # builds the user-facing hint.
+  def emit(_name, _args, _kw), do: :no_clause
 
   defp sub_one(ast) when is_integer(ast), do: ast - 1
   defp sub_one(ast), do: {:-, [], [ast, 1]}
@@ -273,39 +283,37 @@ defmodule Pylixir.Builtins do
     case Map.get(@isinstance_map, type_str) do
       :integer ->
         # RFC §6.13: isinstance(True, int) == True in Python.
-        {:||, [], [{:is_integer, [], [x_ast]}, {:is_boolean, [], [x_ast]}]}
+        {:ok, {:||, [], [{:is_integer, [], [x_ast]}, {:is_boolean, [], [x_ast]}]}}
 
       :float ->
-        {:is_float, [], [x_ast]}
+        {:ok, {:is_float, [], [x_ast]}}
 
       :binary ->
-        {:is_binary, [], [x_ast]}
+        {:ok, {:is_binary, [], [x_ast]}}
 
       :boolean ->
-        {:is_boolean, [], [x_ast]}
+        {:ok, {:is_boolean, [], [x_ast]}}
 
       :list ->
-        {:is_list, [], [x_ast]}
+        {:ok, {:is_list, [], [x_ast]}}
 
       :tuple ->
-        {:is_tuple, [], [x_ast]}
+        {:ok, {:is_tuple, [], [x_ast]}}
 
       :map ->
-        {:&&, [], [{:is_map, [], [x_ast]}, {:!, [], [{:is_struct, [], [x_ast]}]}]}
+        {:ok, {:&&, [], [{:is_map, [], [x_ast]}, {:!, [], [{:is_struct, [], [x_ast]}]}]}}
 
       nil ->
-        raise ArgumentError,
-              "isinstance/2 with type `#{type_str}` is not supported; allowed: " <>
-                inspect(Map.keys(@isinstance_map))
+        {:error,
+         "isinstance/2 with type `#{type_str}` is not supported; allowed: " <>
+           inspect(Map.keys(@isinstance_map))}
     end
   end
 
   defp isinstance_call(_x_ast, type_ast),
     do:
-      raise(
-        ArgumentError,
-        "isinstance/2 second arg must be a bare type name; got #{inspect(type_ast, limit: 3)}"
-      )
+      {:error,
+       "isinstance/2 second arg must be a bare type name; got #{inspect(type_ast, limit: 3)}"}
 
   defp enum_truthy_call(op, xs) do
     fn_ast = {:fn, [], [{:->, [], [[{:x, [], nil}], {:truthy?, [], [{:x, [], nil}]}]}]}
@@ -313,35 +321,34 @@ defmodule Pylixir.Builtins do
   end
 
   defp emit_print(args, kw) do
-    sep_ast = Map.get(kw, "sep", " ")
-    end_ast = Map.get(kw, "end", "\n")
-
     if Map.has_key?(kw, "file") do
-      raise ArgumentError,
-            "print(file=...) is not supported (RFC §6.7 — redirecting stdout requires IO.puts(device, ...))"
+      {:error,
+       "print(file=...) is not supported (RFC §6.7 — redirecting stdout requires IO.puts(device, ...))"}
+    else
+      sep_ast = Map.get(kw, "sep", " ")
+      end_ast = Map.get(kw, "end", "\n")
+
+      str_args = Enum.map(args, fn arg -> {:py_str, [], [arg]} end)
+
+      joined =
+        case str_args do
+          [] ->
+            ""
+
+          [only] ->
+            only
+
+          _ ->
+            {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [str_args, sep_ast]}
+        end
+
+      full =
+        case end_ast do
+          "" -> joined
+          _ -> {:<>, [], [joined, end_ast]}
+        end
+
+      {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [full]}}
     end
-
-    str_args =
-      Enum.map(args, fn arg -> {:py_str, [], [arg]} end)
-
-    joined =
-      case str_args do
-        [] ->
-          ""
-
-        [only] ->
-          only
-
-        _ ->
-          {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [str_args, sep_ast]}
-      end
-
-    full =
-      case end_ast do
-        "" -> joined
-        _ -> {:<>, [], [joined, end_ast]}
-      end
-
-    {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [full]}
   end
 end

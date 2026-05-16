@@ -28,16 +28,16 @@ defmodule Pylixir.Stdlib.Math do
   def attribute(_path, _node), do: :no_clause
 
   @impl true
-  def call([attr], [x], _node) when attr in @unary,
+  def call([attr], [x], _kwargs, _node) when attr in @unary,
     do: {:ok, {{:., [], [:math, String.to_atom(attr)]}, [], [x]}}
 
-  def call([attr], [a, b], _node) when attr in @binary,
+  def call([attr], [a, b], _kwargs, _node) when attr in @binary,
     do: {:ok, {{:., [], [:math, String.to_atom(attr)]}, [], [a, b]}}
 
-  def call([attr], args, _node) when attr in @unary or attr in @binary,
+  def call([attr], args, _kwargs, _node) when attr in @unary or attr in @binary,
     do:
       {:error,
        "math.#{attr}/#{length(args)} is not supported (supported: #{Enum.join(@unary, "/1, ")}/1 + #{Enum.join(@binary, "/2, ")}/2)"}
 
-  def call(_path, _args, _node), do: :no_clause
+  def call(_path, _args, _kwargs, _node), do: :no_clause
 end

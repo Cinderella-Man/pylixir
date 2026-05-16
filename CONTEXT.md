@@ -81,3 +81,22 @@ protected by T07.
 the boundary node but does not descend into its body. Reflects Python's
 scoping: names assigned inside those constructs are scope-local and do
 not leak.
+
+**Lowering** — The `{:ok, ast} | {:error, hint} | :no_clause` result
+tuple returned by `Pylixir.Builtins.emit/3` and every
+`Pylixir.Stdlib.<Module>.call/4` / `.attribute/2`. Describes the
+outcome of translating a single Python expression. Consumed by
+`Pylixir.Lowering.dispatch/4`, which either returns `{ast, context}`
+or raises `UnsupportedNodeError`. The shared *result type* (not a
+shared behaviour) is what lets the hardcoded-builtin surface and the
+pluggable stdlib registry be dispatched by one helper without
+conflating their distinct roles.
+
+**Stdlib registry** — `Pylixir.Stdlib` holds a compile-time map from
+Python module name (`"math"`, `"sys"`) to its implementing module
+(`Pylixir.Stdlib.Math`, `Pylixir.Stdlib.Sys`). Implementations
+`@behaviour Pylixir.Stdlib` and define `attribute/2` + `call/4`, both
+returning a [[Lowering]] result. Adding a new stdlib module = one new
+file + one `@implementations` entry. The Converter discovers entries
+via `supported?/1` (Import gate) and `impl/1` (Attribute / Call
+dispatch via `stdlib_chain/1`).
