@@ -217,13 +217,13 @@ defmodule Pylixir.Builtins do
   def emit("any", [xs], _kw), do: {:ok, enum_truthy_call(:any?, xs)}
   def emit("all", [xs], _kw), do: {:ok, enum_truthy_call(:all?, xs)}
 
-  # `exit()` / `exit(code)` throw `{:pylixir_exit, code}`; py_main's
-  # try/catch wrapper (see `Pylixir.Converter.py_main_def/1`) catches
-  # the throw and returns the code so the BEAM survives — `System.halt`
-  # would kill the test VM during the golden-corpus run.
-  def emit("exit", [], _kw), do: {:ok, {:throw, [], [{:pylixir_exit, 0}]}}
+  # `exit()` / `exit(code)` throw via `Pylixir.ControlFlow.throw_exit/1`;
+  # py_main's try/catch wrapper (see `Pylixir.Converter.py_main_def/1`)
+  # catches the throw and returns the code so the BEAM survives —
+  # `System.halt` would kill the test VM during the golden-corpus run.
+  def emit("exit", [], _kw), do: {:ok, Pylixir.ControlFlow.throw_exit(0)}
 
-  def emit("exit", [code], _kw), do: {:ok, {:throw, [], [{:pylixir_exit, code}]}}
+  def emit("exit", [code], _kw), do: {:ok, Pylixir.ControlFlow.throw_exit(code)}
 
   # Catch-all: name was in @supported (so the caller routed here) but no
   # clause matched the arg shape. The caller (`Lowering.dispatch/4`)

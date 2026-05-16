@@ -107,3 +107,34 @@ returning a [[Lowering]] result. Adding a new stdlib module = one new
 file + one `@implementations` entry. The Converter discovers entries
 via `supported?/1` (Import gate) and `impl/1` (Attribute / Call
 dispatch via `stdlib_chain/1`).
+
+**Node module** — Files under `lib/pylixir/nodes/<x>.ex` that own the
+lowering for a related group of Python AST node types: `Comprehension`
+(list/set/dict/generator), `Loop` (For/While/Break/Continue),
+`Functions` (FunctionDef/Lambda), `If` (if/elif/else), `Compare`
+(single + chained), `Mutations` (statement-context `.append`/`.sort`
+…), `AttributeMethods` (instance method dispatch). The Converter's
+`convert/2` clauses delegate to the matching node module; cross-node
+mechanics (`convert_each`, `convert_keywords`, `convert_loop_target`,
+`convert_test`, `bind_name`, `body_to_block`, `tuple_pattern`,
+`next_temp`, `maybe_temp_bind`, `var_bound?`, `name_in_scope?`) stay
+on `Pylixir.Converter` as `@doc false` public functions because every
+node module calls back through them. Mirrors the long-standing
+`test/pylixir/nodes/<x>_test.exs` layout.
+
+**Control-flow protocol** — `Pylixir.ControlFlow` owns the throw/catch
+shapes that Pylixir uses to implement Python's early-exit constructs:
+
+  * `return value` → `{:pylixir_return, value}` (caught by the
+    function body's wrapper when `Context.return_mode == :wrapped`).
+  * `break` → `{:pylixir_break, payload}` (caught by the enclosing
+    loop).
+  * `continue` → `{:pylixir_continue, payload}` (caught by the
+    enclosing loop's per-iteration arm).
+  * `exit(code)` / `sys.exit(code)` → `{:pylixir_exit, code}` (caught
+    by py_main's wrapper, which returns the code).
+
+`throw_*/1` and `catch_*/2` constructors build the matching emit-side
+and catch-side AST shapes. Without this module the atoms were
+duplicated across ~10 emit sites and ~6 catch sites; any tuple-shape
+change would have needed synchronised edits across multiple files.
