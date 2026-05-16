@@ -166,6 +166,29 @@ defmodule Pylixir.ModuleAnalysis do
        when method in @mutation_methods,
        do: target_name == name
 
+  # `coll[i].method(args)` — `Pylixir.Nodes.Mutations` rebinds `coll`,
+  # so `coll` must NOT be promoted to a module attribute even though
+  # its initial Assign is a literal.
+  defp mutates_name?(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{
+               "_type" => "Attribute",
+               "value" => %{
+                 "_type" => "Subscript",
+                 "value" => %{"_type" => "Name", "id" => target_name}
+               },
+               "attr" => method
+             }
+           }
+         },
+         name
+       )
+       when method in @mutation_methods,
+       do: target_name == name
+
   defp mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
     do: target == name
 

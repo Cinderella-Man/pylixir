@@ -128,6 +128,31 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `adj[A].append(B)` raised "method `.append()` is
+  # not supported" — Mutations only recognised bare-Name targets. Fix
+  # adds a depth-1 subscript clause + matching ModuleAnalysis hook.
+  describe "transpile/1 — subscript-rooted mutation methods" do
+    test "36_subscript_mutation_methods fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "36_subscript_mutation_methods.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the rebind shape: `adj = py_setitem(adj, …, py_getitem(adj, …) ++ …)`.
+        assert elixir_src =~ ~r/py_setitem\(adj, 0, py_getitem\(adj, 0\)/
+
+        # `adj` must NOT have been promoted to a module attribute.
+        refute elixir_src =~ "@var_adj"
+
+        {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        assert stdout == "[10, 20]\n[30]\n[]\n[]\n[100, 200, 300]\n"
+      end
+    end
+  end
+
   # Eval-corpus repro: `set()` raised "`set/0` is not a supported Python
   # builtin call shape" — the zero-arg conversion-constructor form was
   # missing. Fix adds zero-arg clauses for the full

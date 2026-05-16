@@ -5,11 +5,18 @@ defmodule Pylixir.Nodes.Mutations do
 
   Pylixir treats Python's mutable containers as Elixir immutables: the
   statement `xs.append(x)` lowers to `xs = xs ++ [x]` rather than a true
-  in-place mutation. The classifier `detect/1` recognises eligible call
-  shapes (Attribute call on a bare Name) and returns either `:none` or
-  the tuple needed by `emit/6`. Caller (the `Expr` convert clause)
-  decides whether to use the mutation path or fall through to the
-  general call dispatcher.
+  in-place mutation. The classifier `detect/1` recognises two target
+  shapes:
+
+    * `xs.method(args)`      — bare Name target; `{:name, …}` tuple.
+    * `coll[i].method(args)` — depth-1 Subscript target rooted at a
+      bare Name; `{:subscript, …}` tuple. Caller dispatches to
+      `emit/6` or `emit_subscript/7` accordingly.
+
+  The Subscript form rebinds the root: `coll[i].append(x)` lowers to
+  `coll = py_setitem(coll, i, py_getitem(coll, i) ++ [x])`. The slice
+  is temp-bound when non-trivial to preserve single-eval semantics.
+  Deeper chains (`m[i][j].method(args)`) are not yet supported.
   """
 
   alias Pylixir.{Converter, Naming, UnsupportedNodeError}
@@ -17,14 +24,14 @@ defmodule Pylixir.Nodes.Mutations do
   @methods ~w(append sort reverse insert extend remove clear pop add discard update)
 
   @doc """
-  Classify a Python `Expr.value` node. Returns the captured pieces for
-  `emit/6` if the node is a bare-Name mutation method call;
-  `:none` otherwise.
+  Classify a Python `Expr.value` node. Returns `:none`, a `{:name, …}`
+  tuple for the bare-Name case, or a `{:subscript, …}` tuple for the
+  depth-1 subscript case.
   """
   @spec detect(map()) ::
           :none
-          | {target :: String.t(), method :: String.t(), args :: [map()], kwargs :: [map()],
-             source :: map()}
+          | {:name, String.t(), String.t(), [map()], [map()], map()}
+          | {:subscript, String.t(), map(), String.t(), [map()], [map()], map()}
   def detect(
         %{
           "_type" => "Call",
@@ -39,7 +46,31 @@ defmodule Pylixir.Nodes.Mutations do
       when attr != nil do
     if attr in @methods do
       kwargs_raw = Map.get(source, "keywords", [])
-      {name, attr, args, kwargs_raw, source}
+      {:name, name, attr, args, kwargs_raw, source}
+    else
+      :none
+    end
+  end
+
+  def detect(
+        %{
+          "_type" => "Call",
+          "func" => %{
+            "_type" => "Attribute",
+            "value" => %{
+              "_type" => "Subscript",
+              "value" => %{"_type" => "Name", "id" => name},
+              "slice" => slice
+            },
+            "attr" => attr
+          },
+          "args" => args
+        } = source
+      )
+      when attr != nil do
+    if attr in @methods do
+      kwargs_raw = Map.get(source, "keywords", [])
+      {:subscript, name, slice, attr, args, kwargs_raw, source}
     else
       :none
     end
@@ -59,6 +90,36 @@ defmodule Pylixir.Nodes.Mutations do
 
     context = Converter.bind_name(context, target_name)
     {{:=, [], [target_ast, new_value]}, context}
+  end
+
+  # `coll[i].method(args)` — rebind `coll` to a copy where the i-th
+  # element has been mutated. The slice is `maybe_temp_bind`'d so
+  # single-eval semantics hold for non-trivial slices (the slice
+  # appears twice in the output: once in `py_getitem`, once in
+  # `py_setitem`).
+  @spec emit_subscript(String.t(), map(), String.t(), [map()], [map()], map(), Pylixir.Context.t()) ::
+          {Macro.t(), Pylixir.Context.t()}
+  def emit_subscript(coll_name, slice_node, method, args, kwargs_raw, source, context) do
+    {arg_asts, context} = Converter.convert_each(args, context)
+    {kwargs, context} = Converter.convert_keywords(kwargs_raw, context)
+    {slice_ref, slice_binding, context} = Converter.maybe_temp_bind(slice_node, context)
+
+    coll_atom = coll_name |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+    inner_get = {:py_getitem, [], [coll_ref, slice_ref]}
+    new_inner = mutation_rhs(method, inner_get, arg_asts, kwargs, source)
+    setitem = {:py_setitem, [], [coll_ref, slice_ref, new_inner]}
+    assign = {:=, [], [coll_ref, setitem]}
+
+    context = Converter.bind_name(context, coll_name)
+
+    ast =
+      case slice_binding do
+        nil -> assign
+        b -> {:__block__, [], [b, assign]}
+      end
+
+    {ast, context}
   end
 
   defp mutation_rhs("append", target, [x], _kw, _node),

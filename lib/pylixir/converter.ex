@@ -268,8 +268,11 @@ defmodule Pylixir.Converter do
       :none ->
         convert(value, context)
 
-      {target_name, method, args, kwargs, source_node} ->
+      {:name, target_name, method, args, kwargs, source_node} ->
         Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
+
+      {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
+        Nodes.Mutations.emit_subscript(coll_name, slice, method, args, kwargs, source_node, context)
     end
   end
 

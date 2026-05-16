@@ -159,4 +159,33 @@ defmodule Pylixir.Nodes.MutationMethodsTest do
       end
     end
   end
+
+  # `coll[i].method(args)` rebinds `coll` to a copy where the i-th
+  # element has been mutated. Single-eval safety for the slice is
+  # preserved via `maybe_temp_bind`.
+  describe "subscript-rooted mutation: `coll[i].method(args)`" do
+    test "adj[0].append(x) mutates only the inner list at index 0" do
+      case run("""
+           adj = [[], [], []]
+           adj[0].append(10)
+           adj[0].append(20)
+           adj[1].append(30)
+           adj
+           """) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [[10, 20], [30], []]
+      end
+    end
+
+    test "buckets[1].extend([...]) appends to the inner list" do
+      case run("""
+           buckets = [[], []]
+           buckets[1].extend([1, 2, 3])
+           buckets
+           """) do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [[], [1, 2, 3]]
+      end
+    end
+  end
 end
