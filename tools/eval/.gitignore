@@ -1,0 +1,5 @@
+/_build/
+/deps/
+/reports/run-*
+erl_crash.dump
+*.ez
