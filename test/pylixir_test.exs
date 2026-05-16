@@ -128,6 +128,34 @@ defmodule PylixirTest do
     end
   end
 
+  # Eval-corpus repro: `import sys` raised `UnsupportedNodeError("Import")`
+  # because the Converter hardcoded `math` as the only allowed module name.
+  # Fix: `Pylixir.Stdlib` registry — adding a new stdlib module is now one
+  # new file + one `@implementations` entry.
+  describe "transpile/1 — sys stdlib module (Pylixir.Stdlib.Sys)" do
+    test "30_sys_module fixture transpiles end-to-end and matches CPython" do
+      if python_available?() do
+        fixture = Path.join(@fixtures_dir, "30_sys_module.py")
+        python_src = File.read!(fixture)
+
+        elixir_src = Pylixir.transpile(python_src)
+
+        # Pin the registry-routed lowerings: sys.maxsize → literal, the
+        # `if` enters because maxsize > 0, sys.exit(0) → throw, py_main's
+        # catch surfaces the code. "unreachable" never prints. The
+        # formatter inserts `_` separators in large int literals.
+        assert elixir_src =~ "9_223_372_036_854_775_807"
+        assert elixir_src =~ "throw({:pylixir_exit"
+
+        {_, value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
+        errors = Enum.filter(diagnostics, &(&1[:severity] == :error))
+        assert errors == [], "compile errors: " <> inspect(errors)
+        assert stdout == "9223372036854775807\nnonempty\n"
+        assert value == 0
+      end
+    end
+  end
+
   # Eval-corpus repro: bare `exit()` lowered to `var_exit()` (undefined) —
   # `exit` collides with Kernel.exit/1 so Naming rewrites it, and there was
   # no Builtins emit clause to short-circuit. Fix adds an `exit` emit clause

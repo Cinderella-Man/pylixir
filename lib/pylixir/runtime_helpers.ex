@@ -302,5 +302,14 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
+  # Drains stdin and returns its entire contents as a binary, like
+  # Python's `sys.stdin.read()`. Reads until EOF; an immediate EOF
+  # yields the empty string (Python returns "" rather than raising).
+  def py_stdin_read do
+    Stream.repeatedly(fn -> IO.read(:stdio, :line) end)
+    |> Stream.take_while(&(&1 != :eof))
+    |> Enum.join("")
+  end
+
   # --- HELPERS END ---
 end

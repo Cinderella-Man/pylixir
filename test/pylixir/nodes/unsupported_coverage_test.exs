@@ -145,12 +145,14 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       end
     end
 
-    test "Import of non-math raises" do
-      assert_raise UnsupportedNodeError, ~r/import math/, fn ->
+    test "Import of an unregistered stdlib module raises" do
+      # `os` is not in the Pylixir.Stdlib registry. Use a name unlikely
+      # to ever be supported so this test stays meaningful.
+      assert_raise UnsupportedNodeError, ~r/import os/, fn ->
         Converter.convert(
           %{
             "_type" => "Import",
-            "names" => [%{"_type" => "alias", "name" => "sys", "asname" => nil}]
+            "names" => [%{"_type" => "alias", "name" => "os", "asname" => nil}]
           },
           Context.new()
         )

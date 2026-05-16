@@ -19,6 +19,7 @@ defmodule Pylixir.Converter do
     LoopAnalysis,
     ModuleAnalysis,
     Naming,
+    Stdlib,
     UnsupportedNodeError
   }
 
@@ -102,17 +103,19 @@ defmodule Pylixir.Converter do
     {{:unless, [], [test_ast, [do: raise_call]]}, context}
   end
 
-  # Module-top `import math` and `from __future__ import ...` silently
-  # emit nothing (per T31 anticipation).
+  # Imports are no-ops in generated Elixir — `Pylixir.Stdlib` modules
+  # supply their own translations at attribute / call sites. Reject any
+  # module name the registry doesn't know about.
   def convert(%{"_type" => "Import", "names" => names}, context) do
-    if Enum.all?(names, fn %{"name" => n} -> n == "math" end) do
-      {{:__block__, [], []}, context}
-    else
-      not_math = Enum.find(names, fn %{"name" => n} -> n != "math" end)
+    case Enum.find(names, fn %{"name" => n} -> not Stdlib.supported?(n) end) do
+      nil ->
+        {{:__block__, [], []}, context}
 
-      raise UnsupportedNodeError,
-        node_type: "Import",
-        hint: "only `import math` is supported; saw `import #{not_math["name"]}`"
+      %{"name" => unknown} ->
+        raise UnsupportedNodeError,
+          node_type: "Import",
+          hint:
+            "no stdlib translation for `import #{unknown}` (known: #{Enum.join(Stdlib.names(), ", ")})"
     end
   end
 
@@ -122,7 +125,8 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "ImportFrom", "module" => mod}, _context) do
     raise UnsupportedNodeError,
       node_type: "ImportFrom",
-      hint: "`from #{mod} import ...` is not supported (only `from __future__` and `import math`)"
+      hint:
+        "`from #{mod} import ...` is not supported (only `from __future__`; for stdlib modules use `import #{mod}` and reference via `#{mod}.<name>`)"
   end
 
   # Minimal Call clause — supports `Name(args)` calls only. T28 will
@@ -146,17 +150,24 @@ defmodule Pylixir.Converter do
     end
   end
 
-  # Bare `Attribute` access (no Call) — math.pi etc.
-  def convert(%{"_type" => "Attribute", "value" => target, "attr" => attr} = node, context) do
-    case target do
-      %{"_type" => "Name", "id" => "math"} ->
-        emit_math_attribute(attr, node, context)
+  # Bare `Attribute` access (no Call). Walk the chain — if it roots at a
+  # known stdlib module, dispatch to its `attribute/2` callback; otherwise
+  # the access shape isn't supported (Pylixir has no general
+  # object-attribute semantics).
+  def convert(%{"_type" => "Attribute"} = node, context) do
+    case stdlib_chain(node) do
+      {:ok, mod_name, path} ->
+        impl = Stdlib.impl(mod_name)
+        dispatch_stdlib(impl.attribute(path, node), mod_name, path, "attribute", node, context)
 
-      _ ->
+      :no_stdlib ->
+        attr = Map.fetch!(node, "attr")
+        target_type = Map.get(node["value"], "_type")
+
         raise UnsupportedNodeError,
           node_type: "Attribute",
           hint:
-            "non-`math` attribute access (`obj.attr`) is not supported; got `<#{Map.get(target, "_type")}>.#{attr}`",
+            "attribute access on a non-stdlib value (`<#{target_type}>.#{attr}`) is not supported (known stdlib modules: #{Enum.join(Stdlib.names(), ", ")})",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
@@ -1382,13 +1393,21 @@ defmodule Pylixir.Converter do
   end
 
   defp emit_attribute_call(target, attr, node, context) do
-    case target do
-      %{"_type" => "Name", "id" => "math"} ->
+    # Stdlib root? `target` is the chain *before* the method name; the
+    # full path is that prefix plus the method `attr`. Examples:
+    # `math.sqrt(4)`: target=Name("math"), prefix=[], path=["sqrt"].
+    # `sys.stdin.read()`: target=Attribute(sys, "stdin"), prefix=["stdin"],
+    # path=["stdin", "read"].
+    synthesized = %{"_type" => "Attribute", "value" => target, "attr" => attr}
+
+    case stdlib_chain(synthesized) do
+      {:ok, mod_name, path} ->
         {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
         {_kw, context} = convert_keywords(Map.get(node, "keywords", []), context)
-        {emit_math_call(attr, arg_asts, node), context}
+        impl = Stdlib.impl(mod_name)
+        dispatch_stdlib(impl.call(path, arg_asts, node), mod_name, path, "call", node, context)
 
-      _ ->
+      :no_stdlib ->
         {target_ast, context} = convert(target, context)
         {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
         {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
@@ -1678,52 +1697,51 @@ defmodule Pylixir.Converter do
 
   defp reject_multichar_strip!(_chars, _node), do: :ok
 
-  @math_unsupported_attrs ~w(inf nan)
+  # Walk an Attribute chain; if the root is a Name matching a registered
+  # `Pylixir.Stdlib` module, return `{:ok, mod_name, attr_path}` where
+  # `attr_path` is the list of attribute names *after* the module
+  # (always ≥ 1 element since the input is an Attribute node, not a
+  # bare Name). Anything else returns `:no_stdlib`.
+  defp stdlib_chain(%{"_type" => "Attribute", "value" => value, "attr" => attr}) do
+    case attribute_root(value, [attr]) do
+      {:ok, root, path} ->
+        if Stdlib.supported?(root), do: {:ok, root, path}, else: :no_stdlib
 
-  defp emit_math_attribute(attr, node, _context) when attr in @math_unsupported_attrs do
+      :error ->
+        :no_stdlib
+    end
+  end
+
+  defp attribute_root(%{"_type" => "Name", "id" => id}, acc), do: {:ok, id, acc}
+
+  defp attribute_root(%{"_type" => "Attribute", "value" => v, "attr" => a}, acc),
+    do: attribute_root(v, [a | acc])
+
+  defp attribute_root(_, _), do: :error
+
+  # Bridge Stdlib's lowering return tuple to Converter's
+  # `{ast, context}` / `raise` contract.
+  defp dispatch_stdlib({:ok, ast}, _mod_name, _path, _kind, _node, context),
+    do: {ast, context}
+
+  defp dispatch_stdlib({:error, hint}, _mod_name, _path, kind, node, _context) do
     raise UnsupportedNodeError,
-      node_type: "Attribute",
-      hint: "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)",
+      node_type: stdlib_node_type(kind),
+      hint: hint,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
 
-  defp emit_math_attribute("pi", _node, context),
-    do: {{{:., [], [:math, :pi]}, [], []}, context}
-
-  defp emit_math_attribute("e", _node, context),
-    do: {{{:., [], [:math, :e]}, [], []}, context}
-
-  defp emit_math_attribute("tau", _node, context),
-    do: {{:*, [], [2, {{:., [], [:math, :pi]}, [], []}]}, context}
-
-  defp emit_math_attribute(attr, node, _context) do
+  defp dispatch_stdlib(:no_clause, mod_name, path, kind, node, _context) do
     raise UnsupportedNodeError,
-      node_type: "Attribute",
-      hint: "`math.#{attr}` (bare attribute) is not supported",
+      node_type: stdlib_node_type(kind),
+      hint: "`#{mod_name}.#{Enum.join(path, ".")}` is not a supported stdlib #{kind}",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
 
-  @math_unary ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp)
-  @math_binary ~w(pow atan2)
-
-  defp emit_math_call(attr, [x], _node) when attr in @math_unary do
-    {{:., [], [:math, String.to_atom(attr)]}, [], [x]}
-  end
-
-  defp emit_math_call(attr, [a, b], _node) when attr in @math_binary do
-    {{:., [], [:math, String.to_atom(attr)]}, [], [a, b]}
-  end
-
-  defp emit_math_call(attr, args, node) do
-    raise UnsupportedNodeError,
-      node_type: "Call",
-      hint:
-        "math.#{attr}/#{length(args)} is not supported (supported: #{Enum.join(@math_unary, "/1, ")}/1 + #{Enum.join(@math_binary, "/2, ")}/2)",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
+  defp stdlib_node_type("attribute"), do: "Attribute"
+  defp stdlib_node_type("call"), do: "Call"
 
   defp convert_keywords([], context), do: {%{}, context}
 

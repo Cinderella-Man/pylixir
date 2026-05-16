@@ -65,7 +65,7 @@ defmodule Pylixir.TranspileTest do
       end
     end
 
-    test "non-math `import` raises with a clear hint" do
+    test "unregistered stdlib `import` raises with a clear hint listing knowns" do
       if python_available?() do
         err =
           assert_raise UnsupportedNodeError, fn ->
@@ -73,7 +73,11 @@ defmodule Pylixir.TranspileTest do
           end
 
         assert err.node_type == "Import"
-        assert err.hint =~ "import math"
+        assert err.hint =~ "import os"
+        # The hint enumerates registered stdlib modules so the user knows
+        # what *is* available. See `Pylixir.Stdlib.names/0`.
+        assert err.hint =~ "math"
+        assert err.hint =~ "sys"
       end
     end
   end
