@@ -36,8 +36,9 @@ defmodule Pylixir.Nodes.If do
       {body_block, context} = convert_body_block(body, context)
       {{:if, [], [test_ast, [do: body_block]]}, context}
     else
+      pre_if_context = context
       {body_block, context} = convert_body_with_acc(body, assigned, context)
-      else_block = state_tuple_value(assigned)
+      else_block = state_tuple_value(assigned, pre_if_context)
       pattern = state_tuple_pattern(assigned)
       context = Enum.reduce(assigned, context, &Converter.bind_name(&2, &1))
 
@@ -52,17 +53,42 @@ defmodule Pylixir.Nodes.If do
     {test_ast, context} = Converter.convert_test(test, context)
 
     if assigned == [] do
-      {body_block, context} = convert_body_block(body, context)
-      {else_block, context} = convert_body_block(orelse, context)
+      {body_block, else_block, context} = convert_sibling_branches(body, orelse, context)
       {{:if, [], [test_ast, [do: body_block, else: else_block]]}, context}
     else
-      {body_block, context} = convert_body_with_acc(body, assigned, context)
-      {else_block, context} = convert_body_with_acc(orelse, assigned, context)
+      {body_block, else_block, context} =
+        convert_sibling_branches_with_acc(body, orelse, assigned, context)
+
       pattern = state_tuple_pattern(assigned)
       context = Enum.reduce(assigned, context, &Converter.bind_name(&2, &1))
 
       {{:=, [], [pattern, {:if, [], [test_ast, [do: body_block, else: else_block]]}]}, context}
     end
+  end
+
+  # Sibling-branch convention: both branches see the *same* pre-if
+  # context's scopes; names bound during the if-branch must NOT be
+  # visible while converting the else-branch (in Python the two
+  # branches share the surrounding scope, but for code-generation
+  # purposes Elixir's lexical scoping means we have to keep their
+  # visibility independent during the per-branch walk). Counters and
+  # other monotonically-advancing Context fields (`temp_counter`,
+  # `while_counter`, `while_helpers`, …) flow through both branches
+  # in order — only scopes get reset.
+  defp convert_sibling_branches(body, orelse, context) do
+    saved_scopes = context.scopes
+    {body_block, context} = convert_body_block(body, context)
+    context = %{context | scopes: saved_scopes}
+    {else_block, context} = convert_body_block(orelse, context)
+    {body_block, else_block, context}
+  end
+
+  defp convert_sibling_branches_with_acc(body, orelse, assigned, context) do
+    saved_scopes = context.scopes
+    {body_block, context} = convert_body_with_acc(body, assigned, context)
+    context = %{context | scopes: saved_scopes}
+    {else_block, context} = convert_body_with_acc(orelse, assigned, context)
+    {body_block, else_block, context}
   end
 
   @spec emit_cond_chain(map(), [map()], [map()], Pylixir.Context.t()) ::
@@ -81,13 +107,15 @@ defmodule Pylixir.Nodes.If do
 
       {{:cond, [], [[do: all_clauses]]}, context}
     else
+      pre_if_context = context
+
       {clauses, terminal_else, context} =
         collect_cond_chain_threaded(test, body, orelse, assigned, context, [])
 
       arrow_clauses =
         Enum.map(Enum.reverse(clauses), fn {t, b} -> {:->, [], [[t], b]} end)
 
-      fallthrough_body = terminal_else || state_tuple_value(assigned)
+      fallthrough_body = terminal_else || state_tuple_value(assigned, pre_if_context)
       all_clauses = arrow_clauses ++ [{:->, [], [[true], fallthrough_body]}]
 
       pattern = state_tuple_pattern(assigned)
@@ -97,9 +125,14 @@ defmodule Pylixir.Nodes.If do
     end
   end
 
+  # Each elif clause and the terminal else are sibling branches —
+  # like emit_else, they must NOT see scopes bound during the
+  # preceding branches. Save+restore scopes around each branch body.
   defp collect_cond_chain(test, body, orelse, context, acc) do
     {test_ast, context} = Converter.convert_test(test, context)
+    saved_scopes = context.scopes
     {body_block, context} = convert_body_block(body, context)
+    context = %{context | scopes: saved_scopes}
     acc = [{test_ast, body_block} | acc]
 
     case orelse do
@@ -117,7 +150,9 @@ defmodule Pylixir.Nodes.If do
 
   defp collect_cond_chain_threaded(test, body, orelse, assigned, context, acc) do
     {test_ast, context} = Converter.convert_test(test, context)
+    saved_scopes = context.scopes
     {body_block, context} = convert_body_with_acc(body, assigned, context)
+    context = %{context | scopes: saved_scopes}
     acc = [{test_ast, body_block} | acc]
 
     case orelse do
@@ -161,21 +196,56 @@ defmodule Pylixir.Nodes.If do
 
   defp convert_body_with_acc(body, assigned, context) do
     {asts, context} = Converter.convert_each(body, context)
-    tail = state_tuple_value(assigned)
+    # Use the post-body context: vars bound during this branch
+    # contribute their ref; vars only bound in the *other* branch
+    # default to `nil`. Matches Python's "if-without-else makes the
+    # var None on the falsy path" semantics.
+    tail = state_tuple_value_with_defaults(assigned, context)
     {Converter.body_to_block(asts ++ [tail]), context}
   end
 
-  defp state_tuple_value([single]),
+  # Build the tail-position state-tuple value. For each name in
+  # `assigned`, emit a ref if the name is bound in `context` (either
+  # pre-if or bound by this branch's body); otherwise emit `nil`.
+  defp state_tuple_value_with_defaults([single], context) do
+    if Converter.name_in_scope?(context, single) do
+      {single |> Naming.rewrite() |> String.to_atom(), [], nil}
+    else
+      nil
+    end
+  end
+
+  defp state_tuple_value_with_defaults(names, context) do
+    refs =
+      Enum.map(names, fn n ->
+        if Converter.name_in_scope?(context, n) do
+          {n |> Naming.rewrite() |> String.to_atom(), [], nil}
+        else
+          nil
+        end
+      end)
+
+    Converter.tuple_pattern(refs)
+  end
+
+  # Tail-position fallthroughs (`else_block` in emit_only, the
+  # implicit no-match arm of a cond chain): no branch ran, so each
+  # threaded var defaults to its pre-if binding (if any) or `nil`.
+  defp state_tuple_value(assigned, pre_if_context),
+    do: state_tuple_value_with_defaults(assigned, pre_if_context)
+
+  # Tuple-pattern for the LHS — must always be the bare-ref shape
+  # (Elixir patterns require variables, not `nil` literals as the
+  # leftmost position). This is the existing behaviour kept intact.
+  defp state_tuple_pattern([single]),
     do: {single |> Naming.rewrite() |> String.to_atom(), [], nil}
 
-  defp state_tuple_value(names) do
+  defp state_tuple_pattern(names) do
     refs =
       Enum.map(names, fn n -> {n |> Naming.rewrite() |> String.to_atom(), [], nil} end)
 
     Converter.tuple_pattern(refs)
   end
-
-  defp state_tuple_pattern(names), do: state_tuple_value(names)
 
   defp convert_body_block(stmts, context) do
     {asts, context} = Converter.convert_each(stmts, context)

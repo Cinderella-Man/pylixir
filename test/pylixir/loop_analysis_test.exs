@@ -93,10 +93,14 @@ defmodule Pylixir.LoopAnalysisTest do
       assert vars(analysis) == ["a", "b"]
     end
 
-    test "nested For loop adds the inner loop variable" do
+    test "nested For loop — body assigns are tracked; the loop target is NOT" do
+      # For-loop targets are deliberately excluded (the loop emitter
+      # puts them in an Enum.each / Enum.reduce lambda parameter, which
+      # doesn't escape the loop's scope in Elixir). The body's
+      # `inner_val = j` assign is still tracked.
       inner = for_node(name("j"), [assign(name("inner_val"), name("j"))])
       analysis = LoopAnalysis.analyze([inner])
-      assert vars(analysis) == ["inner_val", "j"]
+      assert vars(analysis) == ["inner_val"]
     end
   end
 
@@ -149,13 +153,15 @@ defmodule Pylixir.LoopAnalysisTest do
       assert vars(analysis) == ["x"]
     end
 
-    test "deeply-nested If/For combo" do
+    test "deeply-nested If/For combo — body assigns kept, loop target dropped" do
+      # As above: `k` is the loop target so it's excluded; `found` is
+      # an Assign deep inside the if-branch body, still tracked.
       inner = assign(name("found"), const(true))
       inner_if = if_node(const(true), [inner])
       inner_for = for_node(name("k"), [inner_if])
       analysis = LoopAnalysis.analyze([inner_for])
 
-      assert vars(analysis) == ["found", "k"]
+      assert vars(analysis) == ["found"]
     end
   end
 end

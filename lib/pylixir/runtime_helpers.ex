@@ -294,6 +294,22 @@ defmodule Pylixir.RuntimeHelpers do
     py_round(x * multiplier) / multiplier
   end
 
+  # === Bisect (sorted-list insertion-point search) ===
+
+  # Mirrors Python's `bisect.bisect_left(a, x)` — index where `x` should
+  # be inserted to keep `a` sorted; for equal values, returns the
+  # leftmost position. O(n) in this implementation (vs O(log n) in
+  # Python's), but iterative Erlang BIFs make the constant low.
+  def py_bisect_left(list, x) when is_list(list) do
+    Enum.find_index(list, fn v -> v >= x end) || length(list)
+  end
+
+  # Mirrors `bisect.bisect_right(a, x)` — rightmost insertion position
+  # for equal values.
+  def py_bisect_right(list, x) when is_list(list) do
+    Enum.find_index(list, fn v -> v > x end) || length(list)
+  end
+
   # === Integer methods ===
 
   # Python's `int.bit_length()` — bits required to represent the int

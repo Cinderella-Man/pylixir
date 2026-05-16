@@ -25,6 +25,16 @@ defmodule Pylixir.Stdlib.SysTest do
       assert Sys.attribute(["nosuchattr"], %{}) == :no_clause
       assert Sys.attribute(["deeply", "nested", "name"], %{}) == :no_clause
     end
+
+    test "sys.stdin.read (bare attribute) lowers to a zero-arg lambda" do
+      assert {:ok, ast} = Sys.attribute(["stdin", "read"], %{})
+      assert match?({:fn, [], [{:->, [], [[], {:py_stdin_read, [], []}]}]}, ast)
+    end
+
+    test "sys.stdin.readline (bare attribute) lowers to a zero-arg lambda" do
+      assert {:ok, ast} = Sys.attribute(["stdin", "readline"], %{})
+      assert match?({:fn, [], [{:->, [], [[], {:py_stdin_readline, [], []}]}]}, ast)
+    end
   end
 
   describe "call/4" do

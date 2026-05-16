@@ -375,6 +375,29 @@ defmodule Pylixir.Converter do
     end
   end
 
+  # f-strings: `f"x={x} y={y}"` lowers to `py_str(x) <> "x=" <> py_str(y) …`.
+  # Each `FormattedValue` becomes `py_str(value)`; plain `Constant`
+  # children stay as their binary value. Format specs are not yet
+  # supported (`f"{x:.2f}"` raises — use `"{:.2f}".format(x)` for now).
+  def convert(%{"_type" => "JoinedStr", "values" => values}, context) do
+    {parts, context} =
+      Enum.reduce(values, {[], context}, fn part, {acc, ctx} ->
+        {ast, ctx} = joined_str_part(part, ctx)
+        {[ast | acc], ctx}
+      end)
+
+    parts = Enum.reverse(parts)
+
+    ast =
+      case parts do
+        [] -> ""
+        [single] -> single
+        [first | rest] -> Enum.reduce(rest, first, fn p, acc -> {:<>, [], [acc, p]} end)
+      end
+
+    {ast, context}
+  end
+
   def convert(%{"_type" => "Constant"} = node, context) do
     case Map.fetch!(node, "value") do
       %{"_unsupported_literal" => kind} = tagged ->
@@ -952,6 +975,33 @@ defmodule Pylixir.Converter do
     n = context.temp_counter
     atom = String.to_atom("py_tmp_#{n}")
     {atom, %{context | temp_counter: n + 1}}
+  end
+
+  # --- JoinedStr (f-string) part dispatch -------------------------------
+
+  defp joined_str_part(%{"_type" => "Constant", "value" => v}, context) when is_binary(v),
+    do: {v, context}
+
+  defp joined_str_part(%{"_type" => "FormattedValue"} = node, context) do
+    if Map.get(node, "format_spec") not in [nil, %{"value" => nil}, %{}],
+      do:
+        raise(UnsupportedNodeError,
+          node_type: "FormattedValue",
+          hint:
+            "f-string format specs (`f\"{x:.2f}\"`) aren't supported yet — use `\"{:.2f}\".format(x)` instead",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+        )
+
+    {value_ast, context} = convert(Map.fetch!(node, "value"), context)
+    {{:py_str, [], [value_ast]}, context}
+  end
+
+  defp joined_str_part(other, _context) do
+    raise UnsupportedNodeError,
+      node_type: "JoinedStr",
+      hint:
+        "unexpected JoinedStr child `#{Map.get(other, "_type")}` — expected Constant or FormattedValue"
   end
 
   # --- Literal-container rejections --------------------------------------

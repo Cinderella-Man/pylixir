@@ -77,9 +77,17 @@ defmodule Pylixir.LoopAnalysis do
     target |> target_names() |> MapSet.new()
   end
 
-  defp names_assigned_in(%{"_type" => "For", "target" => target}) do
-    target |> target_names() |> MapSet.new()
-  end
+  # For-loop targets are *not* added to `assigned_vars`. Pylixir's
+  # for-loop emission (`Pylixir.Nodes.Loop`) puts the target in the
+  # `Enum.each` / `Enum.reduce` callback's parameter — scope-local to
+  # the loop. Threading the target out via a surrounding `if`'s
+  # state-tuple produces `row = if … do … row else row end` where
+  # `row` isn't in the outer Elixir scope (compile error). The
+  # tradeoff: reading the for-loop target *after* the loop in user
+  # code (`for x in xs: pass; print(x)`) was already broken for the
+  # same reason; this just stops manifesting the breakage as a
+  # cryptic if-side compile error.
+  defp names_assigned_in(%{"_type" => "For"}), do: MapSet.new()
 
   defp names_assigned_in(_), do: MapSet.new()
 

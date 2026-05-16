@@ -33,6 +33,16 @@ defmodule Pylixir.Stdlib.Sys do
   def attribute(["stdout"], _node),
     do: {:error, "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}
 
+  # Python lets you bind the method as a value (`f = sys.stdin.read`)
+  # and call it later (`f()`). Emit a zero-arg lambda so the
+  # subsequent call site (`f()` → `f.()`, the in-scope anonymous-call
+  # path) finds something callable.
+  def attribute(["stdin", "read"], _node),
+    do: {:ok, {:fn, [], [{:->, [], [[], {:py_stdin_read, [], []}]}]}}
+
+  def attribute(["stdin", "readline"], _node),
+    do: {:ok, {:fn, [], [{:->, [], [[], {:py_stdin_readline, [], []}]}]}}
+
   def attribute(_path, _node), do: :no_clause
 
   @impl true

@@ -574,10 +574,15 @@ else:
   end
 
   describe "Unsupported nodes raise" do
-    test "f-string raises UnsupportedNodeError" do
+    test "f-string with format spec still raises (bare interpolation now works)" do
       if python_available?() do
+        # Bare interpolation transpiles cleanly now — lowered to `<>` concats.
+        out = Pylixir.transpile(~s(name = "world"\nf"hello, {name}"\n))
+        assert is_binary(out)
+
+        # Format specs (`f"{x:.2f}"`) still raise.
         assert_raise Pylixir.UnsupportedNodeError, fn ->
-          Pylixir.transpile(~s(name = "world"\nf"hello, {name}"\n))
+          Pylixir.transpile(~s(x = 3.14\nf"{x:.2f}"\n))
         end
       end
     end

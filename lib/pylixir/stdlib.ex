@@ -45,6 +45,7 @@ defmodule Pylixir.Stdlib do
             ) :: Pylixir.Lowering.result()
 
   @implementations %{
+    "bisect" => Pylixir.Stdlib.Bisect,
     "math" => Pylixir.Stdlib.Math,
     "sys" => Pylixir.Stdlib.Sys
   }

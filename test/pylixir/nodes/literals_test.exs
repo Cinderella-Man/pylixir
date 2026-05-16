@@ -200,4 +200,59 @@ defmodule Pylixir.Nodes.LiteralsTest do
       assert output =~ "\"max\" => 100"
     end
   end
+
+  # f-strings lower to `<>` concats with each `FormattedValue` wrapped
+  # in `py_str`. Format specs still raise (use `.format()` instead).
+  describe "f-strings (JoinedStr)" do
+    alias Pylixir.TranspileHelpers
+
+    defp run(source) do
+      python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
+
+      case System.cmd(python, ["--version"], stderr_to_stdout: true) do
+        {out, 0} ->
+          if String.starts_with?(out, "Python 3.14") do
+            elixir_src = Pylixir.transpile(source)
+            TranspileHelpers.run_source(elixir_src)
+          else
+            :skip
+          end
+
+        _ ->
+          :skip
+      end
+    rescue
+      ErlangError -> :skip
+    end
+
+    test "single interpolation" do
+      case run("x = 42\nf\"value is {x}\"\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == "value is 42"
+      end
+    end
+
+    test "multi-interpolation with mixed text" do
+      case run("a = 1\nb = 2\nf\"{a} and {b}\"\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == "1 and 2"
+      end
+    end
+
+    test "format spec raises with a clear hint" do
+      python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
+
+      case System.cmd(python, ["--version"], stderr_to_stdout: true) do
+        {out, 0} ->
+          if String.starts_with?(out, "Python 3.14") do
+            assert_raise Pylixir.UnsupportedNodeError, ~r/format/, fn ->
+              Pylixir.transpile("x = 3.14\nf\"{x:.2f}\"\n")
+            end
+          end
+
+        _ ->
+          :ok
+      end
+    end
+  end
 end

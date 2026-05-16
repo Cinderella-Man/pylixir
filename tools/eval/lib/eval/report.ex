@@ -119,10 +119,20 @@ defmodule Eval.Report do
   end
 
   defp build_sample_file(bucket_key, entry) do
+    # Comment-prefix every line of the inspect so multi-line metadata
+    # stays as valid Python (the failure-sample file is meant to be
+    # re-runnable through CPython / Pylixir without manual editing).
+    metadata_lines =
+      entry.metadata
+      |> inspect(pretty: true, limit: :infinity)
+      |> String.split("\n")
+      |> Enum.map_join("\n", &("# " <> &1))
+
     """
     # sample id: #{entry.id}
     # bucket: #{inspect(bucket_key)}
-    # metadata: #{inspect(entry.metadata, pretty: true, limit: :infinity)}
+    # metadata:
+    #{metadata_lines}
 
     #{entry.source}
     """

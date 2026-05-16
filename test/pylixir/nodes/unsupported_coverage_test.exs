@@ -102,10 +102,10 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
   end
 
   describe "RFC §4.4 — f-strings, t-strings, sets, walrus, MatMult" do
-    test "JoinedStr / FormattedValue (f-string)" do
-      # Python emits JoinedStr at the top with FormattedValue inside.
-      # The catch-all hits whichever shape arrives first.
-      assert_raises_unsupported(~s|name = "x"\nf"hi, {name}"\n|, "JoinedStr")
+    test "f-string with a format spec still raises (specs not yet supported)" do
+      # Bare f-strings now lower to `<>` concats; only the format-spec
+      # case (`f"{x:.2f}"`) is still unsupported, with a clearer hint.
+      assert_raises_unsupported(~s|x = 3.14\nf"{x:.2f}"\n|, "FormattedValue")
     end
 
     test "Set literal" do
