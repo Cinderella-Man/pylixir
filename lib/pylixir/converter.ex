@@ -129,7 +129,7 @@ defmodule Pylixir.Converter do
   # `[]`, `deque(iter)` → `Enum.to_list(iter)`). Other collections
   # symbols (Counter, defaultdict, …) fall through to the catch-all.
   def convert(%{"_type" => "ImportFrom", "module" => "collections", "names" => names}, context) do
-    allowed = ~w(deque Counter)
+    allowed = ~w(deque Counter defaultdict)
 
     unknown = Enum.find(names, fn %{"name" => n} -> n not in allowed end)
 
@@ -554,6 +554,50 @@ defmodule Pylixir.Converter do
     context = bind_name(context, id)
     {target_ast, context} = convert(target, context)
     {{:=, [], [target_ast, value_ast]}, context}
+  end
+
+  # `x, y = q.popleft()` — tuple-destructure of the deque-head value.
+  # Same cons-pattern as the Name case, but the head pattern is a
+  # Names-only tuple. (Subscript elements in this position aren't
+  # supported — Python rarely uses them either.)
+  defp single_target_assign(
+         %{"_type" => "Tuple", "elts" => elts},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => coll_id},
+             "attr" => "popleft"
+           },
+           "args" => []
+         },
+         _node,
+         context
+       ) do
+    Enum.each(elts, fn
+      %{"_type" => "Name"} ->
+        :ok
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "Assign",
+          hint:
+            "tuple-destructure of `popleft()` requires all targets to be Name; got `#{Map.get(other, "_type")}`"
+    end)
+
+    context = bind_tuple_names!(elts, context)
+    context = bind_name(context, coll_id)
+
+    refs =
+      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    head_pattern = tuple_pattern(refs)
+    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+    pattern = [{:|, [], [head_pattern, coll_ref]}]
+    {{:=, [], [pattern, coll_ref]}, context}
   end
 
   defp single_target_assign(%{"_type" => "Tuple", "elts" => elts} = target, value, node, context) do
@@ -1041,17 +1085,20 @@ defmodule Pylixir.Converter do
   def tuple_pattern(refs), do: {:{}, [], refs}
 
   @doc false
-  # Python's throwaway `_` — emit Elixir's discard pattern, don't bind
-  # it to scope, don't return it in the `names` list. See `LoopAnalysis`
-  # for the matching exclusion (and the rationale).
-  def convert_loop_target(%{"_type" => "Name", "id" => "_"}, context) do
-    {{:_, [], nil}, [], context}
-  end
-
-  def convert_loop_target(%{"_type" => "Name", "id" => id}, context) do
-    context = bind_name(context, id)
-    atom = id |> Naming.rewrite() |> String.to_atom()
-    {{atom, [], nil}, [id], context}
+  # Python's throwaway names (`_`, `__`, `___`, …) — emit Elixir's
+  # discard pattern, don't bind, don't return in the `names` list.
+  # See `LoopAnalysis.discard_name?/1` for the matching exclusion and
+  # rationale (Elixir's `_` is pattern-only; `__` collides with the
+  # compiler-variable prefix).
+  def convert_loop_target(%{"_type" => "Name", "id" => id}, context)
+      when is_binary(id) and id != "" do
+    if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
+      {{:_, [], nil}, [], context}
+    else
+      context = bind_name(context, id)
+      atom = id |> Naming.rewrite() |> String.to_atom()
+      {{atom, [], nil}, [id], context}
+    end
   end
 
   def convert_loop_target(%{"_type" => "Tuple", "elts" => elts}, context) do
@@ -1059,13 +1106,15 @@ defmodule Pylixir.Converter do
 
     {refs, names, context} =
       Enum.reduce(elts, {[], [], context}, fn
-        %{"_type" => "Name", "id" => "_"}, {refs, names, ctx} ->
-          {[{:_, [], nil} | refs], names, ctx}
-
-        %{"_type" => "Name", "id" => id}, {refs, names, ctx} ->
-          ctx = bind_name(ctx, id)
-          atom = id |> Naming.rewrite() |> String.to_atom()
-          {[{atom, [], nil} | refs], [id | names], ctx}
+        %{"_type" => "Name", "id" => id}, {refs, names, ctx}
+        when is_binary(id) and id != "" ->
+          if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
+            {[{:_, [], nil} | refs], names, ctx}
+          else
+            ctx = bind_name(ctx, id)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            {[{atom, [], nil} | refs], [id | names], ctx}
+          end
 
         other, _acc ->
           raise UnsupportedNodeError,

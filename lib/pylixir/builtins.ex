@@ -32,7 +32,7 @@ defmodule Pylixir.Builtins do
   # calls land here. Backing rep is a plain Elixir list — `append`
   # already works via the mutation-method rewrite; `popleft` is
   # special-cased in `single_target_assign`.
-  @t_collections ~w(deque Counter)
+  @t_collections ~w(deque Counter defaultdict)
 
   @supported MapSet.new(
                @t25a ++
@@ -240,6 +240,15 @@ defmodule Pylixir.Builtins do
 
   def emit("Counter", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [], [x]}}
+
+  # `defaultdict(factory)` — Elixir doesn't track the factory, so we
+  # emit a plain `%{}` and rely on `py_getitem` returning `nil` for
+  # missing keys + `py_add(nil, x)` treating `nil` as 0. Works for
+  # `d[k] += 1` (the dominant idiom). For factory=list, the user must
+  # use `d.get(k, [])` since `py_add(nil, list)` doesn't infer the
+  # empty-list identity.
+  def emit("defaultdict", [_factory], _kw), do: {:ok, {:%{}, [], []}}
+  def emit("defaultdict", [], _kw), do: {:ok, {:%{}, [], []}}
 
   # --- T26 type checks ---------------------------------------------------
 

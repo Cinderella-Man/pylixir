@@ -44,6 +44,13 @@ defmodule Pylixir.RuntimeHelpers do
   def py_bool_to_int(false), do: 0
   def py_bool_to_int(x), do: x
 
+  # `nil`-tolerant clauses enable the `defaultdict(int)` idiom — see
+  # the comment on `py_getitem` for maps. `nil` acts as the additive
+  # identity: `nil + n = n`, `s + nil = s`. Without this, `d[k] += 1`
+  # on a missing key would crash with `nil + 1` ArithmeticError.
+  def py_add(nil, b), do: b
+  def py_add(a, nil), do: a
+
   def py_add(a, b) when is_boolean(a), do: py_add(py_bool_to_int(a), b)
   def py_add(a, b) when is_boolean(b), do: py_add(a, py_bool_to_int(b))
   def py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
@@ -166,7 +173,15 @@ defmodule Pylixir.RuntimeHelpers do
   def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
   def py_getitem(c, k) when is_tuple(c) and k >= 0, do: elem(c, k)
   def py_getitem(c, k) when is_tuple(c), do: elem(c, tuple_size(c) + k)
-  def py_getitem(c, k) when is_map(c), do: Map.fetch!(c, k)
+  # Maps: return `nil` for missing keys (not `Map.fetch!`/raise). This
+  # enables the `defaultdict(int)`-style idiom `d[k] += 1` to work
+  # against a regular `%{}` — `py_add(nil, …)` treats `nil` as the
+  # additive identity. Trade-off: legitimate missing-key bugs against
+  # plain dicts surface later (as `nil` propagating) rather than as
+  # an immediate `KeyError`. Python uses `dict.get(k, default)` for
+  # the default-aware read, and Pylixir's `.get` clause routes to
+  # `Map.get` already — those callers are unaffected.
+  def py_getitem(c, k) when is_map(c), do: Map.get(c, k)
 
   def py_setitem(c, k, v) when is_list(c), do: List.replace_at(c, k, v)
   def py_setitem(c, k, v) when is_map(c), do: Map.put(c, k, v)
@@ -311,6 +326,30 @@ defmodule Pylixir.RuntimeHelpers do
     do: MapSet.union(MapSet.difference(a, b), MapSet.difference(b, a))
 
   def py_bxor(a, b), do: Bitwise.bxor(a, b)
+
+  # === itertools.combinations ===
+
+  # Mirrors Python's `itertools.combinations(iter, r)` — every r-length
+  # subset of `iter` in lexicographic order. Returns lists rather than
+  # tuples (Python returns tuples, but every common downstream use —
+  # `set(combo)`, `for x in combo`, `combo[i]` — works equivalently
+  # on lists in Pylixir's lowering).
+  def py_combinations(enum, r) when is_integer(r) and r >= 0 do
+    list = if is_list(enum), do: enum, else: Enum.to_list(enum)
+    py_combinations_inner(list, r)
+  end
+
+  # Recursive inner — public `def` (not `defp`) to keep the
+  # all-defs-no-defps invariant the helpers-codegen sentinel relies
+  # on. Unused `def`s don't warn; unused `defp`s would.
+  def py_combinations_inner(_, 0), do: [[]]
+  def py_combinations_inner([], _), do: []
+
+  def py_combinations_inner([h | t], r) do
+    with_h = Enum.map(py_combinations_inner(t, r - 1), &[h | &1])
+    without_h = py_combinations_inner(t, r)
+    with_h ++ without_h
+  end
 
   # === Bisect (sorted-list insertion-point search) ===
 

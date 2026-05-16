@@ -44,6 +44,12 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # has integer guards so non-integer targets crash visibly.
   @int_methods ~w(bit_length)
 
+  # Methods on Python's `set` / `frozenset` — Elixir's MapSet provides
+  # exact equivalents. Same ducktyping caveat: non-MapSet targets
+  # crash at runtime.
+  @set_methods ~w(union intersection difference symmetric_difference
+                  issubset issuperset isdisjoint)
+
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
     do_dispatch(attr, target_ast, arg_asts, kwargs, node)
@@ -61,6 +67,34 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("bit_length", target, [], _kw, _node),
     do: {:py_int_bit_length, [], [target]}
+
+  # --- Set methods (Python set / frozenset → Elixir MapSet) -------------
+
+  defp do_dispatch("union", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}
+
+  defp do_dispatch("intersection", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :intersection]}, [], [target, other]}
+
+  defp do_dispatch("difference", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [target, other]}
+
+  defp do_dispatch("symmetric_difference", target, [other], _kw, _node) do
+    # MapSet has no direct symmetric_difference; compose via two
+    # differences + union (same as the `py_bxor` helper's set arm).
+    diff_ab = {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [target, other]}
+    diff_ba = {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [other, target]}
+    {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [diff_ab, diff_ba]}
+  end
+
+  defp do_dispatch("issubset", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :subset?]}, [], [target, other]}
+
+  defp do_dispatch("issuperset", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :subset?]}, [], [other, target]}
+
+  defp do_dispatch("isdisjoint", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :disjoint?]}, [], [target, other]}
 
   # --- String formatting -------------------------------------------------
 
@@ -227,7 +261,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
     raise UnsupportedNodeError,
       node_type: "Call",
       hint:
-        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods ++ @int_methods, ", ")})",
+        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods ++ @int_methods ++ @set_methods, ", ")})",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end

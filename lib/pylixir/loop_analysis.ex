@@ -143,16 +143,16 @@ defmodule Pylixir.LoopAnalysis do
 
   defp names_assigned_in(_), do: MapSet.new()
 
-  # Python's idiomatic throwaway `_` is *not* tracked as an assigned
-  # name. Elixir's `_` is pattern-only — it can't appear in expression
-  # position — so threading it through a surrounding state tuple (when
-  # the for-loop sits inside an `if`) generates code the Elixir parser
-  # rejects. Treating `_` as discard everywhere matches the Python
-  # convention; reading `_` after a loop is rare and would surface as
-  # a clear "undefined variable" instead of the cryptic
-  # "invalid use of _" error.
-  defp target_names(%{"_type" => "Name", "id" => "_"}), do: []
-  defp target_names(%{"_type" => "Name", "id" => id}), do: [id]
+  # Python's idiomatic throwaway names (`_`, `__`, `___`, …) are *not*
+  # tracked as assigned. `_` is Elixir's pattern-only discard; `__`
+  # (and any `__<X>__` shape) collides with Elixir's compiler-variable
+  # prefix (`__MODULE__`, `__ENV__`, …). Threading any of these out
+  # via a surrounding state tuple generates code Elixir's parser
+  # rejects. Reading them after a loop is rare and would surface as a
+  # clear "undefined variable" instead of the cryptic Elixir error.
+  defp target_names(%{"_type" => "Name", "id" => id}) do
+    if discard_name?(id), do: [], else: [id]
+  end
 
   defp target_names(%{"_type" => "Tuple", "elts" => elts}),
     do: Enum.flat_map(elts, &target_names/1)
@@ -169,4 +169,10 @@ defmodule Pylixir.LoopAnalysis do
   defp root_name(%{"_type" => "Subscript", "value" => v}), do: root_name(v)
   defp root_name(%{"_type" => "Attribute", "value" => v}), do: root_name(v)
   defp root_name(_), do: nil
+
+  # `_`, `__`, `___`, …  — all-underscore names are Python's throwaway
+  # convention and would all break Elixir's parser in different ways
+  # (bare `_` is pattern-only; `__` collides with `__MODULE__` etc.).
+  defp discard_name?(id) when is_binary(id),
+    do: id != "" and String.to_charlist(id) |> Enum.all?(&(&1 == ?_))
 end
