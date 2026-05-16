@@ -503,6 +503,32 @@ defmodule Pylixir.Converter do
     {{:=, [], [coll_ast, setitem]}, context}
   end
 
+  # Nested-subscript assign: `m[a][b]...[z] = v` where the chain bottoms
+  # out at a bare Name. Rebind the root via nested `py_setitem` /
+  # `py_getitem`. Each slice is temp-bound for single-eval; the root
+  # itself is always a Name so it's trivially re-readable. Chains that
+  # bottom out at anything else (Attribute, Call, …) fall through to
+  # the catch-all.
+  defp single_target_assign(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Subscript"}} = target,
+         value,
+         node,
+         context
+       ) do
+    case nested_subscript_chain(target, []) do
+      {:ok, coll_id, slices} ->
+        emit_nested_subscript_assign(coll_id, slices, value, context)
+
+      :error ->
+        raise UnsupportedNodeError,
+          node_type: "Assign",
+          hint:
+            "Nested-subscript assign `<#{target_root_type(target)}>[…][…] = v` is not supported — only chains rooted at a bare Name are",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
   defp single_target_assign(target, _value, node, _context) do
     raise UnsupportedNodeError,
       node_type: "Assign",
@@ -559,6 +585,60 @@ defmodule Pylixir.Converter do
           hint:
             "tuple-Assign target requires all elements to be `Name` nodes; got `#{Map.get(other, "_type")}`"
     end)
+  end
+
+  # Walk a Subscript chain ending at a bare Name. Returns
+  # `{:ok, root_id, slices_outermost_first}` or `:error` if the chain
+  # bottoms out at something other than a Name (Attribute, Call, etc.).
+  defp nested_subscript_chain(%{"_type" => "Subscript", "value" => v, "slice" => s}, acc) do
+    case v do
+      %{"_type" => "Name", "id" => id} -> {:ok, id, [s | acc]}
+      %{"_type" => "Subscript"} = inner -> nested_subscript_chain(inner, [s | acc])
+      _ -> :error
+    end
+  end
+
+  defp target_root_type(%{"_type" => "Subscript", "value" => v}), do: target_root_type(v)
+  defp target_root_type(%{"_type" => t}), do: t
+
+  # `m[a][b]...[z] = v` → rebind `m` to a deeply-rebuilt copy.
+  # Two-deep example: `m[a][b] = v` lowers to
+  #   m = py_setitem(m, a, py_setitem(py_getitem(m, a), b, v))
+  # The slices are temp-bound first to preserve Python's single-eval
+  # semantics; the root is a bare Name so re-reading it is safe.
+  defp emit_nested_subscript_assign(coll_id, slices, value, context) do
+    {value_ast, context} = convert(value, context)
+    {coll_ast, context} = convert(%{"_type" => "Name", "id" => coll_id}, context)
+
+    {slice_refs, bindings, context} =
+      Enum.reduce(slices, {[], [], context}, fn slice_node, {refs, binds, ctx} ->
+        {ref, binding, ctx} = maybe_temp_bind(slice_node, ctx)
+        binds = if binding, do: [binding | binds], else: binds
+        {[ref | refs], binds, ctx}
+      end)
+
+    slice_refs = Enum.reverse(slice_refs)
+    bindings = Enum.reverse(bindings)
+
+    new_value = build_nested_setitem(coll_ast, slice_refs, value_ast)
+    context = bind_name(context, coll_id)
+
+    assign = {:=, [], [coll_ast, new_value]}
+
+    case bindings do
+      [] -> {assign, context}
+      _ -> {{:__block__, [], bindings ++ [assign]}, context}
+    end
+  end
+
+  defp build_nested_setitem(coll_ast, [last_slice], value_ast) do
+    {:py_setitem, [], [coll_ast, last_slice, value_ast]}
+  end
+
+  defp build_nested_setitem(coll_ast, [s | rest], value_ast) do
+    inner_get = {:py_getitem, [], [coll_ast, s]}
+    inner_set = build_nested_setitem(inner_get, rest, value_ast)
+    {:py_setitem, [], [coll_ast, s, inner_set]}
   end
 
   @doc false

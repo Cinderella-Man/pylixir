@@ -98,12 +98,34 @@ defmodule Pylixir.Nodes.AssignTest do
       assert MapSet.member?(hd(ctx.scopes), "lst")
     end
 
-    test "non-Name-rooted subscript target raises (T14 territory)" do
-      # A Subscript whose collection is itself a Subscript: nested.
+    test "Name-rooted nested subscript target — `matrix[0][0] = 5` rebuilds via nested py_setitem" do
+      # `matrix[0][0] = 5` lowers to
+      #   matrix = py_setitem(matrix, 0, py_setitem(py_getitem(matrix, 0), 0, 5))
       inner = %{"_type" => "Subscript", "value" => name("matrix"), "slice" => const(0)}
       target = %{"_type" => "Subscript", "value" => inner, "slice" => const(0)}
 
-      assert_raise UnsupportedNodeError, ~r/Subscript/, fn ->
+      {ast, ctx} =
+        Converter.convert(assign([target], const(5)), Context.new())
+
+      matrix = {:matrix, [], nil}
+
+      assert ast ==
+               {:=, [],
+                [
+                  matrix,
+                  {:py_setitem, [], [matrix, 0, {:py_setitem, [], [{:py_getitem, [], [matrix, 0]}, 0, 5]}]}
+                ]}
+
+      assert MapSet.member?(hd(ctx.scopes), "matrix")
+    end
+
+    test "non-Name-rooted nested subscript (`obj.attr[i][j] = v`) still raises" do
+      # The chain bottoms out at an Attribute, not a Name.
+      attr = %{"_type" => "Attribute", "value" => name("obj"), "attr" => "field"}
+      inner = %{"_type" => "Subscript", "value" => attr, "slice" => const(0)}
+      target = %{"_type" => "Subscript", "value" => inner, "slice" => const(0)}
+
+      assert_raise UnsupportedNodeError, ~r/Nested-subscript/, fn ->
         Converter.convert(assign([target], const(5)), Context.new())
       end
     end
