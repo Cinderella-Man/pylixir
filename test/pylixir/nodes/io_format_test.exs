@@ -45,7 +45,7 @@ defmodule Pylixir.Nodes.IoFormatTest do
     end
 
     test "print with end kwarg" do
-      case run("print(\"hi\", end=\"!\")\n") do
+      case run(~s|print("hi", end="!")\n|) do
         :skip -> :ok
         {_, _, stdout, _} -> assert stdout == "hi!"
       end

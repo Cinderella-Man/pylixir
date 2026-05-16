@@ -22,8 +22,7 @@ defmodule Pylixir.Stdlib.Math do
 
   def attribute([attr], _node) when attr in @unsupported_attrs,
     do:
-      {:error,
-       "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)"}
+      {:error, "`math.#{attr}` is not supported — Elixir has no inf/nan equivalents (RFC §6.19)"}
 
   def attribute(_path, _node), do: :no_clause
 

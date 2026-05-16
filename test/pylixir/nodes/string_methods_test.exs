@@ -52,21 +52,21 @@ defmodule Pylixir.Nodes.StringMethodsTest do
     end
 
     test "startswith" do
-      case run("\"hello\".startswith(\"he\")\n") do
+      case run(~s|"hello".startswith("he")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == true
       end
     end
 
     test "endswith — negative case" do
-      case run("\"hello\".endswith(\"xx\")\n") do
+      case run(~s|"hello".endswith("xx")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == false
       end
     end
 
     test "sep.join (RFC §10.1 arg-swap)" do
-      case run("\"-\".join([\"a\", \"b\", \"c\"])\n") do
+      case run(~s|"-".join(["a", "b", "c"])\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == "a-b-c"
       end
@@ -82,42 +82,42 @@ defmodule Pylixir.Nodes.StringMethodsTest do
     end
 
     test "split with sep" do
-      case run("\"a,b,c\".split(\",\")\n") do
+      case run(~s|"a,b,c".split(",")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == ["a", "b", "c"]
       end
     end
 
     test "replace" do
-      case run("\"hello world\".replace(\"world\", \"Elixir\")\n") do
+      case run(~s|"hello world".replace("world", "Elixir")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == "hello Elixir"
       end
     end
 
     test "find present" do
-      case run("\"hello\".find(\"ll\")\n") do
+      case run(~s|"hello".find("ll")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 2
       end
     end
 
     test "find absent → -1" do
-      case run("\"hello\".find(\"zz\")\n") do
+      case run(~s|"hello".find("zz")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == -1
       end
     end
 
     test "count" do
-      case run("\"banana\".count(\"a\")\n") do
+      case run(~s|"banana".count("a")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 3
       end
     end
 
     test "index found" do
-      case run("\"hello\".index(\"ll\")\n") do
+      case run(~s|"hello".index("ll")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 2
       end
@@ -167,7 +167,7 @@ defmodule Pylixir.Nodes.StringMethodsTest do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
             assert_raise Pylixir.UnsupportedNodeError, ~r/multi-char/, fn ->
-              Pylixir.transpile("\"abc\".strip(\"ab\")\n")
+              Pylixir.transpile(~s|"abc".strip("ab")\n|)
             end
           end
 
@@ -183,7 +183,7 @@ defmodule Pylixir.Nodes.StringMethodsTest do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
             assert_raise Pylixir.UnsupportedNodeError, ~r/split/, fn ->
-              Pylixir.transpile("\"abc\".split(\"\")\n")
+              Pylixir.transpile(~s|"abc".split("")\n|)
             end
           end
 

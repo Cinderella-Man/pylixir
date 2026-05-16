@@ -23,8 +23,8 @@ defmodule Pylixir.Nodes.Mutations do
   """
   @spec detect(map()) ::
           :none
-          | {target :: String.t(), method :: String.t(), args :: [map()],
-             kwargs :: [map()], source :: map()}
+          | {target :: String.t(), method :: String.t(), args :: [map()], kwargs :: [map()],
+             source :: map()}
   def detect(
         %{
           "_type" => "Call",

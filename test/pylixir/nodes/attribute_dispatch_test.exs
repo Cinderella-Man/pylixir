@@ -24,14 +24,14 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
 
   describe "Dict methods (T28)" do
     test "d.keys()" do
-      case run("d = {\"a\": 1, \"b\": 2}\nd.keys()\n") do
+      case run(~s|d = {"a": 1, "b": 2}\nd.keys()\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert Enum.sort(value) == ["a", "b"]
       end
     end
 
     test "d.values()" do
-      case run("d = {\"a\": 1, \"b\": 2}\nd.values()\n") do
+      case run(~s|d = {"a": 1, "b": 2}\nd.values()\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert Enum.sort(value) == [1, 2]
       end
@@ -45,7 +45,7 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
     end
 
     test "d.get(k) — present" do
-      case run("d = {\"a\": 1}\nd.get(\"a\")\n") do
+      case run(~s|d = {"a": 1}\nd.get("a")\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 1
       end
@@ -59,7 +59,7 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
     end
 
     test "d.get(k, default) — present" do
-      case run("d = {\"a\": 1}\nd.get(\"a\", 0)\n") do
+      case run(~s|d = {"a": 1}\nd.get("a", 0)\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == 1
       end
@@ -120,7 +120,7 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
             assert_raise Pylixir.UnsupportedNodeError, ~r/\.format/, fn ->
-              Pylixir.transpile("\"hi\".format(\"x\")\n")
+              Pylixir.transpile(~s|"hi".format("x")\n|)
             end
           end
 

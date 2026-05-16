@@ -88,6 +88,11 @@ defmodule Pylixir.HelpersCodegen do
   resolves to a real helper — a typo or rename surfaces at Pylixir's
   test time rather than in user code at runtime.
   """
-  @spec helper_names() :: MapSet.t({atom(), non_neg_integer()})
+  # `MapSet` is opaque; the compile-time fold materialises its internal
+  # `%MapSet{:map => %{tuple => []}}` shape and Dialyzer's success
+  # typing then refuses to widen back to the opaque `MapSet.t()`. The
+  # value *is* a MapSet at runtime — this is a known false positive.
+  @dialyzer {:nowarn_function, helper_names: 0}
+  @spec helper_names() :: MapSet.t()
   def helper_names, do: @helper_names
 end

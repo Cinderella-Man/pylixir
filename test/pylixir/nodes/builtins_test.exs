@@ -150,7 +150,7 @@ defmodule Pylixir.Nodes.BuiltinsTest do
   # variable. See lib/pylixir/builtins.ex `@unary_capturable`.
   describe "bare builtin references (unary capture)" do
     test "map(int, [...]) coerces decimal strings" do
-      case run("(list(map(int, [\"1\", \"2\", \"3\", \"4\"])))\n") do
+      case run(~s|(list(map(int, ["1", "2", "3", "4"])))\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == [1, 2, 3, 4]
       end

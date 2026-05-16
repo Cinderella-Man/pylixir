@@ -19,7 +19,12 @@ defmodule Pylixir.LoweringTest do
     test "{:error, hint} raises UnsupportedNodeError with that hint" do
       err =
         assert_raise UnsupportedNodeError, fn ->
-          Lowering.dispatch({:error, "math.inf has no Elixir equivalent"}, "ignored", py_node("Attribute"), %{})
+          Lowering.dispatch(
+            {:error, "math.inf has no Elixir equivalent"},
+            "ignored",
+            py_node("Attribute"),
+            %{}
+          )
         end
 
       assert err.node_type == "Attribute"

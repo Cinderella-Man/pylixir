@@ -105,7 +105,7 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
     test "JoinedStr / FormattedValue (f-string)" do
       # Python emits JoinedStr at the top with FormattedValue inside.
       # The catch-all hits whichever shape arrives first.
-      assert_raises_unsupported("name = \"x\"\nf\"hi, {name}\"\n", "JoinedStr")
+      assert_raises_unsupported(~s|name = "x"\nf"hi, {name}"\n|, "JoinedStr")
     end
 
     test "Set literal" do

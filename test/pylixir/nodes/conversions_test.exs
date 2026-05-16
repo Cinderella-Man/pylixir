@@ -94,8 +94,8 @@ defmodule Pylixir.Nodes.ConversionsTest do
       end
     end
 
-    test "dict([(\"a\", 1), (\"b\", 2)])" do
-      case run("dict([(\"a\", 1), (\"b\", 2)])\n") do
+    test ~s|dict([("a", 1), ("b", 2)])| do
+      case run(~s|dict([("a", 1), ("b", 2)])\n|) do
         :skip -> :ok
         {_, value, _, _} -> assert value == %{"a" => 1, "b" => 2}
       end

@@ -628,7 +628,6 @@ defmodule Pylixir.Converter do
     {{:=, [], [coll_ref, setitem]}, context}
   end
 
-
   @doc false
   def var_bound?(context, var) do
     Enum.any?(context.scopes, &MapSet.member?(&1, var))
@@ -737,7 +736,6 @@ defmodule Pylixir.Converter do
         {Nodes.AttributeMethods.dispatch(attr, target_ast, arg_asts, kwargs, node), context}
     end
   end
-
 
   # Walk an Attribute chain; if the root is a Name matching a registered
   # `Pylixir.Stdlib` module, return `{:ok, mod_name, attr_path}` where

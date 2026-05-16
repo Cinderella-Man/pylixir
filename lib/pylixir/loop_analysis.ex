@@ -31,6 +31,11 @@ defmodule Pylixir.LoopAnalysis do
 
   alias Pylixir.AST.Walk
 
+  # MapSet is `@opaque`; Dialyzer can't trace that values folded through
+  # `Enum.reduce` + `MapSet.union/2` still satisfy the opaque contract.
+  # The values *are* MapSets at runtime — this is a known false positive.
+  @dialyzer {:nowarn_function, analyze: 1}
+
   @type t :: %__MODULE__{
           assigned_vars: MapSet.t(String.t()),
           referenced_vars: MapSet.t(String.t())

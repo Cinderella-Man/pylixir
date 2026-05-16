@@ -19,6 +19,13 @@ defmodule Pylixir.Nodes.If do
 
   alias Pylixir.{Converter, LoopAnalysis, Naming}
 
+  # MapSet is `@opaque`; Dialyzer can't trace that values built by
+  # `MapSet.new/0` + `LoopAnalysis.analyze(...).assigned_vars` still
+  # satisfy the opaque contract through these helpers. The values *are*
+  # MapSets at runtime — the warning is a known false positive.
+  @dialyzer {:nowarn_function,
+             collect_cond_assigned: 3, cond_assigned_vars: 3, if_assigned_vars: 2}
+
   @spec emit_only(map(), [map()], Pylixir.Context.t()) ::
           {Macro.t(), Pylixir.Context.t()}
   def emit_only(test, body, context) do

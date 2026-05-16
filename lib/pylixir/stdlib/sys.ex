@@ -29,9 +29,7 @@ defmodule Pylixir.Stdlib.Sys do
        "bare `sys.stdin` is not supported — use `sys.stdin.read()` to consume all of stdin as a string"}
 
   def attribute(["stdout"], _node),
-    do:
-      {:error,
-       "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}
+    do: {:error, "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}
 
   def attribute(_path, _node), do: :no_clause
 

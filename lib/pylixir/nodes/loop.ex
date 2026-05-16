@@ -28,7 +28,21 @@ defmodule Pylixir.Nodes.Loop do
   live on `Pylixir.Converter`.
   """
 
-  alias Pylixir.{AST.Walk, Context, ControlFlow, Converter, LoopAnalysis, Naming, UnsupportedNodeError}
+  alias Pylixir.{
+    AST.Walk,
+    Context,
+    ControlFlow,
+    Converter,
+    LoopAnalysis,
+    Naming,
+    UnsupportedNodeError
+  }
+
+  # MapSet is `@opaque`; Dialyzer can't trace that the value built from
+  # `Walk.walk_scope/3` (started with `MapSet.new/0`) still satisfies
+  # the opaque contract by the time it reaches `MapSet.union/2`. Runtime
+  # type is correct — this is a known false positive.
+  @dialyzer {:nowarn_function, emit_while: 2}
 
   # --- Public entry points -----------------------------------------------
 
