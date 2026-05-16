@@ -63,4 +63,31 @@ defmodule Pylixir.HelpersCodegen do
   """
   @spec helpers_ast() :: [Macro.t()]
   def helpers_ast, do: @helpers_ast
+
+  # Compute the set of `{name, arity}` pairs at Pylixir's compile time so
+  # the linkage check (see `test/pylixir/helpers_linkage_test.exs`) costs
+  # nothing at runtime. Helpers with a `when` guard wrap the head in
+  # `{:when, _, [{name, _, args}, guard]}` — unwrap before extracting.
+  @helper_names @helpers_ast
+                |> Enum.map(fn {:def, _, [head, _body_kw]} ->
+                  {name, args} =
+                    case head do
+                      {:when, _, [{n, _, a}, _guard]} -> {n, a}
+                      {n, _, a} -> {n, a}
+                    end
+
+                  arity = if is_list(args), do: length(args), else: 0
+                  {name, arity}
+                end)
+                |> MapSet.new()
+
+  @doc """
+  Set of `{name, arity}` pairs for every helper spliced into the
+  generated module. Used by the helpers-linkage test to verify that
+  every `py_*` reference emitted by `Pylixir.Builtins` / `Pylixir.Stdlib.*`
+  resolves to a real helper — a typo or rename surfaces at Pylixir's
+  test time rather than in user code at runtime.
+  """
+  @spec helper_names() :: MapSet.t({atom(), non_neg_integer()})
+  def helper_names, do: @helper_names
 end

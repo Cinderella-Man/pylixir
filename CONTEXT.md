@@ -58,7 +58,14 @@ shape Pylixir emits. Owns helpers, module attrs, defp's, and the
 **Helper** — A `py_*` function spliced into every generated module so
 the output is self-contained. Source of truth is
 `Pylixir.RuntimeHelpers`; baked into `@helpers_source` by
-`Pylixir.HelpersCodegen` at Pylixir's own compile time.
+`Pylixir.HelpersCodegen` at Pylixir's own compile time. The
+`py_*` prefix is the load-bearing emission namespace: any AST tuple
+literal `{:py_*, [], args}` appearing in `Pylixir.Builtins`,
+`Pylixir.Converter`, or a `Pylixir.Stdlib` impl must resolve to a
+helper of matching arity. The helpers-linkage test
+(`test/pylixir/helpers_linkage_test.exs`) enforces this statically via
+`HelpersCodegen.helper_names/0`, so a rename or typo surfaces at
+Pylixir's test time rather than in user code at runtime.
 
 **Entry point** — The `def py_main` function at the bottom of the
 wrapper. `py_main` because the `py_` prefix is protected by T07's
