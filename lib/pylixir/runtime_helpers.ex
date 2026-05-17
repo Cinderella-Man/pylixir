@@ -305,6 +305,25 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str_count(s, ""), do: String.length(s) + 1
   def py_str_count(s, sub), do: length(String.split(s, sub)) - 1
 
+  # Python's `str.splitlines()` — split on \r\n / \r / \n; trailing
+  # newline doesn't create an empty trailing entry. Empty input → [].
+  def py_str_splitlines(""), do: []
+
+  def py_str_splitlines(s) when is_binary(s) do
+    s
+    |> String.replace(~r/\r\n|\r/, "\n")
+    |> String.split("\n")
+    |> drop_trailing_empty()
+  end
+
+  def drop_trailing_empty([]), do: []
+  def drop_trailing_empty(list) do
+    case List.last(list) do
+      "" -> Enum.slice(list, 0, length(list) - 1)
+      _ -> list
+    end
+  end
+
   def py_str_index(s, sub) do
     case py_str_find(s, sub) do
       -1 -> raise RuntimeError, "substring not found"
@@ -435,6 +454,67 @@ defmodule Pylixir.RuntimeHelpers do
       rest = List.delete_at(list, i)
       Enum.map(py_permutations_inner(rest, r - 1), &[h | &1])
     end)
+  end
+
+  # === Math (extended) ===
+
+  # Python's `math.comb(n, k)` — binomial coefficient. Multiplicative
+  # formula (avoids huge factorials): C(n, k) = product_{i=1..k} (n-k+i) / i.
+  # Returns 0 when k > n or k < 0 (matches Python).
+  def py_math_comb(n, k) when is_integer(n) and is_integer(k) do
+    cond do
+      k < 0 or k > n -> 0
+      k == 0 or k == n -> 1
+      true -> py_math_comb_loop(n, min(k, n - k), 1, 1)
+    end
+  end
+
+  def py_math_comb_loop(_n, 0, acc, _i), do: acc
+
+  def py_math_comb_loop(n, k, acc, i) do
+    acc = div(acc * (n - i + 1), i)
+    py_math_comb_loop(n, k - 1, acc, i + 1)
+  end
+
+  # Python's `math.factorial(n)`. BEAM integers are arbitrary-precision;
+  # no overflow risk. Negative input raises (mirrors Python's ValueError).
+  def py_math_factorial(0), do: 1
+  def py_math_factorial(n) when is_integer(n) and n > 0,
+    do: Enum.reduce(1..n, 1, &(&1 * &2))
+
+  # Variadic `math.hypot(*coords)` — Euclidean norm sqrt(sum(xi**2)).
+  # Caller wraps args in a list literal; we reduce + sqrt.
+  def py_math_hypot(coords) when is_list(coords) do
+    sum = Enum.reduce(coords, 0.0, fn x, acc -> acc + x * x end)
+    :math.sqrt(sum)
+  end
+
+  # === Slice assignment ===
+
+  # `coll[start:stop:step] = new_seq` — replace the elements at the
+  # stepped index sequence with `new_seq`. Without a step (step == nil
+  # or 1), the slice is contiguous and `new_seq` length doesn't have
+  # to match — extra elements extend, shorter shrinks. With a step,
+  # `len(new_seq)` MUST equal the slice's index count (Python raises
+  # ValueError otherwise — we mirror by overwriting positionwise).
+  def py_slice_assign(list, start, stop, step, new_seq) when is_list(list) do
+    step_v = step || 1
+    len = length(list)
+    new_seq_list = if is_list(new_seq), do: new_seq, else: Enum.to_list(new_seq)
+
+    if step_v == 1 do
+      {s, e} = py_slice_bounds(start, stop, 1, len)
+      Enum.take(list, s) ++ new_seq_list ++ Enum.drop(list, e)
+    else
+      {s, e} = py_slice_bounds(start, stop, step_v, len)
+      indices = py_slice_indices(s, e, step_v)
+      py_slice_assign_stepped(list, indices, new_seq_list)
+    end
+  end
+
+  def py_slice_assign_stepped(list, indices, new_seq) do
+    pairs = Enum.zip(indices, new_seq) |> Map.new()
+    Enum.with_index(list, fn x, i -> Map.get(pairs, i, x) end)
   end
 
   # === Bisect (sorted-list insertion-point search) ===

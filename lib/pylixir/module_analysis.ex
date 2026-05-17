@@ -154,9 +154,30 @@ defmodule Pylixir.ModuleAnalysis do
     if MapSet.size(mutable_names) == 0 do
       {fns, []}
     else
+      # Fix-point: a function that references *another* demoted function
+      # must itself be demoted (the demoted callee only exists inside
+      # py_main's scope, so a `defp` caller can't reach it).
+      do_demote_fixpoint(fns, mutable_names)
+    end
+  end
+
+  defp do_demote_fixpoint(fns, names) do
+    {kept, demoted} =
       Enum.split_with(fns, fn fn_node ->
-        not function_uses_any?(fn_node, mutable_names)
+        not function_uses_any?(fn_node, names)
       end)
+
+    case demoted do
+      [] ->
+        {kept, []}
+
+      _ ->
+        # Add the newly-demoted names to the closure-binding set and
+        # iterate over the remaining kept fns. Stop when no new fns
+        # demote in a pass.
+        names = Enum.reduce(demoted, names, fn fn_node, acc -> MapSet.put(acc, fn_node["name"]) end)
+        {kept_final, demoted_rest} = do_demote_fixpoint(kept, names)
+        {kept_final, demoted ++ demoted_rest}
     end
   end
 

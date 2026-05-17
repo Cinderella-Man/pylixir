@@ -152,10 +152,13 @@ defmodule Pylixir.Converter do
   # lambda that delegates to the matching `Pylixir.Stdlib.Math` AST.
   # Subsequent calls go through the in-scope-anonymous-call path
   # (`gcd.(t, n)` etc.). Unsupported math names raise.
-  def convert(%{"_type" => "ImportFrom", "module" => "math", "names" => names}, context) do
+  def convert(%{"_type" => "ImportFrom", "module" => mod, "names" => names} = node, context)
+      when mod in ~w(math sys bisect heapq itertools) do
     {stmts, context} =
-      Enum.reduce(names, {[], context}, fn %{"name" => n}, {acc, ctx} ->
-        {stmt, ctx} = math_import_alias(n, ctx)
+      Enum.reduce(names, {[], context}, fn entry, {acc, ctx} ->
+        n = entry["name"]
+        alias = entry["asname"] || n
+        {stmt, ctx} = stdlib_from_import_alias(mod, n, alias, ctx, node)
         {[stmt | acc], ctx}
       end)
 
@@ -876,12 +879,29 @@ defmodule Pylixir.Converter do
          _node,
          context
        ) do
-    {value_ast, context} = convert(value, context)
-    {slice_ast, context} = convert(slice, context)
-    {coll_ast, context} = convert(collection, context)
-    setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
-    context = bind_name(context, coll_id)
-    {{:=, [], [coll_ast, setitem]}, context}
+    case slice do
+      # Slice-assignment: `coll[start:stop:step] = new_seq`. Lowers to a
+      # rebind of `coll` via `py_slice_assign` (handles both stepped and
+      # contiguous cases — len(new_seq) != slice_len is allowed only
+      # without a step, per Python semantics).
+      %{"_type" => "Slice"} = slice_node ->
+        {value_ast, context} = convert(value, context)
+        {start_ast, context} = convert_optional(Map.get(slice_node, "lower"), context)
+        {stop_ast, context} = convert_optional(Map.get(slice_node, "upper"), context)
+        {step_ast, context} = convert_optional(Map.get(slice_node, "step"), context)
+        {coll_ast, context} = convert(collection, context)
+        rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
+        context = bind_name(context, coll_id)
+        {{:=, [], [coll_ast, rhs]}, context}
+
+      _ ->
+        {value_ast, context} = convert(value, context)
+        {slice_ast, context} = convert(slice, context)
+        {coll_ast, context} = convert(collection, context)
+        setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
+        context = bind_name(context, coll_id)
+        {{:=, [], [coll_ast, setitem]}, context}
+    end
   end
 
   # Nested-subscript assign: `m[a][b]...[z] = v` where the chain bottoms
@@ -927,9 +947,26 @@ defmodule Pylixir.Converter do
   end
 
   defp multi_target_assign(targets, value, node, context) do
-    name_ids = Enum.map(targets, &name_id_or_raise!(&1, node))
+    # Validate target shapes early — reject anything we don't lower.
+    Enum.each(targets, fn t ->
+      case Map.get(t, "_type") do
+        "Name" -> :ok
+        "Subscript" -> :ok
+        other ->
+          raise UnsupportedNodeError,
+            node_type: "Assign",
+            hint:
+              "multi-target Assign supports Name and Subscript targets; got `#{other}`",
+            lineno: Map.get(node, "lineno"),
+            col_offset: Map.get(node, "col_offset")
+      end
+    end)
+
     {value_ast, context} = convert(value, context)
 
+    # Single-eval the value RHS when non-trivial so each target sees the
+    # same evaluated value (matches Python: `a = b = expensive()` calls
+    # `expensive` once).
     {bindings, value_ref, context} =
       if Trivial.trivial?(value) do
         {[], value_ast, context}
@@ -940,10 +977,8 @@ defmodule Pylixir.Converter do
       end
 
     {assigns, context} =
-      Enum.reduce(name_ids, {[], context}, fn id, {acc, ctx} ->
-        ctx = bind_name(ctx, id)
-        rewritten = id |> Naming.rewrite() |> String.to_atom()
-        assign = {:=, [], [{rewritten, [], nil}, value_ref]}
+      Enum.reduce(targets, {[], context}, fn target, {acc, ctx} ->
+        {assign, ctx} = multi_assign_one(target, value_ref, node, ctx)
         {[assign | acc], ctx}
       end)
 
@@ -951,13 +986,34 @@ defmodule Pylixir.Converter do
     {{:__block__, [], block}, context}
   end
 
-  defp name_id_or_raise!(%{"_type" => "Name", "id" => id}, _node), do: id
+  defp multi_assign_one(%{"_type" => "Name", "id" => id}, value_ref, _node, context) do
+    rewritten = id |> Naming.rewrite() |> String.to_atom()
+    context = bind_name(context, id)
+    {{:=, [], [{rewritten, [], nil}, value_ref]}, context}
+  end
 
-  defp name_id_or_raise!(other, node) do
+  # `coll[idx] = value_ref` — rebind `coll` via py_setitem, mirroring
+  # the single-target Subscript Assign path.
+  defp multi_assign_one(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => coll_id}, "slice" => slice},
+         value_ref,
+         _node,
+         context
+       ) do
+    {slice_ast, context} = convert(slice, context)
+    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+    context = bind_name(context, coll_id)
+
+    rhs = {:py_setitem, [], [coll_ref, slice_ast, value_ref]}
+    {{:=, [], [coll_ref, rhs]}, context}
+  end
+
+  defp multi_assign_one(other, _value_ref, node, _context) do
     raise UnsupportedNodeError,
       node_type: "Assign",
       hint:
-        "multi-target Assign requires all targets to be `Name` nodes; got `#{Map.get(other, "_type")}`",
+        "multi-target Assign target shape `#{Map.get(other, "_type")}` is not supported (only Name and Subscript-on-Name)",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
@@ -1499,34 +1555,115 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  # `from math import <name>` — emit `<name> = fn ... -> <math AST> end`.
-  # Routes through `Pylixir.Stdlib.Math.call/4`'s existing clauses so
-  # there's no duplication of the lowering.
-  defp math_import_alias(name, context) do
-    params =
-      cond do
-        name in ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp isqrt) ->
-          [{:x, [], nil}]
+  # `from <stdlib_mod> import <name> [as <alias>]` — emit a binding
+  # for `<alias>` that mirrors what `import <mod>; <mod>.<name>` would
+  # produce. Strategy depends on the kind of symbol:
+  #
+  #   * value-shaped (`sys.argv`, `sys.maxsize`): bind directly.
+  #   * function-shaped (`bisect_left`, `gcd`, …): bind a lambda that
+  #     forwards to the runtime helper — preserves the user's call
+  #     shape (`gcd(a, b)`) without forcing the `mod.` prefix.
+  #   * `stdin` (sys): bind a sentinel; `.read()` / `.readline()` on
+  #     it dispatch via `attribute_methods` to the runtime helpers.
+  defp stdlib_from_import_alias(mod, name, alias, context, node) do
+    alias_atom = alias |> Naming.rewrite() |> String.to_atom()
+    alias_ref = {alias_atom, [], nil}
 
-        name in ~w(pow atan2 gcd) ->
-          [{:a, [], nil}, {:b, [], nil}]
+    rhs =
+      case import_alias_rhs(mod, name) do
+        {:ok, ast} ->
+          ast
 
-        true ->
+        :error ->
           raise UnsupportedNodeError,
             node_type: "ImportFrom",
-            hint:
-              "`from math import #{name}` is not supported (allowed: " <>
-                "sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp " <>
-                "isqrt pow atan2 gcd)"
+            hint: "`from #{mod} import #{name}` is not supported",
+            lineno: Map.get(node, "lineno"),
+            col_offset: Map.get(node, "col_offset")
       end
 
-    {:ok, body} =
-      Pylixir.Stdlib.Math.call([name], params, %{}, %{"_type" => "Call", "lineno" => nil})
+    context = bind_name(context, alias)
+    {{:=, [], [alias_ref, rhs]}, context}
+  end
 
-    fn_ast = {:fn, [], [{:->, [], [params, body]}]}
-    name_atom = name |> Naming.rewrite() |> String.to_atom()
-    context = bind_name(context, name)
-    {{:=, [], [{name_atom, [], nil}, fn_ast]}, context}
+  # `{:ok, ast}` returns the RHS to bind to the imported name.
+  # Function-shaped imports use `&name/arity` captures so the user's
+  # subsequent call shape works unchanged (and arity errors surface
+  # at compile time, not as cryptic runtime crashes).
+  defp import_alias_rhs("sys", "argv"),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:System]}, :argv]}, [], []}}
+
+  defp import_alias_rhs("sys", "maxsize"), do: {:ok, 9_223_372_036_854_775_807}
+
+  # `stdin` is bound to nil; bare attribute calls `stdin.read()` /
+  # `stdin.readline()` are special-cased in `attribute_methods`.
+  defp import_alias_rhs("sys", "stdin"), do: {:ok, nil}
+
+  defp import_alias_rhs("sys", "setrecursionlimit"),
+    do: {:ok, {:fn, [], [{:->, [], [[{:_n, [], nil}], nil]}]}}
+
+  defp import_alias_rhs("sys", _), do: :error
+
+  defp import_alias_rhs("math", name) do
+    case math_name_arity(name) do
+      {:ok, arity} -> {:ok, capture(name, arity)}
+      :error -> :error
+    end
+  end
+
+  defp import_alias_rhs("bisect", name) when name in ~w(bisect_left bisect_right bisect),
+    do: {:ok, capture(bisect_target(name), 2)}
+
+  defp import_alias_rhs("bisect", _), do: :error
+
+  # Heapq: heappush/heappop/heapify all rebind their heap argument.
+  # Pylixir's single_target_assign + Expr-statement clauses handle the
+  # rebind when called as `heapq.heappush(h, x)`, but a plain capture
+  # `&py_heappush/2` wouldn't because the rebind logic lives in the
+  # converter, not the helper. So `from heapq import heappush` is
+  # rejected — user should keep the `heapq.` prefix for these.
+  defp import_alias_rhs("heapq", n) when n in ~w(heappush heappop heapify),
+    do: :error
+
+  defp import_alias_rhs("heapq", _), do: :error
+
+  defp import_alias_rhs("itertools", "combinations"), do: {:ok, capture(:py_combinations, 2)}
+  # `permutations` is variadic in Python (1 or 2 args). Bind the 1-arg
+  # form by default — calls like `permutations(xs, r)` will fail with
+  # a clear arity error pointing to the import site.
+  defp import_alias_rhs("itertools", "permutations"), do: {:ok, capture(:py_permutations, 1)}
+  defp import_alias_rhs("itertools", _), do: :error
+
+  defp import_alias_rhs(_mod, _name), do: :error
+
+  defp math_name_arity(n) when n in ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp isqrt factorial),
+    do: {:ok, 1}
+
+  defp math_name_arity(n) when n in ~w(pow atan2 gcd comb), do: {:ok, 2}
+  defp math_name_arity(_), do: :error
+
+  defp bisect_target("bisect_left"), do: :py_bisect_left
+  defp bisect_target("bisect_right"), do: :py_bisect_right
+  # Python: `bisect.bisect` is an alias for `bisect_right`.
+  defp bisect_target("bisect"), do: :py_bisect_right
+
+  defp capture(name, arity) when is_atom(name) and is_integer(arity) do
+    # `&name/arity` — local capture; the helpers live in the same
+    # module via the splice, so no remote-module prefix is needed.
+    {:&, [], [{:/, [], [{name, [], nil}, arity]}]}
+  end
+
+  # Convenience for math: re-use the same Pylixir.Stdlib.Math lowering
+  # so renames there propagate automatically. Math is special because
+  # several names produce non-trivial AST (e.g. `floor` wraps with
+  # `trunc`); for them we synthesise a fn over fresh params.
+  defp capture(name_str, arity) when is_binary(name_str) do
+    params = Enum.map(1..arity, fn i -> {String.to_atom("a#{i}"), [], nil} end)
+
+    {:ok, body} =
+      Pylixir.Stdlib.Math.call([name_str], params, %{}, %{"_type" => "Call", "lineno" => nil})
+
+    {:fn, [], [{:->, [], [params, body]}]}
   end
 
   defp reject_starred!(elts, container_type) do

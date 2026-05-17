@@ -55,6 +55,45 @@ defmodule Pylixir.Stdlib.Math do
   def call(["isqrt"], [n], _kwargs, _node),
     do: {:ok, {:trunc, [], [{{:., [], [:math, :sqrt]}, [], [n]}]}}
 
+  # `math.comb(n, k)` — binomial coefficient n! / (k! * (n-k)!). Pure
+  # integer math via py_math_comb runtime helper (multiplicative
+  # formula; doesn't overflow for the inputs Python actually feeds it
+  # since BEAM integers are arbitrary-precision).
+  def call(["comb"], [n, k], _kwargs, _node),
+    do: {:ok, {:py_math_comb, [], [n, k]}}
+
+  # `math.factorial(n)` — n!. Integer.gcd-style: same arbitrary-precision
+  # benefit; defers to runtime helper.
+  def call(["factorial"], [n], _kwargs, _node),
+    do: {:ok, {:py_math_factorial, [], [n]}}
+
+  # `math.hypot(x, y, ...)` — Euclidean norm sqrt(sum(xi**2)). Variadic
+  # in Python 3.8+; routes through a list-taking helper. The Pylixir
+  # call site wraps the args in a list literal so this works for any
+  # arity ≥ 1.
+  def call(["hypot"], args, _kwargs, _node) when args != [],
+    do: {:ok, {:py_math_hypot, [], [args]}}
+
+  # `math.log(x)` already routes through @unary (natural log).
+  # `math.log(x, base)` — explicit-base log. Lower to log(x) / log(base).
+  def call(["log"], [x, base], _kwargs, _node) do
+    log_x = {{:., [], [:math, :log]}, [], [x]}
+    log_b = {{:., [], [:math, :log]}, [], [base]}
+    {:ok, {:/, [], [log_x, log_b]}}
+  end
+
+  # Angle conversion: `math.degrees(rad)` → rad * 180 / pi.
+  # `math.radians(deg)` → deg * pi / 180.
+  def call(["degrees"], [rad], _kwargs, _node) do
+    pi = {{:., [], [:math, :pi]}, [], []}
+    {:ok, {:/, [], [{:*, [], [rad, 180]}, pi]}}
+  end
+
+  def call(["radians"], [deg], _kwargs, _node) do
+    pi = {{:., [], [:math, :pi]}, [], []}
+    {:ok, {:/, [], [{:*, [], [deg, pi]}, 180]}}
+  end
+
   def call([attr], args, _kwargs, _node) when attr in @unary or attr in @binary,
     do:
       {:error,

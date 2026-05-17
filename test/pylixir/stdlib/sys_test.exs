@@ -16,9 +16,12 @@ defmodule Pylixir.Stdlib.SysTest do
       assert match?({{:., _, [{:__aliases__, _, [:System]}, :argv]}, _, []}, ast)
     end
 
-    test "bare sys.stdin returns {:error, hint} pointing at sys.stdin.read()" do
-      assert {:error, hint} = Sys.attribute(["stdin"], %{})
-      assert hint =~ "sys.stdin.read()"
+    test "bare sys.stdin lowers to IO.stream(:stdio, :line) — supports `for line in sys.stdin`" do
+      assert {:ok, ast} = Sys.attribute(["stdin"], %{})
+      rendered = Macro.to_string(ast)
+      assert rendered =~ "IO.stream"
+      assert rendered =~ ":stdio"
+      assert rendered =~ ":line"
     end
 
     test "unknown attribute returns :no_clause" do

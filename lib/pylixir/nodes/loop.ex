@@ -61,15 +61,13 @@ defmodule Pylixir.Nodes.Loop do
 
   @spec for_(map(), Context.t()) :: {Macro.t(), Context.t()}
   def for_(%{"target" => target, "iter" => iter, "body" => body} = node, context) do
-    if Map.get(node, "orelse", []) != [] do
-      raise UnsupportedNodeError,
-        node_type: "For",
-        hint: "for/else (Python's for-loop `else` clause) is not supported",
-        lineno: Map.get(node, "lineno"),
-        col_offset: Map.get(node, "col_offset")
-    end
+    orelse = Map.get(node, "orelse", [])
 
-    emit_for(%{"target" => target, "iter" => iter, "body" => body}, context)
+    if orelse == [] do
+      emit_for(%{"target" => target, "iter" => iter, "body" => body}, context)
+    else
+      emit_for_else(target, iter, body, orelse, context)
+    end
   end
 
   @spec break_(map(), Context.t()) :: {Macro.t(), Context.t()}
@@ -202,6 +200,138 @@ defmodule Pylixir.Nodes.Loop do
     catch_clause = ControlFlow.catch_continue(payload_ast, recurse_call)
     {:try, [], [[do: body_block, catch: [catch_clause]]]}
   end
+
+  # --- For/else emission (Python's `for ... else: ...`) ------------------
+
+  # The `else` clause runs after the loop body **only** if the loop
+  # completed without hitting `break`. Strategy: produce the same
+  # accumulator we'd normally emit, but wrap the reduce in a try
+  # that returns `{value, broke?}` — `{result, false}` on normal
+  # completion, `{payload, true}` on break. Then conditionally run
+  # the else block. Falls through to the standard emit_for paths for
+  # threading/binding so we don't duplicate the for-loop machinery.
+  defp emit_for_else(target, iter, body, orelse, context) do
+    saved_scopes = context.scopes
+    pre_loop_context = context
+
+    {iter_ast, context} = Converter.convert(iter, context)
+    {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
+
+    analysis = LoopAnalysis.analyze(body)
+
+    threaded =
+      analysis.assigned_vars
+      |> MapSet.difference(MapSet.new(target_names))
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    {payload_ast, acc_refs} = build_acc_refs(threaded)
+    saved = context.loop_break_payload
+    context = %{context | loop_break_payload: payload_ast}
+    {body_asts, context} = Converter.convert_each(body, context)
+    context = %{context | loop_break_payload: saved}
+
+    {_has_break?, has_continue?} = loop_flow(body)
+
+    {reduce_ast, threaded_bind_pattern} =
+      build_else_reduce(
+        threaded,
+        acc_refs,
+        iter_ast,
+        target_ast,
+        body_asts,
+        pre_loop_context,
+        has_continue?
+      )
+
+    broke_var = {:pylixir_broke?, [], nil}
+    state_var = unique_state_var()
+
+    # try { reduce; {state, false} } catch :throw, {:pylixir_break, p} -> {p, true} end
+    try_ast = build_else_try(reduce_ast, state_var, broke_var)
+
+    # Bind {state, broke?} = <try> ; threaded = state (destructure if tuple)
+    bind_state =
+      {:=, [], [{state_var, broke_var}, try_ast]}
+
+    bind_threaded =
+      case threaded do
+        [] -> nil
+        [_single] -> {:=, [], [threaded_bind_pattern, state_var]}
+        _multi -> {:=, [], [threaded_bind_pattern, state_var]}
+      end
+
+    # Restore scopes; re-bind threaded vars for the post-loop env.
+    context = %{context | scopes: saved_scopes}
+    context = Enum.reduce(threaded, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
+
+    # Convert else body in the post-loop scope (sees threaded vars).
+    {else_asts, context} = Converter.convert_each(orelse, context)
+    else_block = Converter.body_to_block(else_asts)
+
+    # unless broke?, do: else_block  — emit as `if !broke?, do: ..., else: nil`.
+    cond_else =
+      {:if, [],
+       [
+         {:!, [], [broke_var]},
+         [do: else_block, else: nil]
+       ]}
+
+    pieces = Enum.reject([bind_state, bind_threaded, cond_else], &is_nil/1)
+    {Converter.body_to_block(pieces), context}
+  end
+
+  # Build the reduce/each call we wrap in the try. Mirrors the four
+  # cases in emit_for, but the "normal completion" value we wrap into
+  # the {state, false} tuple is the threaded accumulator (or :ok when
+  # no threading).
+  defp build_else_reduce([], _refs, iter_ast, target_ast, body_asts, _pre_ctx, has_continue?) do
+    body_block = Converter.body_to_block(body_asts)
+    body_with_continue = maybe_continue_each(body_block, has_continue?)
+    fn_ast = {:fn, [], [{:->, [], [[target_ast], body_with_continue]}]}
+    reduce = {{:., [], [{:__aliases__, [], [:Enum]}, :each]}, [], [iter_ast, fn_ast]}
+    {reduce, nil}
+  end
+
+  defp build_else_reduce([var], _refs, iter_ast, target_ast, body_asts, pre_ctx, has_continue?) do
+    acc_ref = {var |> Naming.rewrite() |> String.to_atom(), [], nil}
+    initial = initial_ref(var, pre_ctx)
+
+    inner_body = Converter.body_to_block(body_asts ++ [acc_ref])
+    inner_body = maybe_continue_iter(inner_body, acc_ref, has_continue?)
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, acc_ref], inner_body]}]}
+    reduce = {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, initial, fn_ast]}
+    {reduce, acc_ref}
+  end
+
+  defp build_else_reduce(vars, refs, iter_ast, target_ast, body_asts, pre_ctx, has_continue?) do
+    acc_pattern = Converter.tuple_pattern(refs)
+    initial = Converter.tuple_pattern(Enum.map(vars, &initial_ref(&1, pre_ctx)))
+
+    inner_body = Converter.body_to_block(body_asts ++ [acc_pattern])
+    inner_body = maybe_continue_iter(inner_body, acc_pattern, has_continue?)
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, acc_pattern], inner_body]}]}
+    reduce = {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, initial, fn_ast]}
+    {reduce, acc_pattern}
+  end
+
+  defp build_else_try(reduce_ast, state_var, _broke_var) do
+    normal = {:__block__, [], [reduce_ast, {state_var, false}]}
+
+    # Replace the reduce's tail with `{state_var, false}` instead — we
+    # need the reduce *result* to be the state. Simpler: bind the
+    # reduce result to state_var then yield {state_var, false}.
+    do_block =
+      {:__block__, [], [{:=, [], [state_var, reduce_ast]}, {state_var, false}]}
+
+    catch_clause =
+      {:->, [], [[:throw, {:pylixir_break, {:payload, [], nil}}], {{:payload, [], nil}, true}]}
+
+    _ = normal
+    {:try, [], [[do: do_block, catch: [catch_clause]]]}
+  end
+
+  defp unique_state_var, do: {:pylixir_for_else_state, [], nil}
 
   # --- For emission (T16b + T17) -----------------------------------------
 

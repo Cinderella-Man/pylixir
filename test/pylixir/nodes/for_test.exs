@@ -25,14 +25,20 @@ defmodule Pylixir.Nodes.ForTest do
 
   defp module_with(stmts), do: %{"_type" => "Module", "body" => stmts}
 
-  describe "For.orelse rejection" do
-    test "non-empty orelse raises" do
-      assert_raise UnsupportedNodeError, ~r/for\/else/, fn ->
+  describe "For.orelse handling" do
+    test "non-empty orelse lowers to an else-block guarded by `unless broke?`" do
+      # for i in []: pass else: 42 — empty iter, no break, else runs.
+      {ast, _} =
         Converter.convert(
-          for_node(name("i"), list_node([]), [], [const(1)]),
+          for_node(name("i"), list_node([]), [%{"_type" => "Pass"}], [const(42)]),
           Context.new()
         )
-      end
+
+      rendered = Macro.to_string(ast)
+      # The for/else emission wraps the loop in a try producing
+      # {state, broke?} and dispatches to the else-block via !broke?.
+      assert rendered =~ "pylixir_broke?"
+      assert rendered =~ "42"
     end
   end
 

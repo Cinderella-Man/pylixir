@@ -80,16 +80,21 @@ defmodule Pylixir.Builtins do
 
   def emit("abs", [x], _kw), do: {:ok, {:py_abs, [], [x]}}
 
+  # `range(stop)` and `range(start, stop)` — always ascending step 1.
+  # Use the `//` explicit-step form so empty cases (`range(2, 2)`,
+  # `range(0)`) produce `[]` instead of falling into Elixir's default
+  # `a..b` step inference (which flips to `-1` when `a > b`).
   def emit("range", [stop], _kw),
     do:
       {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [{:.., [], [0, sub_one(stop)]}]}}
+       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
+        [{:"..//", [], [0, sub_one(stop), 1]}]}}
 
   def emit("range", [start, stop], _kw),
     do:
       {:ok,
        {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-        [{:.., [], [start, sub_one(stop)]}]}}
+        [{:"..//", [], [start, sub_one(stop), 1]}]}}
 
   def emit("range", [start, stop, step], _kw),
     do:

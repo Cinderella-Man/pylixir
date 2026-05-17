@@ -25,10 +25,15 @@ defmodule Pylixir.Stdlib.Sys do
 
   def attribute(["maxsize"], _node), do: {:ok, 9_223_372_036_854_775_807}
 
+  # Bare `sys.stdin` — Python's stdin file object. The common use is
+  # iteration (`for line in sys.stdin:`); lower to Erlang's line-mode
+  # IO stream. Each line includes the trailing newline (matches
+  # CPython). `sys.stdin.read()` / `sys.stdin.readline()` are separate
+  # multi-segment clauses below and don't go through this path.
   def attribute(["stdin"], _node),
     do:
-      {:error,
-       "bare `sys.stdin` is not supported — use `sys.stdin.read()` to consume all of stdin as a string"}
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:IO]}, :stream]}, [], [:stdio, :line]}}
 
   def attribute(["stdout"], _node),
     do: {:error, "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}

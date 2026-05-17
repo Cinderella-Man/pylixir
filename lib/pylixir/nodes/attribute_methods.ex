@@ -31,7 +31,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
   @dict_methods ~w(keys values items get)
   @string_methods ~w(lower upper strip lstrip rstrip startswith endswith
                      split replace find count index zfill isdigit isalpha isalnum
-                     join)
+                     join splitlines read readline)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -263,6 +263,20 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("isalnum", target, [], _kw, _node) do
     {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[A-Za-z0-9]+$")]}
   end
+
+  # Python's `str.splitlines()` — split on `\r\n`, `\r`, `\n`, and other
+  # Unicode line boundaries; the trailing newline doesn't produce a
+  # final empty entry. `str.splitlines(keepends=True)` not supported.
+  defp do_dispatch("splitlines", target, [], _kw, _node),
+    do: {:py_str_splitlines, [], [target]}
+
+  # Stdin attribute calls — both `sys.stdin.read()` (via Stdlib.Sys
+  # multi-segment) and `stdin.read()` (after `from sys import stdin`)
+  # end up here when the receiver is the `stdin` sentinel. The receiver
+  # is discarded (we don't model stdin as a real object — just a flag
+  # for "next read goes through Erlang's stdio").
+  defp do_dispatch("read", _target, [], _kw, _node), do: {:py_stdin_read, [], []}
+  defp do_dispatch("readline", _target, [], _kw, _node), do: {:py_stdin_readline, [], []}
 
   defp do_dispatch(attr, _target, _args, _kw, node) do
     raise UnsupportedNodeError,
