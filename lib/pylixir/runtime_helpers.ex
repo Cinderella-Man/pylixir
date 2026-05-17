@@ -489,6 +489,15 @@ defmodule Pylixir.RuntimeHelpers do
     :math.sqrt(sum)
   end
 
+  # Iterate-as-list: handles Python's iter-from-string semantics
+  # (each grapheme becomes an element) and tuple iteration (Tuple
+  # isn't an Enumerable in Elixir). Used by the star-unpack destructure
+  # path (`a, *b = expr`) and anywhere else we need a list from an
+  # arbitrary Pylixir-shaped value.
+  def py_iter_to_list(s) when is_binary(s), do: String.graphemes(s)
+  def py_iter_to_list(t) when is_tuple(t), do: Tuple.to_list(t)
+  def py_iter_to_list(other), do: Enum.to_list(other)
+
   # === Slice assignment ===
 
   # `coll[start:stop:step] = new_seq` — replace the elements at the

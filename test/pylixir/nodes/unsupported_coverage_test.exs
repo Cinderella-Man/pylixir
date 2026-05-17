@@ -49,8 +49,10 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       assert_raises_unsupported("async def f():\n    pass\n", "AsyncFunctionDef")
     end
 
-    test "Try" do
-      assert_raises_unsupported("try:\n    1\nexcept:\n    2\n", "Try")
+    test "Try is now supported — minimal type-agnostic rescue/finally" do
+      out = Pylixir.transpile("try:\n    1\nexcept:\n    2\n")
+      assert is_binary(out)
+      assert out =~ "rescue"
     end
 
     test "With" do

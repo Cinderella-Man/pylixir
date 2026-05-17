@@ -131,9 +131,15 @@ defmodule Pylixir.Converter do
 
   # Imports are no-ops in generated Elixir — `Pylixir.Stdlib` modules
   # supply their own translations at attribute / call sites. Reject any
-  # module name the registry doesn't know about.
+  # module name the registry doesn't know about. `functools` is
+  # accepted as a no-op so the user's `@functools.lru_cache` decorator
+  # path resolves (the decorator itself is stripped at the def site).
+  @import_no_ops ~w(functools)
+
   def convert(%{"_type" => "Import", "names" => names}, context) do
-    case Enum.find(names, fn %{"name" => n} -> not Stdlib.supported?(n) end) do
+    case Enum.find(names, fn %{"name" => n} ->
+           not Stdlib.supported?(n) and n not in @import_no_ops
+         end) do
       nil ->
         {{:__block__, [], []}, context}
 
@@ -152,6 +158,27 @@ defmodule Pylixir.Converter do
   # lambda that delegates to the matching `Pylixir.Stdlib.Math` AST.
   # Subsequent calls go through the in-scope-anonymous-call path
   # (`gcd.(t, n)` etc.). Unsupported math names raise.
+  # `from functools import lru_cache, cache` — both are decorator
+  # no-ops in Pylixir (we don't memoize; functions just re-compute).
+  # Bind each imported name to an identity wrapper so user code that
+  # passes the decorator around without using it (`d = lru_cache(...)`
+  # then `@d`) still resolves. The decorator path itself is stripped
+  # in `Pylixir.Nodes.Functions.safe_to_strip_decorator?/1`.
+  def convert(%{"_type" => "ImportFrom", "module" => "functools", "names" => names}, context) do
+    allowed = ~w(lru_cache cache reduce)
+
+    unknown = Enum.find(names, fn %{"name" => n} -> n not in allowed end)
+
+    if unknown do
+      raise UnsupportedNodeError,
+        node_type: "ImportFrom",
+        hint:
+          "`from functools import #{unknown["name"]}` is not supported (allowed: #{Enum.join(allowed, ", ")})"
+    end
+
+    {{:__block__, [], []}, context}
+  end
+
   def convert(%{"_type" => "ImportFrom", "module" => mod, "names" => names} = node, context)
       when mod in ~w(math sys bisect heapq itertools) do
     {stmts, context} =
@@ -326,6 +353,63 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Continue"} = node, context),
     do: Nodes.Loop.continue_(node, context)
+
+  # `try: body except [Type] [as e]: handler` — minimal lowering that
+  # ignores the exception type / `as`-binding and rescues any raise.
+  # `else` runs only when body completes without raising; `finally`
+  # always runs (and runs even after a re-raise from the rescue path).
+  # This is good enough for the common "catch ValueError / KeyError /
+  # IndexError to fall back to a default" patterns in competitive code.
+  def convert(%{"_type" => "Try"} = node, context) do
+    %{"body" => body, "handlers" => handlers} = node
+    orelse = Map.get(node, "orelse", [])
+    finalbody = Map.get(node, "finalbody", [])
+
+    {body_asts, context} = convert_each(body, context)
+    body_block = body_to_block(body_asts)
+
+    {body_block, context} =
+      case orelse do
+        [] ->
+          {body_block, context}
+
+        _ ->
+          {else_asts, context} = convert_each(orelse, context)
+          else_block = body_to_block(else_asts)
+          {body_to_block([body_block, else_block]), context}
+      end
+
+    {rescue_clauses, context} =
+      Enum.map_reduce(handlers, context, fn handler, ctx ->
+        {handler_asts, ctx} = convert_each(handler["body"] || [], ctx)
+        handler_block = body_to_block(handler_asts)
+        # Catch-any pattern; ignore the type (Pylixir doesn't track
+        # exception classes) and the optional `as e` binding (the
+        # user's `e` would shadow our pinned `_`).
+        {{:->, [], [[{:_, [], nil}], handler_block]}, ctx}
+      end)
+
+    {try_args, context} =
+      case {rescue_clauses, finalbody} do
+        {[], []} ->
+          {[do: body_block], context}
+
+        {_, []} ->
+          {[do: body_block, rescue: rescue_clauses], context}
+
+        {[], _} ->
+          {after_asts, context} = convert_each(finalbody, context)
+          after_block = body_to_block(after_asts)
+          {[do: body_block, after: after_block], context}
+
+        {_, _} ->
+          {after_asts, context} = convert_each(finalbody, context)
+          after_block = body_to_block(after_asts)
+          {[do: body_block, rescue: rescue_clauses, after: after_block], context}
+      end
+
+    {{:try, [], [try_args]}, context}
+  end
 
   # Expr: drop the result unless the inner value is a recognised
   # mutation method, in which case T30 rewrites it to a target
@@ -849,23 +933,41 @@ defmodule Pylixir.Converter do
     {{:=, [], [pattern, coll_ref]}, context}
   end
 
+  # `head, *tail = expr` — Python star-unpack destructure. Lower to a
+  # `[head | tail] = list` cons-pattern when the star is at the end
+  # and the prefix is all Names. Multi-element prefix uses Enum.split.
+  # The shape `*a, b` (star not at end) and `a, *b, c` (star in middle)
+  # require more general slicing — supported via Enum.split as well.
   defp single_target_assign(%{"_type" => "Tuple", "elts" => elts} = target, value, node, context) do
-    reject_starred!(elts, "Tuple")
+    case starred_partition(elts) do
+      {:starred, before, star_name, after_elts} ->
+        if Enum.all?(before, &match?(%{"_type" => "Name"}, &1)) and
+             Enum.all?(after_elts, &match?(%{"_type" => "Name"}, &1)) do
+          emit_starred_destructure(before, star_name, after_elts, value, context)
+        else
+          raise UnsupportedNodeError,
+            node_type: "Assign",
+            hint: "star-unpack destructure (`a, *b = ...`) requires Name targets",
+            lineno: Map.get(node, "lineno"),
+            col_offset: Map.get(node, "col_offset")
+        end
 
-    if Enum.all?(elts, &match?(%{"_type" => "Name"}, &1)) do
-      # Pure tuple-of-Names destructure (e.g. `a, b = (1, 2)`).
-      {value_ast, context} = convert(value, context)
-      context = bind_tuple_names!(elts, context)
-      {target_ast, context} = convert(target, context)
-      {{:=, [], [target_ast, value_ast]}, context}
-    else
-      # Mixed Name/Subscript targets (e.g. the swap idiom
-      # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
-      # destructure-match because Subscript isn't a valid pattern.
-      # Strategy: temp-bind every RHS value once (single-eval), then
-      # apply each LHS in order — Names become normal binds, Subscripts
-      # become py_setitem rebinds of the root.
-      emit_mixed_tuple_assign(elts, value, node, context)
+      :no_star ->
+        if Enum.all?(elts, &match?(%{"_type" => "Name"}, &1)) do
+          # Pure tuple-of-Names destructure (e.g. `a, b = (1, 2)`).
+          {value_ast, context} = convert(value, context)
+          context = bind_tuple_names!(elts, context)
+          {target_ast, context} = convert(target, context)
+          {{:=, [], [target_ast, value_ast]}, context}
+        else
+          # Mixed Name/Subscript targets (e.g. the swap idiom
+          # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
+          # destructure-match because Subscript isn't a valid pattern.
+          # Strategy: temp-bind every RHS value once (single-eval), then
+          # apply each LHS in order — Names become normal binds, Subscripts
+          # become py_setitem rebinds of the root.
+          emit_mixed_tuple_assign(elts, value, node, context)
+        end
     end
   end
 
@@ -944,6 +1046,97 @@ defmodule Pylixir.Converter do
         "Assign target shape `#{Map.get(target, "_type")}` is not supported in T13 (non-Name-rooted subscript / Attribute / Starred / slice)",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- Starred-destructure helpers (`a, *b, c = expr`) -------------------
+
+  defp starred_partition(elts) do
+    case Enum.split_with(elts, &match?(%{"_type" => "Starred"}, &1)) do
+      {[], _} ->
+        :no_star
+
+      {[_one], _rest} ->
+        idx = Enum.find_index(elts, &match?(%{"_type" => "Starred"}, &1))
+        {before, [starred | after_elts]} = Enum.split(elts, idx)
+        %{"value" => %{"_type" => "Name", "id" => star_name}} = starred
+        {:starred, before, star_name, after_elts}
+
+      _ ->
+        :no_star
+    end
+  end
+
+  defp emit_starred_destructure([], star_name, [], value, context) do
+    {value_ast, context} = convert(value, context)
+    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
+    context = bind_name(context, star_name)
+    rhs = {:py_iter_to_list, [], [value_ast]}
+    {{:=, [], [{star_atom, [], nil}, rhs]}, context}
+  end
+
+  defp emit_starred_destructure(before, star_name, [], value, context) do
+    {value_ast, context} = convert(value, context)
+    {temp_atom, context} = next_temp(context)
+    temp_ref = {temp_atom, [], nil}
+    to_list = {:py_iter_to_list, [], [value_ast]}
+    bind_temp = {:=, [], [temp_ref, to_list]}
+
+    n_before = length(before)
+    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
+
+    before_pattern =
+      Enum.map(before, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    context = Enum.reduce(before, context, fn %{"_type" => "Name", "id" => id}, ctx -> bind_name(ctx, id) end)
+    context = bind_name(context, star_name)
+
+    split = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp_ref, n_before]}
+    bind_split = {:=, [], [{before_pattern, {star_atom, [], nil}}, split]}
+    {{:__block__, [], [bind_temp, bind_split]}, context}
+  end
+
+  defp emit_starred_destructure(before, star_name, after_elts, value, context) do
+    {value_ast, context} = convert(value, context)
+    {temp_atom, context} = next_temp(context)
+    temp_ref = {temp_atom, [], nil}
+    to_list = {:py_iter_to_list, [], [value_ast]}
+    bind_temp = {:=, [], [temp_ref, to_list]}
+
+    n_before = length(before)
+    n_after = length(after_elts)
+    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
+
+    context =
+      Enum.reduce(before ++ after_elts, context, fn %{"_type" => "Name", "id" => id}, ctx ->
+        bind_name(ctx, id)
+      end)
+
+    context = bind_name(context, star_name)
+
+    before_pat =
+      Enum.map(before, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    after_pat =
+      Enum.map(after_elts, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    {temp2_atom, context} = next_temp(context)
+    temp2_ref = {temp2_atom, [], nil}
+
+    split1 = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp_ref, n_before]}
+    bind_split1 = {:=, [], [{before_pat, temp2_ref}, split1]}
+
+    len_temp2 = {{:., [], [{:__aliases__, [], [:Kernel]}, :length]}, [], [temp2_ref]}
+    n_star = {:-, [], [len_temp2, n_after]}
+    split2 = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp2_ref, n_star]}
+    bind_split2 = {:=, [], [{{star_atom, [], nil}, after_pat}, split2]}
+
+    {{:__block__, [], [bind_temp, bind_split1, bind_split2]}, context}
   end
 
   defp multi_target_assign(targets, value, node, context) do
@@ -1276,39 +1469,90 @@ defmodule Pylixir.Converter do
   end
 
   defp emit_name_call(id, node, context) do
-    {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
-    {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+    raw_args = Map.get(node, "args", [])
+
+    case single_starred_args(raw_args) do
+      {:ok, star_node} ->
+        emit_starred_call(id, star_node, node, context)
+
+      :no ->
+        {arg_asts, context} = convert_each(raw_args, context)
+        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+
+        cond do
+          id == context.recursive_self_binding ->
+            no_kwargs!(kwargs, id, node)
+            self_ref = {:self, [], nil}
+            {{{:., [], [self_ref]}, [], arg_asts ++ [self_ref]}, context}
+
+          MapSet.member?(context.recursive_lambdas, id) ->
+            no_kwargs!(kwargs, id, node)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            ref = {atom, [], nil}
+            {{{:., [], [ref]}, [], arg_asts ++ [ref]}, context}
+
+          name_in_scope?(context, id) ->
+            no_kwargs!(kwargs, id, node)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            ref = {atom, [], nil}
+            {{{:., [], [ref]}, [], arg_asts}, context}
+
+          Builtins.supported?(id) ->
+            Lowering.dispatch(
+              Builtins.emit(id, arg_asts, kwargs),
+              "`#{id}/#{length(arg_asts)}` is not a supported Python builtin call shape",
+              node,
+              context
+            )
+
+          true ->
+            no_kwargs!(kwargs, id, node)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            {{atom, [], arg_asts}, context}
+        end
+    end
+  end
+
+  # Recognise the common `f(*args)` shape — a single Starred argument
+  # and nothing else. Mixed star + positional (`f(a, *xs, b)`) and
+  # multiple stars require list-concat at the call site; not handled.
+  defp single_starred_args([%{"_type" => "Starred", "value" => v}]), do: {:ok, v}
+  defp single_starred_args(_), do: :no
+
+  # `zip(*xs)` is the only builtin that has a list-form lowering matching
+  # Python's star-unpack semantics — `Enum.zip(xs)` already iterates a
+  # list-of-iters in lockstep, same as `zip(*xs)`. For other in-scope
+  # names (lambdas, demoted functions), emit `apply(fn_ref, args)`.
+  # Top-level `defp`s — `Kernel.apply(__MODULE__, :name, args)`.
+  defp emit_starred_call("zip", star_node, _node, context) do
+    {arg_ast, context} = convert(star_node, context)
+    {{{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [arg_ast]}, context}
+  end
+
+  defp emit_starred_call(id, star_node, node, context) do
+    {arg_ast, context} = convert(star_node, context)
+    arg_list = {:py_iter_to_list, [], [arg_ast]}
 
     cond do
-      id == context.recursive_self_binding ->
-        no_kwargs!(kwargs, id, node)
-        self_ref = {:self, [], nil}
-        {{{:., [], [self_ref]}, [], arg_asts ++ [self_ref]}, context}
-
-      MapSet.member?(context.recursive_lambdas, id) ->
-        no_kwargs!(kwargs, id, node)
-        atom = id |> Naming.rewrite() |> String.to_atom()
-        ref = {atom, [], nil}
-        {{{:., [], [ref]}, [], arg_asts ++ [ref]}, context}
-
       name_in_scope?(context, id) ->
-        no_kwargs!(kwargs, id, node)
+        # `id` is bound as a lambda — `apply(fn, args)` works.
         atom = id |> Naming.rewrite() |> String.to_atom()
         ref = {atom, [], nil}
-        {{{:., [], [ref]}, [], arg_asts}, context}
-
-      Builtins.supported?(id) ->
-        Lowering.dispatch(
-          Builtins.emit(id, arg_asts, kwargs),
-          "`#{id}/#{length(arg_asts)}` is not a supported Python builtin call shape",
-          node,
-          context
-        )
+        {{{:., [], [{:__aliases__, [], [:Kernel]}, :apply]}, [], [ref, arg_list]}, context}
 
       true ->
-        no_kwargs!(kwargs, id, node)
-        atom = id |> Naming.rewrite() |> String.to_atom()
-        {{atom, [], arg_asts}, context}
+        # Top-level `defp` would need `apply(__MODULE__, ...)` which
+        # doesn't reach private functions. Emit a clear hint pointing
+        # the user at the lambda-via-`from <stdlib> import` workaround
+        # or refactoring to take a list directly.
+        raise UnsupportedNodeError,
+          node_type: "Starred",
+          hint:
+            "`#{id}(*args)` is only supported when `#{id}` is in scope as a lambda (or is the builtin `zip`). " <>
+              "Top-level `def`s lower to `defp` and can't be reached via `apply` — refactor `#{id}` to take a list, " <>
+              "or bind it as `#{id}_fn = lambda *a: #{id}(*a)` and call `#{id}_fn(*args)`.",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
     end
   end
 

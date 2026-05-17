@@ -75,12 +75,16 @@ defmodule Pylixir.Nodes.Functions do
   defp emit_nested_function_def(node, context) do
     %{"name" => name, "args" => args, "body" => body} = node
 
-    if Map.get(node, "decorator_list", []) != [] do
-      raise UnsupportedNodeError,
-        node_type: "FunctionDef",
-        hint: "decorators on nested functions are not supported",
-        lineno: Map.get(node, "lineno"),
-        col_offset: Map.get(node, "col_offset")
+    case Map.get(node, "decorator_list", []) |> Enum.reject(&safe_to_strip_decorator?/1) do
+      [] ->
+        :ok
+
+      [_unsupported | _] ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "decorators on nested functions are not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
     end
 
     validate_arguments!(args, node)
@@ -145,12 +149,16 @@ defmodule Pylixir.Nodes.Functions do
   defp emit_function_def(node, context) do
     %{"name" => py_name, "args" => args, "body" => body} = node
 
-    if Map.get(node, "decorator_list", []) != [] do
-      raise UnsupportedNodeError,
-        node_type: "FunctionDef",
-        hint: "Python decorators are not supported",
-        lineno: Map.get(node, "lineno"),
-        col_offset: Map.get(node, "col_offset")
+    case Map.get(node, "decorator_list", []) |> Enum.reject(&safe_to_strip_decorator?/1) do
+      [] ->
+        :ok
+
+      [_unsupported | _] ->
+        raise UnsupportedNodeError,
+          node_type: "FunctionDef",
+          hint: "Python decorators are not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
     end
 
     validate_arguments!(args, node)
@@ -196,6 +204,27 @@ defmodule Pylixir.Nodes.Functions do
   end
 
   # --- Return-mode + parameter plumbing (shared) -------------------------
+
+  # Decorators we can safely strip because dropping them only loses
+  # performance, not correctness. `lru_cache`/`cache` add memoization
+  # — Pylixir would need a Process-backed memo table to mirror this,
+  # but plain re-computation still produces the right answer.
+  defp safe_to_strip_decorator?(%{"_type" => "Name", "id" => id})
+       when id in ~w(cache lru_cache),
+       do: true
+
+  defp safe_to_strip_decorator?(%{"_type" => "Call", "func" => func}),
+    do: safe_to_strip_decorator?(func)
+
+  defp safe_to_strip_decorator?(%{
+         "_type" => "Attribute",
+         "value" => %{"_type" => "Name", "id" => "functools"},
+         "attr" => attr
+       })
+       when attr in ~w(cache lru_cache),
+       do: true
+
+  defp safe_to_strip_decorator?(_), do: false
 
   defp self_referential?(body, name) do
     Enum.any?(body, fn stmt ->

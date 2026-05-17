@@ -63,14 +63,18 @@ defmodule Pylixir.Nodes.AssignTest do
                 ]}
     end
 
-    test "Starred in tuple target raises" do
+    test "Starred in tuple target lowers to a split/destructure (`a, *rest = ...`)" do
       starred = %{"_type" => "Starred", "value" => name("rest")}
       tup_target = %{"_type" => "Tuple", "elts" => [name("a"), starred]}
-      tup_value = %{"_type" => "Tuple", "elts" => [const(1), const(2)]}
+      tup_value = %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}
 
-      assert_raise UnsupportedNodeError, ~r/star-unpack/, fn ->
-        Converter.convert(assign([tup_target], tup_value), Context.new())
-      end
+      {ast, _ctx} = Converter.convert(assign([tup_target], tup_value), Context.new())
+      rendered = Macro.to_string(ast)
+      # The destructure now lowers to a temp-bind + Enum.split rather
+      # than raising — the prefix Names get the head, star captures
+      # the tail as a list.
+      assert rendered =~ "Enum.split"
+      assert rendered =~ "rest"
     end
 
     test "non-Name element in tuple target raises" do

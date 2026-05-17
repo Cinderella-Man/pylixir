@@ -46,6 +46,7 @@ defmodule Pylixir.Stdlib do
 
   @implementations %{
     "bisect" => Pylixir.Stdlib.Bisect,
+    "collections" => Pylixir.Stdlib.Collections,
     "heapq" => Pylixir.Stdlib.Heapq,
     "itertools" => Pylixir.Stdlib.Itertools,
     "math" => Pylixir.Stdlib.Math,
