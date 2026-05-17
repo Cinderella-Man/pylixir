@@ -50,6 +50,7 @@ defmodule Pylixir.Stdlib do
     "heapq" => Pylixir.Stdlib.Heapq,
     "itertools" => Pylixir.Stdlib.Itertools,
     "math" => Pylixir.Stdlib.Math,
+    "re" => Pylixir.Stdlib.Re,
     "sys" => Pylixir.Stdlib.Sys
   }
 

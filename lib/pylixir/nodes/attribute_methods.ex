@@ -183,8 +183,18 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("lstrip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim_leading]}, [], [target]}
 
+  defp do_dispatch("lstrip", target, [chars], _kw, node) do
+    reject_multichar_strip!(chars, node)
+    {{:., [], [{:__aliases__, [], [:String]}, :trim_leading]}, [], [target, chars]}
+  end
+
   defp do_dispatch("rstrip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim_trailing]}, [], [target]}
+
+  defp do_dispatch("rstrip", target, [chars], _kw, node) do
+    reject_multichar_strip!(chars, node)
+    {{:., [], [{:__aliases__, [], [:String]}, :trim_trailing]}, [], [target, chars]}
+  end
 
   defp do_dispatch("startswith", target, [prefix], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :starts_with?]}, [], [target, prefix]}

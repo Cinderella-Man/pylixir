@@ -544,6 +544,25 @@ defmodule Pylixir.ModuleAnalysis do
        when method in ["heappush", "heapify"],
        do: target_name == name
 
+  # Bare-Name `heappush(heap, item)` / `heapify(heap)` after
+  # `from heapq import ...`. ModuleAnalysis runs before stdlib aliases
+  # are tracked, so we recognise the pattern by name alone — risks a
+  # false positive only if the user defined their own `heappush`,
+  # which would be extremely unusual.
+  defp mutates_name?(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{"_type" => "Name", "id" => method},
+             "args" => [%{"_type" => "Name", "id" => target_name} | _]
+           }
+         },
+         name
+       )
+       when method in ["heappush", "heapify"],
+       do: target_name == name
+
   defp mutates_name?(_, _), do: false
 
   # `x = coll.pop()` / `a, b = coll.pop()` — Converter's `single_target_assign`
@@ -563,6 +582,21 @@ defmodule Pylixir.ModuleAnalysis do
          name
        )
        when method in ["pop", "popleft"],
+       do: coll == name
+
+  # `x = heappop(h)` after `from heapq import heappop` — Converter's
+  # single_target_assign rewrites the alias to `heapq.heappop(h)`
+  # which then destructure-binds and rebinds `h`. ModuleAnalysis runs
+  # too early to see stdlib_aliases, so recognise the bare-Name shape
+  # by method name.
+  defp capture_return_mutates?(
+         %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => "heappop"},
+           "args" => [%{"_type" => "Name", "id" => coll} | _]
+         },
+         name
+       ),
        do: coll == name
 
   defp capture_return_mutates?(_, _), do: false

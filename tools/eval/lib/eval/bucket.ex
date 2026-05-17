@@ -104,7 +104,12 @@ defmodule Eval.Bucket do
     msg =~ "is unused" or
       msg =~ "shadows" or
       msg =~ "underscored variable" or
-      msg =~ "no clause matching"
+      msg =~ "no clause matching" or
+      # Elixir 1.19's type-checker warning fires on `py_band/py_bor/py_bxor`
+      # results because they're typed as `integer() | %MapSet{}`. The
+      # comparison still works correctly at runtime — this is a
+      # soundness warning, not a correctness error.
+      msg =~ "comparison with structs"
   end
 
   defp stylistic?(_), do: false

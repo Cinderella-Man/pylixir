@@ -94,6 +94,16 @@ defmodule Pylixir.LoopAnalysis do
       when method in ["pop", "popleft"] ->
         MapSet.put(target_set, coll)
 
+      # `x = heappop(heap)` after `from heapq import heappop` —
+      # bare-Name capture-return; rebinds `heap` via the converter's
+      # stdlib_aliases-rewrite path.
+      %{
+        "_type" => "Call",
+        "func" => %{"_type" => "Name", "id" => "heappop"},
+        "args" => [%{"_type" => "Name", "id" => coll} | _]
+      } ->
+        MapSet.put(target_set, coll)
+
       _ ->
         target_set
     end
@@ -178,6 +188,19 @@ defmodule Pylixir.LoopAnalysis do
              "value" => %{"_type" => "Name", "id" => "heapq"},
              "attr" => method
            },
+           "args" => [%{"_type" => "Name", "id" => name} | _]
+         }
+       })
+       when method in ["heappush", "heapify"],
+       do: MapSet.new([name])
+
+  # Bare-Name `heappush(heap, x)` / `heapify(heap)` after
+  # `from heapq import ...` — same threading as the heapq.X(...) form.
+  defp names_assigned_in(%{
+         "_type" => "Expr",
+         "value" => %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => method},
            "args" => [%{"_type" => "Name", "id" => name} | _]
          }
        })

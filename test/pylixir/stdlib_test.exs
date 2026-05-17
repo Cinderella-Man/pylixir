@@ -24,7 +24,7 @@ defmodule Pylixir.StdlibTest do
     end
 
     test "names/0 — sorted list of registered module names" do
-      assert Stdlib.names() == ["bisect", "collections", "heapq", "itertools", "math", "sys"]
+      assert Stdlib.names() == ["bisect", "collections", "heapq", "itertools", "math", "re", "sys"]
     end
   end
 

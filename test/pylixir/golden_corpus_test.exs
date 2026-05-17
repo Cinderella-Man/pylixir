@@ -119,6 +119,7 @@ defmodule Pylixir.GoldenCorpusTest do
 
   defp stylistic_warning?(msg) do
     msg =~ "is unused" or msg =~ "shadows" or
-      msg =~ "underscored variable" or msg =~ "no clause matching"
+      msg =~ "underscored variable" or msg =~ "no clause matching" or
+      msg =~ "comparison with structs"
   end
 end

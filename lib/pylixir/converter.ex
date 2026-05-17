@@ -420,7 +420,7 @@ defmodule Pylixir.Converter do
   # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — both
   # mutate `heap` in Python and need a rebind in Pylixir.
   def convert(%{"_type" => "Expr", "value" => value}, context) do
-    case heapq_statement_mutation(value) do
+    case heapq_statement_mutation(value, context) do
       {:ok, heap_name, fn_name, args} ->
         emit_heapq_statement_rebind(heap_name, fn_name, args, context)
 
@@ -463,7 +463,7 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Assign", "targets" => targets, "value" => value} = node, context) do
     case targets do
-      [single] -> single_target_assign(single, value, node, context)
+      [single] -> single_target_assign(single, rewrite_stdlib_alias_call(value, context), node, context)
       _ -> multi_target_assign(targets, value, node, context)
     end
   end
@@ -614,20 +614,43 @@ defmodule Pylixir.Converter do
   # at statement position. Both are documented as in-place mutations
   # in Python; the rebind happens here so user code can keep its
   # `heap = []; heapq.heappush(heap, x)` shape verbatim.
-  defp heapq_statement_mutation(%{
-         "_type" => "Call",
-         "func" => %{
-           "_type" => "Attribute",
-           "value" => %{"_type" => "Name", "id" => "heapq"},
-           "attr" => method
+  defp heapq_statement_mutation(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "heapq"},
+             "attr" => method
+           },
+           "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
          },
-         "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
-       })
+         _context
+       )
        when method in ["heappush", "heapify"] do
     {:ok, heap_name, method, rest}
   end
 
-  defp heapq_statement_mutation(_), do: :none
+  # Bare-Name `heappush(h, x)` / `heapify(h)` after `from heapq import ...`
+  # — route through the same rebind logic as `heapq.X(...)` so the user's
+  # `heap = []; heappush(heap, x)` shape works.
+  defp heapq_statement_mutation(
+         %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => alias},
+           "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
+         },
+         context
+       ) do
+    case context.stdlib_aliases[alias] do
+      {"heapq", method} when method in ["heappush", "heapify"] ->
+        {:ok, heap_name, method, rest}
+
+      _ ->
+        :none
+    end
+  end
+
+  defp heapq_statement_mutation(_, _), do: :none
 
   defp emit_heapq_statement_rebind(heap_name, "heappush", [item_node], context) do
     {item_ast, context} = convert(item_node, context)
@@ -941,7 +964,7 @@ defmodule Pylixir.Converter do
   # and the prefix is all Names. Multi-element prefix uses Enum.split.
   # The shape `*a, b` (star not at end) and `a, *b, c` (star in middle)
   # require more general slicing — supported via Enum.split as well.
-  defp single_target_assign(%{"_type" => "Tuple", "elts" => elts} = target, value, node, context) do
+  defp single_target_assign(%{"_type" => "Tuple", "elts" => elts}, value, node, context) do
     case starred_partition(elts) do
       {:starred, before, star_name, after_elts} ->
         if Enum.all?(before, &match?(%{"_type" => "Name"}, &1)) and
@@ -956,20 +979,23 @@ defmodule Pylixir.Converter do
         end
 
       :no_star ->
-        if Enum.all?(elts, &match?(%{"_type" => "Name"}, &1)) do
-          # Pure tuple-of-Names destructure (e.g. `a, b = (1, 2)`).
-          {value_ast, context} = convert(value, context)
-          context = bind_tuple_names!(elts, context)
-          {target_ast, context} = convert(target, context)
-          {{:=, [], [target_ast, value_ast]}, context}
-        else
-          # Mixed Name/Subscript targets (e.g. the swap idiom
-          # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
-          # destructure-match because Subscript isn't a valid pattern.
-          # Strategy: temp-bind every RHS value once (single-eval), then
-          # apply each LHS in order — Names become normal binds, Subscripts
-          # become py_setitem rebinds of the root.
-          emit_mixed_tuple_assign(elts, value, node, context)
+        cond do
+          pure_destructure_target?(elts) ->
+            # Pure tuple-of-Names (possibly nested) — e.g.
+            # `a, b = (1, 2)` or `count, (a, b) = func()`.
+            {value_ast, context} = convert(value, context)
+            context = bind_destructure_target(elts, context)
+            pattern = destructure_pattern(elts)
+            {{:=, [], [pattern, value_ast]}, context}
+
+          true ->
+            # Mixed Name/Subscript targets (e.g. the swap idiom
+            # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
+            # destructure-match because Subscript isn't a valid pattern.
+            # Strategy: temp-bind every RHS value once (single-eval), then
+            # apply each LHS in order — Names become normal binds, Subscripts
+            # become py_setitem rebinds of the root.
+            emit_mixed_tuple_assign(elts, value, node, context)
         end
     end
   end
@@ -1050,6 +1076,64 @@ defmodule Pylixir.Converter do
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
+
+  # If the Call's callee is a stdlib alias (recorded via `from <mod>
+  # import <name>`), rewrite it to the equivalent `Attribute` shape
+  # (`<mod>.<name>`). Lets the existing pattern-matching clauses in
+  # `single_target_assign` (which only know the `<mod>.<name>` shape)
+  # also work for bare-Name aliased calls. No-op for everything else.
+  defp rewrite_stdlib_alias_call(
+         %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => alias}} = call,
+         context
+       ) do
+    case context.stdlib_aliases[alias] do
+      {mod, name} ->
+        attr_func = %{
+          "_type" => "Attribute",
+          "value" => %{"_type" => "Name", "id" => mod},
+          "attr" => name
+        }
+
+        Map.put(call, "func", attr_func)
+
+      _ ->
+        call
+    end
+  end
+
+  defp rewrite_stdlib_alias_call(value, _context), do: value
+
+  # --- Nested-tuple destructure helpers (`count, (a, b) = func()`) -------
+
+  # Pure destructure: every leaf is a Name; nested Tuples/Lists are
+  # transparent. Matches Python `count, (a, b) = ...` semantics.
+  defp pure_destructure_target?(elts) when is_list(elts) do
+    Enum.all?(elts, &pure_destructure_elt?/1)
+  end
+
+  defp pure_destructure_elt?(%{"_type" => "Name"}), do: true
+  defp pure_destructure_elt?(%{"_type" => "Tuple", "elts" => inner}), do: pure_destructure_target?(inner)
+  defp pure_destructure_elt?(%{"_type" => "List", "elts" => inner}), do: pure_destructure_target?(inner)
+  defp pure_destructure_elt?(_), do: false
+
+  defp bind_destructure_target(elts, context) when is_list(elts) do
+    Enum.reduce(elts, context, fn
+      %{"_type" => "Name", "id" => id}, ctx -> bind_name(ctx, id)
+      %{"_type" => "Tuple", "elts" => inner}, ctx -> bind_destructure_target(inner, ctx)
+      %{"_type" => "List", "elts" => inner}, ctx -> bind_destructure_target(inner, ctx)
+    end)
+  end
+
+  defp destructure_pattern(elts) when is_list(elts) do
+    refs = Enum.map(elts, &destructure_elt/1)
+    tuple_pattern(refs)
+  end
+
+  defp destructure_elt(%{"_type" => "Name", "id" => id}),
+    do: {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+
+  defp destructure_elt(%{"_type" => "Tuple", "elts" => inner}), do: destructure_pattern(inner)
+  defp destructure_elt(%{"_type" => "List", "elts" => inner}), do: destructure_pattern(inner)
 
   # --- Starred-destructure helpers (`a, *b, c = expr`) -------------------
 
@@ -1912,14 +1996,12 @@ defmodule Pylixir.Converter do
   defp import_alias_rhs("bisect", _), do: :error
 
   # Heapq: heappush/heappop/heapify all rebind their heap argument.
-  # Pylixir's single_target_assign + Expr-statement clauses handle the
-  # rebind when called as `heapq.heappush(h, x)`, but a plain capture
-  # `&py_heappush/2` wouldn't because the rebind logic lives in the
-  # converter, not the helper. So `from heapq import heappush` is
-  # rejected — user should keep the `heapq.` prefix for these.
-  defp import_alias_rhs("heapq", n) when n in ~w(heappush heappop heapify),
-    do: :error
-
+  # The rebind logic lives in the converter (see `emit_heapq_statement_rebind`
+  # and the single_target_assign heappop clause) — bare captures like
+  # `&py_heappush/2` wouldn't trigger that, so we bind a sentinel `nil`
+  # instead and rely on `context.stdlib_aliases` to route bare-Name calls
+  # back through the same rebind path used for `heapq.X(...)`.
+  defp import_alias_rhs("heapq", n) when n in ~w(heappush heappop heapify), do: {:ok, nil}
   defp import_alias_rhs("heapq", _), do: :error
 
   defp import_alias_rhs("itertools", "combinations"), do: {:ok, capture(:py_combinations, 2)}
