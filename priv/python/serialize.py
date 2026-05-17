@@ -32,7 +32,14 @@ class PylixirEncoder(json.JSONEncoder):
         if isinstance(obj, complex):
             return {"_unsupported_literal": "complex", "repr": str(obj)}
         if isinstance(obj, bytes):
-            return {"_unsupported_literal": "bytes", "repr": repr(obj)}
+            # Pylixir doesn't model bytes vs str separately — most uses of
+            # `b"..."` in competitive code are ASCII text passed to a
+            # function that accepts either. Decode as UTF-8; fall back to
+            # the repr-tagged shape if the bytes aren't valid UTF-8.
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"_unsupported_literal": "bytes", "repr": repr(obj)}
         if obj is ...:
             return {"_unsupported_literal": "ellipsis"}
         return super().default(obj)

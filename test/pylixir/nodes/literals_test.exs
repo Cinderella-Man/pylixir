@@ -139,19 +139,17 @@ defmodule Pylixir.Nodes.LiteralsTest do
     end
   end
 
-  describe "Dict-unpack ({**d}) is rejected" do
-    test "nil key (Python ast.parse encodes **d as Dict.keys[i] == None) raises" do
+  describe "Dict-unpack ({**d}) lowers to Map.merge chain" do
+    test "nil-key entry spreads the value into the literal via Map.merge" do
       node = dict_node([nil, const("k")], [name("d"), const(1)])
       node = Map.put(node, "lineno", 2)
 
-      err =
-        assert_raise UnsupportedNodeError, fn ->
-          Converter.convert(node, Context.new())
-        end
-
-      assert err.node_type == "Dict"
-      assert err.hint =~ "dict-unpack"
-      assert err.lineno == 2
+      {ast, _} = Converter.convert(node, Context.new())
+      rendered = Macro.to_string(ast)
+      # Expect a Map.merge call combining the unpacked `d` with the
+      # literal map containing `"k" => 1`.
+      assert rendered =~ "Map.merge"
+      assert rendered =~ "\"k\""
     end
   end
 

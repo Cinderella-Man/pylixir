@@ -59,8 +59,15 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       assert_raises_unsupported("with open(\"f\") as f:\n    pass\n", "With")
     end
 
-    test "Raise" do
-      assert_raises_unsupported("raise ValueError(\"x\")\n", "Raise")
+    test "Raise is now supported — lowers to `raise RuntimeError, \"X: msg\"`" do
+      out = Pylixir.transpile("raise ValueError(\"nope\")\n")
+      assert is_binary(out)
+      assert out =~ ~r/raise\s+RuntimeError/
+      assert out =~ "ValueError"
+    end
+
+    test "bare re-raise (`raise` with no exc) still raises at translation time" do
+      assert_raises_unsupported("try:\n  pass\nexcept:\n  raise\n", "Raise")
     end
   end
 
@@ -120,8 +127,10 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       assert_raises_unsupported("xs = [1, 2]\n{*xs, 3}\n", "Starred")
     end
 
-    test "Walrus / NamedExpr" do
-      assert_raises_unsupported("if (n := 5) > 0:\n    pass\n", "NamedExpr")
+    test "Walrus / NamedExpr is now supported — lowers to Elixir's `=` (value-producing assign)" do
+      out = Pylixir.transpile("if (n := 5) > 0:\n    print(n)\n")
+      assert is_binary(out)
+      assert out =~ "n = 5"
     end
 
     test "MatMult `@`" do

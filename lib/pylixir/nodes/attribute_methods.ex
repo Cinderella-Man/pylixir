@@ -48,7 +48,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
                      islower isupper isspace isdecimal isnumeric isascii
                      join splitlines read readline
                      ljust rjust center partition rpartition
-                     removeprefix removesuffix)
+                     removeprefix removesuffix encode decode)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -127,33 +127,28 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   # --- String formatting -------------------------------------------------
 
-  # `"<template>".format(args...)` — handled only when the template is a
-  # *literal* string (the common case) so we can parse the spec at
-  # codegen time. Supported templates: `{}` / `{0}` (bare positional),
-  # `{:.Nf}` / `{0:.Nf}` (float with N decimal places). Other shapes
-  # raise with a clearer hint.
-  defp do_dispatch("format", template, args, _kw, node) when is_binary(template) do
-    case parse_format_template(template) do
-      {:bare_pos, idx} when idx < length(args) ->
-        {:py_str, [], [Enum.at(args, idx)]}
+  # `"<template>".format(args...)` — handled when the template is a
+  # *literal* string (the common case). Supported placeholder shapes:
+  #
+  #   * `{}`        — auto-positional (next available arg)
+  #   * `{N}`       — explicit positional index
+  #   * `{name}`    — keyword arg lookup
+  #   * `{...:SPEC}` — any of the above with a format spec, dispatched
+  #     to `py_format_value/2` at runtime (same spec parser the f-string
+  #     code uses).
+  #
+  # Mix-and-match within a template is fine: `"{} {1}".format(a, b)`
+  # works (auto-position grabs args[0], `{1}` grabs args[1]). Templates
+  # that aren't literal strings raise with a clear hint.
+  defp do_dispatch("format", template, args, kw, node) when is_binary(template) do
+    case parse_format_segments(template) do
+      {:ok, segments} ->
+        build_format_concat(segments, args, kw, template, node)
 
-      {:float_fixed, idx, decimals} when idx < length(args) ->
-        # `:erlang.float_to_binary/2` is the non-deprecated path
-        # (Elixir's `Float.to_string/2` deprecated 2024). Note: rounds
-        # half-up, not banker's — Python's `.format` uses banker's, so
-        # `{:.0f}".format(2.5)` differs (`3` here vs `2` in Python).
-        # Higher-precision uses (the eval-corpus shapes `{:.6f}`,
-        # `{:.9f}`) don't hit the disagreement.
-        coerced = {:py_float, [], [Enum.at(args, idx)]}
-
-        {{:., [], [:erlang, :float_to_binary]}, [], [coerced, [decimals: decimals]]}
-
-      _ ->
+      {:error, reason} ->
         raise UnsupportedNodeError,
           node_type: "Call",
-          hint:
-            "`\"#{template}\".format(...)` — only `{}` / `{N}` / `{:.Nf}` / `{N:.Nf}` " <>
-              "single-placeholder forms are supported at codegen time",
+          hint: "`\"#{template}\".format(...)` — #{reason}",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
@@ -163,8 +158,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
     raise UnsupportedNodeError,
       node_type: "Call",
       hint:
-        "`.format(...)` is only supported when the template is a literal string with one of: " <>
-          "`{}` / `{N}` / `{:.Nf}` / `{N:.Nf}`",
+        "`.format(...)` is only supported when the template is a literal string",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
@@ -250,6 +244,14 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("removesuffix", target, [suffix], _kw, _node),
     do: {:py_str_remove_suffix, [], [target, suffix]}
+
+  # `str.encode()` / `bytes.decode()` — Pylixir collapses bytes-vs-str,
+  # so both are identity transforms (the target_ast is already a
+  # binary). Ignore the optional encoding/errors args. This lets common
+  # patterns like `s.encode().split(b"\n")` work — split on a bytes
+  # arg uses the same binary-pattern path as str.split.
+  defp do_dispatch("encode", target, _args, _kw, _node), do: target
+  defp do_dispatch("decode", target, _args, _kw, _node), do: target
 
   # 0-arg form: trim whitespace via Elixir's `String.trim*`.
   defp do_dispatch("strip", target, [], _kw, _node),
@@ -422,29 +424,138 @@ defmodule Pylixir.Nodes.AttributeMethods do
       col_offset: Map.get(node, "col_offset")
   end
 
-  # Classify a `.format()` template literal into one of the supported
-  # shapes. Returns `{:bare_pos, idx}` or `{:float_fixed, idx, decimals}`
-  # or `:unsupported`. The default index when omitted is `0`.
-  defp parse_format_template(template) do
+  # Tokenize a .format template into segments: `{:text, "..."}` and
+  # `{:placeholder, key, spec}` where:
+  #   - key  = :auto | {:index, N} | {:name, "name"}
+  #   - spec = nil | "<spec>" (e.g. ".2f", ">5")
+  # Returns `{:ok, segments}` or `{:error, reason}` for malformed
+  # templates (unbalanced braces, nested placeholders, etc.).
+  defp parse_format_segments(template) do
+    do_parse_format(template, "", [])
+  rescue
+    _ -> {:error, "couldn't parse template"}
+  end
+
+  defp do_parse_format("", acc_text, acc_segments) do
+    segments = flush_text(acc_text, acc_segments)
+    {:ok, Enum.reverse(segments)}
+  end
+
+  defp do_parse_format("{{" <> rest, acc_text, acc_segments),
+    do: do_parse_format(rest, acc_text <> "{", acc_segments)
+
+  defp do_parse_format("}}" <> rest, acc_text, acc_segments),
+    do: do_parse_format(rest, acc_text <> "}", acc_segments)
+
+  defp do_parse_format("{" <> rest, acc_text, acc_segments) do
+    case :binary.split(rest, "}") do
+      [inner, after_brace] ->
+        case parse_placeholder(inner) do
+          {:ok, placeholder} ->
+            segments = flush_text(acc_text, acc_segments)
+            do_parse_format(after_brace, "", [placeholder | segments])
+
+          {:error, _} = e ->
+            e
+        end
+
+      [_no_close] ->
+        {:error, "unclosed `{` in template"}
+    end
+  end
+
+  defp do_parse_format("}" <> _rest, _acc_text, _acc_segments),
+    do: {:error, "stray `}` in template (use `}}` to escape)"}
+
+  defp do_parse_format(<<ch::utf8, rest::binary>>, acc_text, acc_segments),
+    do: do_parse_format(rest, acc_text <> <<ch::utf8>>, acc_segments)
+
+  defp flush_text("", segments), do: segments
+  defp flush_text(text, segments), do: [{:text, text} | segments]
+
+  # Inside the `{...}` braces — separate the key from the optional
+  # `:SPEC` and classify the key.
+  defp parse_placeholder(inner) do
+    {key_part, spec} =
+      case :binary.split(inner, ":") do
+        [k, s] -> {k, s}
+        [k] -> {k, nil}
+      end
+
     cond do
-      template == "{}" ->
-        {:bare_pos, 0}
+      key_part == "" ->
+        {:ok, {:placeholder, :auto, spec}}
 
-      Regex.match?(~r/^\{(\d+)\}$/, template) ->
-        [_, idx] = Regex.run(~r/^\{(\d+)\}$/, template)
-        {:bare_pos, String.to_integer(idx)}
+      String.match?(key_part, ~r/^\d+$/) ->
+        {:ok, {:placeholder, {:index, String.to_integer(key_part)}, spec}}
 
-      Regex.match?(~r/^\{:\.(\d+)f\}$/, template) ->
-        [_, n] = Regex.run(~r/^\{:\.(\d+)f\}$/, template)
-        {:float_fixed, 0, String.to_integer(n)}
-
-      Regex.match?(~r/^\{(\d+):\.(\d+)f\}$/, template) ->
-        [_, idx, n] = Regex.run(~r/^\{(\d+):\.(\d+)f\}$/, template)
-        {:float_fixed, String.to_integer(idx), String.to_integer(n)}
+      String.match?(key_part, ~r/^[a-zA-Z_][a-zA-Z0-9_]*$/) ->
+        {:ok, {:placeholder, {:name, key_part}, spec}}
 
       true ->
-        :unsupported
+        {:error, "unsupported placeholder key `#{key_part}` (only `{}`, `{N}`, `{name}` for now)"}
     end
+  end
+
+  # Walk the segments, resolving each placeholder against `args` (for
+  # positional) or `kwargs` (for named), and emit a `<>` chain. The
+  # `auto` counter advances each time we resolve a bare `{}`.
+  defp build_format_concat(segments, args, kwargs, template, node) do
+    {parts, _auto_idx} =
+      Enum.map_reduce(segments, 0, fn
+        {:text, t}, auto ->
+          {t, auto}
+
+        {:placeholder, :auto, spec}, auto ->
+          {resolve_positional(auto, args, spec, template, node), auto + 1}
+
+        {:placeholder, {:index, idx}, spec}, auto ->
+          {resolve_positional(idx, args, spec, template, node), auto}
+
+        {:placeholder, {:name, name}, spec}, auto ->
+          {resolve_named(name, kwargs, spec, template, node), auto}
+      end)
+
+    join_with_concat(parts)
+  end
+
+  defp resolve_named(name, kwargs, spec, template, node) do
+    case Map.fetch(kwargs, name) do
+      {:ok, arg_ast} ->
+        wrap_with_spec(arg_ast, spec)
+
+      :error ->
+        raise UnsupportedNodeError,
+          node_type: "Call",
+          hint:
+            "`\"#{template}\".format(...)` — keyword `{#{name}}` has no matching kwarg",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  defp resolve_positional(idx, args, spec, template, node) do
+    if idx < length(args) do
+      wrap_with_spec(Enum.at(args, idx), spec)
+    else
+      raise UnsupportedNodeError,
+        node_type: "Call",
+        hint:
+          "`\"#{template}\".format(...)` — placeholder index #{idx} but only #{length(args)} positional args given",
+        lineno: Map.get(node, "lineno"),
+        col_offset: Map.get(node, "col_offset")
+    end
+  end
+
+  defp wrap_with_spec(arg_ast, nil), do: {:py_str, [], [arg_ast]}
+  defp wrap_with_spec(arg_ast, spec), do: {:py_format_value, [], [arg_ast, spec]}
+
+  defp join_with_concat([]), do: ""
+  defp join_with_concat([one]), do: one
+
+  defp join_with_concat(parts) do
+    [first | rest] = parts
+    Enum.reduce(rest, first, fn p, acc -> {:<>, [], [acc, p]} end)
   end
 
   defp regex_match(target, pattern) do

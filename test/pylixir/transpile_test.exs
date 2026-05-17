@@ -104,11 +104,21 @@ defmodule Pylixir.TranspileTest do
       end
     end
 
-    test "bytes literal raises" do
+    test "ASCII bytes literal is decoded as utf-8 (no rejection)" do
+      # Pylixir doesn't model bytes vs str separately; the serializer
+      # decodes b"..." as UTF-8 so most uses (bytes-as-text in
+      # competitive code) just work.
+      if python_available?() do
+        out = Pylixir.transpile("b\"hello\"\n")
+        assert out =~ "\"hello\""
+      end
+    end
+
+    test "non-UTF-8 bytes literal still raises (decode fallback)" do
       if python_available?() do
         err =
           assert_raise UnsupportedNodeError, fn ->
-            Pylixir.transpile("b\"hello\"\n")
+            Pylixir.transpile("b\"\\xff\\xfe\"\n")
           end
 
         assert err.hint =~ "bytes"

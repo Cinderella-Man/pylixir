@@ -94,6 +94,25 @@ defmodule Pylixir.Stdlib.Math do
     {:ok, {:/, [], [{:*, [], [deg, pi]}, 180]}}
   end
 
+  # `math.trunc(x)` — truncate toward zero, returns int.
+  def call(["trunc"], [x], _kwargs, _node), do: {:ok, {:trunc, [], [x]}}
+
+  # `math.fabs(x)` — absolute value, always float.
+  def call(["fabs"], [x], _kwargs, _node),
+    do: {:ok, {{:., [], [:erlang, :abs]}, [], [{:*, [], [x, 1.0]}]}}
+
+  # `math.copysign(x, y)` — magnitude of x with sign of y. Python
+  # always returns a float; coerce via `* 1.0` so integer inputs lift.
+  def call(["copysign"], [x, y], _kwargs, _node) do
+    abs_x = {{:., [], [:erlang, :abs]}, [], [{:*, [], [x, 1.0]}]}
+    {:ok,
+     {:if, [],
+      [
+        {:>=, [], [y, 0]},
+        [do: abs_x, else: {:-, [], [abs_x]}]
+      ]}}
+  end
+
   def call([attr], args, _kwargs, _node) when attr in @unary or attr in @binary,
     do:
       {:error,

@@ -151,15 +151,17 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
       end
     end
 
-    test "multi-placeholder template raises with the supported-shapes hint" do
+    test "multi-placeholder template lowers via segment-based concat" do
       python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
 
       case System.cmd(python, ["--version"], stderr_to_stdout: true) do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
-            assert_raise Pylixir.UnsupportedNodeError, ~r/single-placeholder/, fn ->
-              Pylixir.transpile(~s|"{} and {}".format(1, 2)\n|)
-            end
+            out_src = Pylixir.transpile(~s|"{} and {}".format(1, 2)\n|)
+            # The segments are joined with `<>` chains and each
+            # placeholder lowers via py_str (no spec).
+            assert out_src =~ "py_str"
+            assert out_src =~ "<>"
           end
 
         _ ->
@@ -192,15 +194,14 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
   end
 
   describe "Unknown method raises (instead of emit-as-is)" do
-    test "\"hello\".format(...) raises at translation time" do
+    test "\"hello\".format() with no placeholders lowers to the literal" do
       python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
 
       case System.cmd(python, ["--version"], stderr_to_stdout: true) do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
-            assert_raise Pylixir.UnsupportedNodeError, ~r/\.format/, fn ->
-              Pylixir.transpile(~s|"hi".format("x")\n|)
-            end
+            out_src = Pylixir.transpile(~s|print("hi".format("x"))\n|)
+            assert out_src =~ "\"hi\""
           end
 
         _ ->

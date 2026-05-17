@@ -31,6 +31,20 @@ defmodule Pylixir.RuntimeHelpers.Format do
       {:int, width, pad_char} when is_integer(value) ->
         Integer.to_string(value) |> String.pad_leading(width, pad_char)
 
+      {:int_signed, width, pad_char} when is_integer(value) ->
+        sign = if value >= 0, do: "+", else: "-"
+        body = Integer.to_string(abs(value))
+        (sign <> body) |> String.pad_leading(width, pad_char)
+
+      {:int_base, base, width, pad_char} when is_integer(value) ->
+        Integer.to_string(value, base) |> String.downcase() |> String.pad_leading(width, pad_char)
+
+      {:int_base_upper, base, width, pad_char} when is_integer(value) ->
+        Integer.to_string(value, base) |> String.pad_leading(width, pad_char)
+
+      {:int_comma} when is_integer(value) ->
+        value |> Integer.to_string() |> insert_thousands_separators(",")
+
       {:float, width, precision} ->
         v = if is_integer(value), do: value * 1.0, else: value
         s = :erlang.float_to_binary(v, decimals: precision)
@@ -54,6 +68,24 @@ defmodule Pylixir.RuntimeHelpers.Format do
       _ ->
         py_str(value)
     end
+  end
+
+  # Insert a separator every 3 digits from the right. `"1234567"` → `"1,234,567"`.
+  # Handles an optional leading "-" so negative numbers format correctly.
+  def insert_thousands_separators(s, sep) when is_binary(s) and is_binary(sep) do
+    {sign, body} =
+      case s do
+        "-" <> rest -> {"-", rest}
+        other -> {"", other}
+      end
+
+    sign <>
+      (body
+       |> String.reverse()
+       |> String.graphemes()
+       |> Enum.chunk_every(3)
+       |> Enum.map_join(sep, &Enum.join/1)
+       |> String.reverse())
   end
 
   def py_center_pad(s, width, fill) do
@@ -87,6 +119,35 @@ defmodule Pylixir.RuntimeHelpers.Format do
       # `d` alone — just to_string for int
       spec == "d" ->
         {:int, 0, " "}
+
+      # `+d` / `+Nd` — always-show-sign int. Padding goes around the
+      # sign+digits combo. (Doesn't yet handle `0+Nd` zero-pad-with-sign.)
+      Regex.run(~r/^\+(\d*)d?$/, spec) ->
+        [_, w] = Regex.run(~r/^\+(\d*)d?$/, spec)
+        width = if w == "", do: 0, else: String.to_integer(w)
+        {:int_signed, width, " "}
+
+      # `Nb` / `0Nb` — binary; `Nx` / `NX` — hex; `No` — octal.
+      Regex.run(~r/^(0?)(\d*)([bxXo])$/, spec) ->
+        [_, zero, w, type] = Regex.run(~r/^(0?)(\d*)([bxXo])$/, spec)
+        width = if w == "", do: 0, else: String.to_integer(w)
+        pad = if zero == "0", do: "0", else: " "
+
+        base =
+          case type do
+            "b" -> 2
+            "o" -> 8
+            _ -> 16
+          end
+
+        case type do
+          "X" -> {:int_base_upper, base, width, pad}
+          _ -> {:int_base, base, width, pad}
+        end
+
+      # `,` — thousands separator for int.
+      spec == "," ->
+        {:int_comma}
 
       # `[width].precisionf` — float
       Regex.run(~r/^(\d*)\.(\d+)f$/, spec) ->

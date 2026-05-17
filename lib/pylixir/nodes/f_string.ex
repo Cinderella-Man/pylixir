@@ -48,6 +48,12 @@ defmodule Pylixir.Nodes.FString do
 
   defp part(%{"_type" => "FormattedValue"} = node, context) do
     {value_ast, context} = Converter.convert(Map.fetch!(node, "value"), context)
+    # `conversion` is `-1` (none), `!r` (114), `!s` (115), or `!a` (97).
+    # Apply BEFORE the format spec — Python evaluates `value!r:spec` as
+    # `format(repr(value), spec)`. !r and !a both stringify via repr
+    # (Pylixir's `py_repr` collapses both since we don't model ASCII
+    # escaping distinctly).
+    value_ast = apply_conversion(Map.get(node, "conversion", -1), value_ast)
     spec = extract_format_spec(Map.get(node, "format_spec"))
 
     case spec do
@@ -55,8 +61,6 @@ defmodule Pylixir.Nodes.FString do
         {{:py_str, [], [value_ast]}, context}
 
       {:literal, text} ->
-        # Runtime helper interprets the spec at runtime (Pylixir doesn't
-        # know `value`'s type statically).
         {{:py_format_value, [], [value_ast, text]}, context}
 
       :unsupported ->
@@ -92,4 +96,14 @@ defmodule Pylixir.Nodes.FString do
 
   defp extract_format_spec(m) when is_map(m) and map_size(m) == 0, do: :none
   defp extract_format_spec(_), do: :unsupported
+
+  defp apply_conversion(-1, ast), do: ast
+  defp apply_conversion(nil, ast), do: ast
+  # !s — already what py_str does; wrap explicitly so spec sees a string.
+  defp apply_conversion(115, ast), do: {:py_str, [], [ast]}
+  # !r — repr; falls back to py_str for shapes py_repr doesn't special-case.
+  defp apply_conversion(114, ast), do: {:py_repr, [], [ast]}
+  # !a — Python's ascii(): repr + escape non-ASCII. Pylixir doesn't model
+  # the escape distinction, so route through py_repr (same as !r).
+  defp apply_conversion(97, ast), do: {:py_repr, [], [ast]}
 end

@@ -94,6 +94,55 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  # `raise ExceptionClass(args)` / `raise ExceptionClass` / bare
+  # `raise` — Python's exception-raising. Pylixir doesn't model
+  # exception classes, so we route everything through
+  # `RuntimeError` and stringify the message: `raise X("msg")` lowers
+  # to `raise(RuntimeError, "X: msg")`. Bare `re-raise` (`raise` with
+  # no exc inside an except) is rejected — it needs the original
+  # exception's binding which we don't track.
+  def convert(%{"_type" => "Raise", "exc" => exc}, context) do
+    case exc do
+      nil ->
+        raise UnsupportedNodeError,
+          node_type: "Raise",
+          hint: "bare `raise` (re-raise) is not supported — name the exception explicitly"
+
+      %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => cls}, "args" => args} ->
+        emit_raise(cls, args, context)
+
+      %{"_type" => "Name", "id" => cls} ->
+        emit_raise(cls, [], context)
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "Raise",
+          hint:
+            "raise target must be `ClassName(...)` or `ClassName`; got `#{Map.get(other, "_type")}`"
+    end
+  end
+
+  # Walrus operator (PEP 572): `(n := expr)` is both an assignment
+  # AND an expression that yields the assigned value. Elixir's `=`
+  # already has both shapes — `(n = 5) > 0` works directly. The Name
+  # target binds in the surrounding scope (Pylixir treats it like an
+  # Assign — `bind_name` records it).
+  def convert(%{"_type" => "NamedExpr", "target" => target, "value" => value}, context) do
+    case target do
+      %{"_type" => "Name", "id" => id} ->
+        {value_ast, context} = convert(value, context)
+        context = bind_name(context, id)
+        target_atom = id |> Naming.rewrite() |> String.to_atom()
+        {{:=, [], [{target_atom, [], nil}, value_ast]}, context}
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "NamedExpr",
+          hint:
+            "walrus target must be a bare Name (`(n := expr)`); got `#{Map.get(other, "_type")}`"
+    end
+  end
+
   # `del coll[k]` — rebind `coll` via `py_delitem` (polymorphic on
   # list/map/MapSet). Multi-target `del a, b` becomes a block. Other
   # target shapes (bare Name `del x`, Attribute, Tuple) still raise.
@@ -497,12 +546,19 @@ defmodule Pylixir.Converter do
     {tuple_ast, context}
   end
 
-  def convert(%{"_type" => "Dict", "keys" => keys, "values" => values} = node, context) do
-    reject_dict_unpack!(keys, node)
-    {key_asts, context} = convert_each(keys, context)
-    {value_asts, context} = convert_each(values, context)
-    pairs = Enum.zip(key_asts, value_asts)
-    {{:%{}, [], pairs}, context}
+  def convert(%{"_type" => "Dict", "keys" => keys, "values" => values}, context) do
+    # `keys` may include `nil` entries — those mark dict-unpack
+    # positions (`{**other_d, "k": v}`); the corresponding `values`
+    # entry is the dict to spread. Lower the whole expression to a
+    # chain of `Map.merge` (or a single literal map when no unpack).
+    if Enum.any?(keys, &is_nil/1) do
+      emit_dict_with_unpack(keys, values, context)
+    else
+      {key_asts, context} = convert_each(keys, context)
+      {value_asts, context} = convert_each(values, context)
+      pairs = Enum.zip(key_asts, value_asts)
+      {{:%{}, [], pairs}, context}
+    end
   end
 
   def convert(%{"_type" => "Name"} = node, context) do
@@ -586,6 +642,22 @@ defmodule Pylixir.Converter do
     heap_ref = {heap_atom, [], nil}
     context = bind_name(context, heap_name)
     {{:=, [], [heap_ref, {:py_heapify, [], [heap_ref]}]}, context}
+  end
+
+  # Emit `raise(RuntimeError, "<ClassName>: <msg>")`. The msg is the
+  # first arg (Python convention: `raise ValueError("nope")`). With
+  # no args we just stringify the class name. Pylixir doesn't model
+  # exception classes, so everything funnels through RuntimeError —
+  # callers can still `try/except:` since the existing except is
+  # type-agnostic (rescues any).
+  defp emit_raise(cls_name, [], context) do
+    {{:raise, [], [{:__aliases__, [], [:RuntimeError]}, cls_name]}, context}
+  end
+
+  defp emit_raise(cls_name, [msg_node | _], context) do
+    {msg_ast, context} = convert(msg_node, context)
+    formatted = {:<>, [], [cls_name <> ": ", {:py_str, [], [msg_ast]}]}
+    {{:raise, [], [{:__aliases__, [], [:RuntimeError]}, formatted]}, context}
   end
 
   # --- Operator emission -------------------------------------------------
@@ -1136,15 +1208,44 @@ defmodule Pylixir.Converter do
     end)
   end
 
-  defp reject_dict_unpack!(keys, dict_node) do
-    if Enum.any?(keys, &is_nil/1) do
-      raise UnsupportedNodeError,
-        node_type: "Dict",
-        hint: "dict-unpack (`{**d}`) is not supported",
-        lineno: Map.get(dict_node, "lineno"),
-        col_offset: Map.get(dict_node, "col_offset")
+  # `{**d1, "k": v, **d2}` — walks keys/values in source order, batches
+  # consecutive non-unpack pairs into one literal map, then chains
+  # `Map.merge` calls across the batches. `keys` entries are `nil` at
+  # unpack positions; the matching `values` entry is the dict to spread.
+  defp emit_dict_with_unpack(keys, values, context) do
+    {groups, context} = build_dict_unpack_groups(Enum.zip(keys, values), context, [], [])
+
+    case groups do
+      [single] ->
+        {single, context}
+
+      [first | rest] ->
+        merged =
+          Enum.reduce(rest, first, fn group, acc ->
+            {{:., [], [{:__aliases__, [], [:Map]}, :merge]}, [], [acc, group]}
+          end)
+
+        {merged, context}
     end
   end
+
+  defp build_dict_unpack_groups([], context, current_pairs, acc),
+    do: {Enum.reverse(flush_dict_group(current_pairs, acc)), context}
+
+  defp build_dict_unpack_groups([{nil, unpack_value} | rest], context, current_pairs, acc) do
+    {unpack_ast, context} = convert(unpack_value, context)
+    acc = flush_dict_group(current_pairs, acc)
+    build_dict_unpack_groups(rest, context, [], [unpack_ast | acc])
+  end
+
+  defp build_dict_unpack_groups([{key, value} | rest], context, current_pairs, acc) do
+    {key_ast, context} = convert(key, context)
+    {value_ast, context} = convert(value, context)
+    build_dict_unpack_groups(rest, context, [{key_ast, value_ast} | current_pairs], acc)
+  end
+
+  defp flush_dict_group([], acc), do: acc
+  defp flush_dict_group(pairs, acc), do: [{:%{}, [], Enum.reverse(pairs)} | acc]
 
   # --- Constant unsupported-literal hint --------------------------------
 

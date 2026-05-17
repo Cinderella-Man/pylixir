@@ -35,8 +35,6 @@ defmodule Pylixir.UnsupportedNodeError do
     "ClassDef" =>
       "Python classes are not supported; use a module of functions plus a data map for state.",
     "AsyncFunctionDef" => "async def is not supported.",
-    "Raise" =>
-      "raise is not supported in MVP; future ticket may add it. Use pylixir's helper-raised exceptions for now.",
     "Yield" => "generators (yield/yield from) are not supported.",
     "Match" => "match/case (structural pattern matching) is not supported."
   }
