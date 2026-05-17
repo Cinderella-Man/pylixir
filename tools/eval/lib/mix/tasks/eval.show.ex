@@ -164,8 +164,17 @@ defmodule Mix.Tasks.Eval.Show do
 
   defp print_to_stdout(file, source, elixir_src, opts) do
     unless opts[:no_source] do
+      # Comment every line of the Python source so the redirected
+      # stdout (`mix eval.show file.py > out.exs`) stays runnable
+      # under `elixir out.exs`. Without the `#` prefix, the Python
+      # `'''docstring'''` lines parse as malformed Elixir heredocs.
+      commented =
+        source
+        |> String.split("\n")
+        |> Enum.map_join("\n", &("# " <> &1))
+
       IO.puts("# === Python source: #{file} ===")
-      IO.puts(source)
+      IO.puts(commented)
       IO.puts("# === Generated Elixir ===")
     end
 
