@@ -24,6 +24,19 @@ defmodule Pylixir.Nodes.AttributeMethods do
   different (`(target_ast, method_name)`), so forcing them under one
   protocol would obscure both — see the conversation in the
   improve-codebase-architecture review for the full reasoning.
+
+  ## Why this module isn't split per Python-type (Str/Dict/Set/Int)
+
+  Considered and rejected in the 2026-05-17 architecture review.
+  Dispatch is by *method name only* — we don't know the receiver type
+  at codegen time, and several Python types share method names
+  (`.pop` on list/dict/set, `.count` on str/list). Splitting per-type
+  would force a method-name dispatcher that tries each per-type
+  module in turn — moving indirection without improving locality.
+  The flat `do_dispatch/5` table here, organised by `# ---` section
+  comments per Python type, keeps "find the lowering for method X"
+  to one grep. The `@*_methods` lists feed the catch-all hint
+  message so users see the allowed surface at the right moment.
   """
 
   alias Pylixir.UnsupportedNodeError

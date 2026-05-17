@@ -18,17 +18,31 @@ defmodule Pylixir.HelpersCodegen do
   module attributes vs anything else inside the helpers module.
   """
 
-  @helpers_path Path.join([__DIR__, "runtime_helpers.ex"])
-  @external_resource @helpers_path
+  # The core helpers file plus per-topic submodule files. Each topic
+  # is a `defmodule Pylixir.RuntimeHelpers.<Topic> do … end` that's
+  # also testable in isolation; the sentinel-delimited block is what
+  # gets spliced into generated `TranslatedCode` modules.
+  @helper_files [
+    Path.join([__DIR__, "runtime_helpers.ex"]),
+    Path.join([__DIR__, "runtime_helpers", "format.ex"]),
+    Path.join([__DIR__, "runtime_helpers", "regex.ex"]),
+    Path.join([__DIR__, "runtime_helpers", "math_ext.ex"])
+  ]
+
+  for path <- @helper_files, do: @external_resource(path)
 
   @start_sentinel "# --- HELPERS START ---"
   @end_sentinel "# --- HELPERS END ---"
 
   @helpers_source (
-                    raw = File.read!(@helpers_path)
-                    [_before, rest] = String.split(raw, @start_sentinel, parts: 2)
-                    [body, _after] = String.split(rest, @end_sentinel, parts: 2)
-                    String.trim(body)
+                    @helper_files
+                    |> Enum.map(fn path ->
+                      raw = File.read!(path)
+                      [_before, rest] = String.split(raw, @start_sentinel, parts: 2)
+                      [body, _after] = String.split(rest, @end_sentinel, parts: 2)
+                      String.trim(body)
+                    end)
+                    |> Enum.join("\n\n")
                   )
 
   # Parse once at compile time. Wrap in a throwaway `defmodule` so the

@@ -30,4 +30,11 @@ defmodule Pylixir.Stdlib.Itertools do
     do: {:ok, {:py_permutations, [], [iter, r]}}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  @impl true
+  def import_binding("combinations"), do: {:ok, Pylixir.Stdlib.capture(:py_combinations, 2)}
+  # `permutations` is variadic (1 or 2 args). Bind the 1-arg form;
+  # 2-arg calls go through stdlib_aliases-rewrite at the call site.
+  def import_binding("permutations"), do: {:ok, Pylixir.Stdlib.capture(:py_permutations, 1)}
+  def import_binding(_), do: :error
 end

@@ -157,16 +157,10 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "ImportFrom", "module" => "__future__"}, context),
     do: {{:__block__, [], []}, context}
 
-  # `from math import gcd, sqrt, ...` — emit each name as a local
-  # lambda that delegates to the matching `Pylixir.Stdlib.Math` AST.
-  # Subsequent calls go through the in-scope-anonymous-call path
-  # (`gcd.(t, n)` etc.). Unsupported math names raise.
   # `from functools import lru_cache, cache` — both are decorator
-  # no-ops in Pylixir (we don't memoize; functions just re-compute).
-  # Bind each imported name to an identity wrapper so user code that
-  # passes the decorator around without using it (`d = lru_cache(...)`
-  # then `@d`) still resolves. The decorator path itself is stripped
-  # in `Pylixir.Nodes.Functions.safe_to_strip_decorator?/1`.
+  # no-ops (we don't memoize; functions just re-compute). functools
+  # isn't a Stdlib registry member (no `call/4` lowerings), so it has
+  # its own no-op clause rather than going through `import_binding/1`.
   def convert(%{"_type" => "ImportFrom", "module" => "functools", "names" => names}, context) do
     allowed = ~w(lru_cache cache reduce)
 
@@ -182,50 +176,39 @@ defmodule Pylixir.Converter do
     {{:__block__, [], []}, context}
   end
 
-  def convert(%{"_type" => "ImportFrom", "module" => mod, "names" => names} = node, context)
-      when mod in ~w(math sys bisect heapq itertools) do
-    {stmts, context} =
-      Enum.reduce(names, {[], context}, fn entry, {acc, ctx} ->
-        n = entry["name"]
-        alias = entry["asname"] || n
-        {stmt, ctx} = stdlib_from_import_alias(mod, n, alias, ctx, node)
-        {[stmt | acc], ctx}
-      end)
+  # `from <stdlib_mod> import <names>` — delegates the per-name RHS
+  # shape to `<Stdlib.Module>.import_binding/1`. Stdlib modules own
+  # whether each name is a value-binding, a `&capture/N`, or a
+  # sentinel-`nil` for downstream alias-rewrite. Adding a stdlib that
+  # supports from-import is one file edit, not a Converter change.
+  def convert(%{"_type" => "ImportFrom", "module" => mod, "names" => names} = node, context) do
+    case Stdlib.impl(mod) do
+      nil ->
+        raise UnsupportedNodeError,
+          node_type: "ImportFrom",
+          hint:
+            "`from #{mod} import ...` is not supported (only `from __future__`; for stdlib modules use `import #{mod}` and reference via `#{mod}.<name>`)",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
 
-    body =
-      case Enum.reverse(stmts) do
-        [] -> {:__block__, [], []}
-        [single] -> single
-        many -> {:__block__, [], many}
-      end
+      impl ->
+        {stmts, context} =
+          Enum.reduce(names, {[], context}, fn entry, {acc, ctx} ->
+            n = entry["name"]
+            alias = entry["asname"] || n
+            {stmt, ctx} = stdlib_from_import_alias(mod, impl, n, alias, ctx, node)
+            {[stmt | acc], ctx}
+          end)
 
-    {body, context}
-  end
+        body =
+          case Enum.reverse(stmts) do
+            [] -> {:__block__, [], []}
+            [single] -> single
+            many -> {:__block__, [], many}
+          end
 
-  # `from collections import deque` — silent no-op. `deque` is then
-  # used as a bare name and translated as a builtin (`deque()` →
-  # `[]`, `deque(iter)` → `Enum.to_list(iter)`). Other collections
-  # symbols (Counter, defaultdict, …) fall through to the catch-all.
-  def convert(%{"_type" => "ImportFrom", "module" => "collections", "names" => names}, context) do
-    allowed = ~w(deque Counter defaultdict)
-
-    unknown = Enum.find(names, fn %{"name" => n} -> n not in allowed end)
-
-    if unknown do
-      raise UnsupportedNodeError,
-        node_type: "ImportFrom",
-        hint:
-          "`from collections import #{unknown["name"]}` is not supported (allowed: #{Enum.join(allowed, ", ")})"
+        {body, context}
     end
-
-    {{:__block__, [], []}, context}
-  end
-
-  def convert(%{"_type" => "ImportFrom", "module" => mod}, _context) do
-    raise UnsupportedNodeError,
-      node_type: "ImportFrom",
-      hint:
-        "`from #{mod} import ...` is not supported (only `from __future__`; for stdlib modules use `import #{mod}` and reference via `#{mod}.<name>`)"
   end
 
   # Minimal Call clause — supports `Name(args)` calls only. T28 will
@@ -420,7 +403,7 @@ defmodule Pylixir.Converter do
   # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — both
   # mutate `heap` in Python and need a rebind in Pylixir.
   def convert(%{"_type" => "Expr", "value" => value}, context) do
-    case heapq_statement_mutation(value, context) do
+    case Pylixir.Stdlib.Heapq.statement_mutation_call(value, context) do
       {:ok, heap_name, fn_name, args} ->
         emit_heapq_statement_rebind(heap_name, fn_name, args, context)
 
@@ -461,12 +444,8 @@ defmodule Pylixir.Converter do
     {{:if, [], [test_ast, [do: body_ast, else: orelse_ast]]}, context}
   end
 
-  def convert(%{"_type" => "Assign", "targets" => targets, "value" => value} = node, context) do
-    case targets do
-      [single] -> single_target_assign(single, rewrite_stdlib_alias_call(value, context), node, context)
-      _ -> multi_target_assign(targets, value, node, context)
-    end
-  end
+  def convert(%{"_type" => "Assign"} = node, context),
+    do: Nodes.Assign.assign(node, context)
 
   def convert(
         %{"_type" => "AugAssign", "target" => target, "op" => op, "value" => value} = node,
@@ -554,28 +533,8 @@ defmodule Pylixir.Converter do
     end
   end
 
-  # f-strings: `f"x={x} y={y}"` lowers to `py_str(x) <> "x=" <> py_str(y) …`.
-  # Each `FormattedValue` becomes `py_str(value)`; plain `Constant`
-  # children stay as their binary value. Format specs are not yet
-  # supported (`f"{x:.2f}"` raises — use `"{:.2f}".format(x)` for now).
-  def convert(%{"_type" => "JoinedStr", "values" => values}, context) do
-    {parts, context} =
-      Enum.reduce(values, {[], context}, fn part, {acc, ctx} ->
-        {ast, ctx} = joined_str_part(part, ctx)
-        {[ast | acc], ctx}
-      end)
-
-    parts = Enum.reverse(parts)
-
-    ast =
-      case parts do
-        [] -> ""
-        [single] -> single
-        [first | rest] -> Enum.reduce(rest, first, fn p, acc -> {:<>, [], [acc, p]} end)
-      end
-
-    {ast, context}
-  end
+  def convert(%{"_type" => "JoinedStr"} = node, context),
+    do: Nodes.FString.joined_str(node, context)
 
   def convert(%{"_type" => "Constant"} = node, context) do
     case Map.fetch!(node, "value") do
@@ -608,49 +567,11 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  # --- heapq statement-mutation helpers (called from the Expr clause) ---
-
-  # Recognise `heapq.heappush(heap, item)` and `heapq.heapify(heap)`
-  # at statement position. Both are documented as in-place mutations
-  # in Python; the rebind happens here so user code can keep its
-  # `heap = []; heapq.heappush(heap, x)` shape verbatim.
-  defp heapq_statement_mutation(
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => "heapq"},
-             "attr" => method
-           },
-           "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
-         },
-         _context
-       )
-       when method in ["heappush", "heapify"] do
-    {:ok, heap_name, method, rest}
-  end
-
-  # Bare-Name `heappush(h, x)` / `heapify(h)` after `from heapq import ...`
-  # — route through the same rebind logic as `heapq.X(...)` so the user's
-  # `heap = []; heappush(heap, x)` shape works.
-  defp heapq_statement_mutation(
-         %{
-           "_type" => "Call",
-           "func" => %{"_type" => "Name", "id" => alias},
-           "args" => [%{"_type" => "Name", "id" => heap_name} | rest]
-         },
-         context
-       ) do
-    case context.stdlib_aliases[alias] do
-      {"heapq", method} when method in ["heappush", "heapify"] ->
-        {:ok, heap_name, method, rest}
-
-      _ ->
-        :none
-    end
-  end
-
-  defp heapq_statement_mutation(_, _), do: :none
+  # --- heapq statement-mutation rebind emitter ---------------------------
+  #
+  # Recognition lives on `Pylixir.Stdlib.Heapq.statement_mutation_call/2`
+  # (used by Converter / ModuleAnalysis / LoopAnalysis). This emitter
+  # owns the rebind shape: `heap = py_heappush(heap, item)` etc.
 
   defp emit_heapq_statement_rebind(heap_name, "heappush", [item_node], context) do
     {item_ast, context} = convert(item_node, context)
@@ -666,13 +587,6 @@ defmodule Pylixir.Converter do
     context = bind_name(context, heap_name)
     {{:=, [], [heap_ref, {:py_heapify, [], [heap_ref]}]}, context}
   end
-
-  # `.pop()` family RHS — picks the right runtime helper based on arity.
-  # 0 args → last element / KeyError on dict (we use py_pop_last for lists);
-  # 1 arg  → index for lists, key for dicts; 2 args → key + default for dicts.
-  defp pop_call_rhs(coll_ref, []), do: {:py_pop_last, [], [coll_ref]}
-  defp pop_call_rhs(coll_ref, [a]), do: {:py_pop_at, [], [coll_ref, a]}
-  defp pop_call_rhs(coll_ref, [a, b]), do: {:py_pop_at_default, [], [coll_ref, a, b]}
 
   # --- Operator emission -------------------------------------------------
 
@@ -743,707 +657,6 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  # --- Assign target dispatch -------------------------------------------
-
-  # `x = coll.pop()` / `x = coll.pop(idx_or_key)` / `.pop(key, default)`
-  # — Python's mutating capture-and-return pop. Lowers to a
-  # `{popped, coll} = py_pop_<…>(coll, …)` destructure-match so the
-  # collection is rebound in one shot. py_pop_* branch on container
-  # type at runtime: list (index-based) vs dict (key-based).
-  defp single_target_assign(
-         %{"_type" => "Name", "id" => id},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => coll_id},
-             "attr" => "pop"
-           },
-           "args" => args
-         },
-         _node,
-         context
-       )
-       when length(args) <= 2 do
-    {arg_asts, context} = Enum.map_reduce(args, context, &convert/2)
-    context = bind_name(context, id)
-    context = bind_name(context, coll_id)
-    head_atom = id |> Naming.rewrite() |> String.to_atom()
-    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
-    head_ref = {head_atom, [], nil}
-    coll_ref = {coll_atom, [], nil}
-    rhs = pop_call_rhs(coll_ref, arg_asts)
-    {{:=, [], [{head_ref, coll_ref}, rhs]}, context}
-  end
-
-  # Tuple-destructure variant: `a, b = coll.pop()` — the popped value
-  # is itself a tuple, so the head pattern destructures further.
-  defp single_target_assign(
-         %{"_type" => "Tuple", "elts" => elts},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => coll_id},
-             "attr" => "pop"
-           },
-           "args" => args
-         },
-         _node,
-         context
-       )
-       when length(args) <= 2 do
-    Enum.each(elts, fn
-      %{"_type" => "Name"} ->
-        :ok
-
-      other ->
-        raise UnsupportedNodeError,
-          node_type: "Assign",
-          hint:
-            "tuple-destructure of `.pop()` requires Name elements; got `#{Map.get(other, "_type")}`"
-    end)
-
-    {arg_asts, context} = Enum.map_reduce(args, context, &convert/2)
-    context = bind_tuple_names!(elts, context)
-    context = bind_name(context, coll_id)
-
-    refs =
-      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    head_pattern = tuple_pattern(refs)
-    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
-    coll_ref = {coll_atom, [], nil}
-    rhs = pop_call_rhs(coll_ref, arg_asts)
-    {{:=, [], [{head_pattern, coll_ref}, rhs]}, context}
-  end
-
-  # `x = q.popleft()` — Python's deque.popleft returns the leftmost
-  # element AND removes it. Pylixir's deque-as-list rep lowers to a
-  # cons-pattern destructure: `[x | q] = q` binds `x` to the head and
-  # rebinds `q` to the tail in one match. Runtime crash on empty list
-  # (Python raises `IndexError`; close enough).
-  defp single_target_assign(
-         %{"_type" => "Name", "id" => id},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => coll_id},
-             "attr" => "popleft"
-           },
-           "args" => args
-         },
-         _node,
-         context
-       )
-       when args == [] do
-    context = bind_name(context, id)
-    context = bind_name(context, coll_id)
-    head_atom = id |> Naming.rewrite() |> String.to_atom()
-    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
-    head_ref = {head_atom, [], nil}
-    coll_ref = {coll_atom, [], nil}
-    pattern = [{:|, [], [head_ref, coll_ref]}]
-    {{:=, [], [pattern, coll_ref]}, context}
-  end
-
-  # `x = heapq.heappop(heap)` — py_heappop returns `{head, tail}`, so
-  # the Assign rebinds BOTH `x` (head) and `heap` (tail) in one
-  # destructure-match.
-  defp single_target_assign(
-         %{"_type" => "Name", "id" => id},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => "heapq"},
-             "attr" => "heappop"
-           },
-           "args" => [%{"_type" => "Name", "id" => heap_name}]
-         },
-         _node,
-         context
-       ) do
-    context = bind_name(context, id)
-    context = bind_name(context, heap_name)
-    head_atom = id |> Naming.rewrite() |> String.to_atom()
-    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
-    head_ref = {head_atom, [], nil}
-    heap_ref = {heap_atom, [], nil}
-    {{:=, [], [{head_ref, heap_ref}, {:py_heappop, [], [heap_ref]}]}, context}
-  end
-
-  defp single_target_assign(
-         %{"_type" => "Tuple", "elts" => elts},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => "heapq"},
-             "attr" => "heappop"
-           },
-           "args" => [%{"_type" => "Name", "id" => heap_name}]
-         },
-         _node,
-         context
-       ) do
-    Enum.each(elts, fn
-      %{"_type" => "Name"} ->
-        :ok
-
-      other ->
-        raise UnsupportedNodeError,
-          node_type: "Assign",
-          hint:
-            "tuple-destructure of `heapq.heappop()` requires Name elements; got `#{Map.get(other, "_type")}`"
-    end)
-
-    context = bind_tuple_names!(elts, context)
-    context = bind_name(context, heap_name)
-
-    head_refs =
-      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    head_pattern = tuple_pattern(head_refs)
-    heap_atom = heap_name |> Naming.rewrite() |> String.to_atom()
-    heap_ref = {heap_atom, [], nil}
-    {{:=, [], [{head_pattern, heap_ref}, {:py_heappop, [], [heap_ref]}]}, context}
-  end
-
-  # `x, y = q.popleft()` — tuple-destructure of the deque-head value.
-  # Same cons-pattern as the Name case, but the head pattern is a
-  # Names-only tuple. (Subscript elements in this position aren't
-  # supported — Python rarely uses them either.)
-  defp single_target_assign(
-         %{"_type" => "Tuple", "elts" => elts},
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => coll_id},
-             "attr" => "popleft"
-           },
-           "args" => []
-         },
-         _node,
-         context
-       ) do
-    Enum.each(elts, fn
-      %{"_type" => "Name"} ->
-        :ok
-
-      other ->
-        raise UnsupportedNodeError,
-          node_type: "Assign",
-          hint:
-            "tuple-destructure of `popleft()` requires all targets to be Name; got `#{Map.get(other, "_type")}`"
-    end)
-
-    context = bind_tuple_names!(elts, context)
-    context = bind_name(context, coll_id)
-
-    refs =
-      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    head_pattern = tuple_pattern(refs)
-    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
-    coll_ref = {coll_atom, [], nil}
-    pattern = [{:|, [], [head_pattern, coll_ref]}]
-    {{:=, [], [pattern, coll_ref]}, context}
-  end
-
-  # `head, *tail = expr` — Python star-unpack destructure. Lower to a
-  # `[head | tail] = list` cons-pattern when the star is at the end
-  # and the prefix is all Names. Multi-element prefix uses Enum.split.
-  # The shape `*a, b` (star not at end) and `a, *b, c` (star in middle)
-  # require more general slicing — supported via Enum.split as well.
-  defp single_target_assign(%{"_type" => "Tuple", "elts" => elts}, value, node, context) do
-    case starred_partition(elts) do
-      {:starred, before, star_name, after_elts} ->
-        if Enum.all?(before, &match?(%{"_type" => "Name"}, &1)) and
-             Enum.all?(after_elts, &match?(%{"_type" => "Name"}, &1)) do
-          emit_starred_destructure(before, star_name, after_elts, value, context)
-        else
-          raise UnsupportedNodeError,
-            node_type: "Assign",
-            hint: "star-unpack destructure (`a, *b = ...`) requires Name targets",
-            lineno: Map.get(node, "lineno"),
-            col_offset: Map.get(node, "col_offset")
-        end
-
-      :no_star ->
-        cond do
-          pure_destructure_target?(elts) ->
-            # Pure tuple-of-Names (possibly nested) — e.g.
-            # `a, b = (1, 2)` or `count, (a, b) = func()`.
-            {value_ast, context} = convert(value, context)
-            context = bind_destructure_target(elts, context)
-            pattern = destructure_pattern(elts)
-            {{:=, [], [pattern, value_ast]}, context}
-
-          true ->
-            # Mixed Name/Subscript targets (e.g. the swap idiom
-            # `t[i], t[i+1] = t[i+1], t[i]`). Can't use Elixir's
-            # destructure-match because Subscript isn't a valid pattern.
-            # Strategy: temp-bind every RHS value once (single-eval), then
-            # apply each LHS in order — Names become normal binds, Subscripts
-            # become py_setitem rebinds of the root.
-            emit_mixed_tuple_assign(elts, value, node, context)
-        end
-    end
-  end
-
-  defp single_target_assign(
-         %{
-           "_type" => "Subscript",
-           "value" => %{"_type" => "Name", "id" => coll_id} = collection,
-           "slice" => slice
-         },
-         value,
-         _node,
-         context
-       ) do
-    case slice do
-      # Slice-assignment: `coll[start:stop:step] = new_seq`. Lowers to a
-      # rebind of `coll` via `py_slice_assign` (handles both stepped and
-      # contiguous cases — len(new_seq) != slice_len is allowed only
-      # without a step, per Python semantics).
-      %{"_type" => "Slice"} = slice_node ->
-        {value_ast, context} = convert(value, context)
-        {start_ast, context} = convert_optional(Map.get(slice_node, "lower"), context)
-        {stop_ast, context} = convert_optional(Map.get(slice_node, "upper"), context)
-        {step_ast, context} = convert_optional(Map.get(slice_node, "step"), context)
-        {coll_ast, context} = convert(collection, context)
-        rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
-        context = bind_name(context, coll_id)
-        {{:=, [], [coll_ast, rhs]}, context}
-
-      _ ->
-        {value_ast, context} = convert(value, context)
-        {slice_ast, context} = convert(slice, context)
-        {coll_ast, context} = convert(collection, context)
-        setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
-        context = bind_name(context, coll_id)
-        {{:=, [], [coll_ast, setitem]}, context}
-    end
-  end
-
-  # Nested-subscript assign: `m[a][b]...[z] = v` where the chain bottoms
-  # out at a bare Name. Rebind the root via nested `py_setitem` /
-  # `py_getitem`. Each slice is temp-bound for single-eval; the root
-  # itself is always a Name so it's trivially re-readable. Chains that
-  # bottom out at anything else (Attribute, Call, …) fall through to
-  # the catch-all.
-  defp single_target_assign(
-         %{"_type" => "Subscript", "value" => %{"_type" => "Subscript"}} = target,
-         value,
-         node,
-         context
-       ) do
-    case nested_subscript_chain(target, []) do
-      {:ok, coll_id, slices} ->
-        emit_nested_subscript_assign(coll_id, slices, value, context)
-
-      :error ->
-        raise UnsupportedNodeError,
-          node_type: "Assign",
-          hint:
-            "Nested-subscript assign `<#{target_root_type(target)}>[…][…] = v` is not supported — only chains rooted at a bare Name are",
-          lineno: Map.get(node, "lineno"),
-          col_offset: Map.get(node, "col_offset")
-    end
-  end
-
-  defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
-    {value_ast, context} = convert(value, context)
-    context = bind_name(context, id)
-    {target_ast, context} = convert(target, context)
-    {{:=, [], [target_ast, value_ast]}, context}
-  end
-
-  defp single_target_assign(target, _value, node, _context) do
-    raise UnsupportedNodeError,
-      node_type: "Assign",
-      hint:
-        "Assign target shape `#{Map.get(target, "_type")}` is not supported in T13 (non-Name-rooted subscript / Attribute / Starred / slice)",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
-
-  # If the Call's callee is a stdlib alias (recorded via `from <mod>
-  # import <name>`), rewrite it to the equivalent `Attribute` shape
-  # (`<mod>.<name>`). Lets the existing pattern-matching clauses in
-  # `single_target_assign` (which only know the `<mod>.<name>` shape)
-  # also work for bare-Name aliased calls. No-op for everything else.
-  defp rewrite_stdlib_alias_call(
-         %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => alias}} = call,
-         context
-       ) do
-    case context.stdlib_aliases[alias] do
-      {mod, name} ->
-        attr_func = %{
-          "_type" => "Attribute",
-          "value" => %{"_type" => "Name", "id" => mod},
-          "attr" => name
-        }
-
-        Map.put(call, "func", attr_func)
-
-      _ ->
-        call
-    end
-  end
-
-  defp rewrite_stdlib_alias_call(value, _context), do: value
-
-  # --- Nested-tuple destructure helpers (`count, (a, b) = func()`) -------
-
-  # Pure destructure: every leaf is a Name; nested Tuples/Lists are
-  # transparent. Matches Python `count, (a, b) = ...` semantics.
-  defp pure_destructure_target?(elts) when is_list(elts) do
-    Enum.all?(elts, &pure_destructure_elt?/1)
-  end
-
-  defp pure_destructure_elt?(%{"_type" => "Name"}), do: true
-  defp pure_destructure_elt?(%{"_type" => "Tuple", "elts" => inner}), do: pure_destructure_target?(inner)
-  defp pure_destructure_elt?(%{"_type" => "List", "elts" => inner}), do: pure_destructure_target?(inner)
-  defp pure_destructure_elt?(_), do: false
-
-  defp bind_destructure_target(elts, context) when is_list(elts) do
-    Enum.reduce(elts, context, fn
-      %{"_type" => "Name", "id" => id}, ctx -> bind_name(ctx, id)
-      %{"_type" => "Tuple", "elts" => inner}, ctx -> bind_destructure_target(inner, ctx)
-      %{"_type" => "List", "elts" => inner}, ctx -> bind_destructure_target(inner, ctx)
-    end)
-  end
-
-  defp destructure_pattern(elts) when is_list(elts) do
-    refs = Enum.map(elts, &destructure_elt/1)
-    tuple_pattern(refs)
-  end
-
-  defp destructure_elt(%{"_type" => "Name", "id" => id}),
-    do: {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-
-  defp destructure_elt(%{"_type" => "Tuple", "elts" => inner}), do: destructure_pattern(inner)
-  defp destructure_elt(%{"_type" => "List", "elts" => inner}), do: destructure_pattern(inner)
-
-  # --- Starred-destructure helpers (`a, *b, c = expr`) -------------------
-
-  defp starred_partition(elts) do
-    case Enum.split_with(elts, &match?(%{"_type" => "Starred"}, &1)) do
-      {[], _} ->
-        :no_star
-
-      {[_one], _rest} ->
-        idx = Enum.find_index(elts, &match?(%{"_type" => "Starred"}, &1))
-        {before, [starred | after_elts]} = Enum.split(elts, idx)
-        %{"value" => %{"_type" => "Name", "id" => star_name}} = starred
-        {:starred, before, star_name, after_elts}
-
-      _ ->
-        :no_star
-    end
-  end
-
-  defp emit_starred_destructure([], star_name, [], value, context) do
-    {value_ast, context} = convert(value, context)
-    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
-    context = bind_name(context, star_name)
-    rhs = {:py_iter_to_list, [], [value_ast]}
-    {{:=, [], [{star_atom, [], nil}, rhs]}, context}
-  end
-
-  defp emit_starred_destructure(before, star_name, [], value, context) do
-    {value_ast, context} = convert(value, context)
-    {temp_atom, context} = next_temp(context)
-    temp_ref = {temp_atom, [], nil}
-    to_list = {:py_iter_to_list, [], [value_ast]}
-    bind_temp = {:=, [], [temp_ref, to_list]}
-
-    n_before = length(before)
-    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
-
-    before_pattern =
-      Enum.map(before, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    context = Enum.reduce(before, context, fn %{"_type" => "Name", "id" => id}, ctx -> bind_name(ctx, id) end)
-    context = bind_name(context, star_name)
-
-    split = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp_ref, n_before]}
-    bind_split = {:=, [], [{before_pattern, {star_atom, [], nil}}, split]}
-    {{:__block__, [], [bind_temp, bind_split]}, context}
-  end
-
-  defp emit_starred_destructure(before, star_name, after_elts, value, context) do
-    {value_ast, context} = convert(value, context)
-    {temp_atom, context} = next_temp(context)
-    temp_ref = {temp_atom, [], nil}
-    to_list = {:py_iter_to_list, [], [value_ast]}
-    bind_temp = {:=, [], [temp_ref, to_list]}
-
-    n_before = length(before)
-    n_after = length(after_elts)
-    star_atom = star_name |> Naming.rewrite() |> String.to_atom()
-
-    context =
-      Enum.reduce(before ++ after_elts, context, fn %{"_type" => "Name", "id" => id}, ctx ->
-        bind_name(ctx, id)
-      end)
-
-    context = bind_name(context, star_name)
-
-    before_pat =
-      Enum.map(before, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    after_pat =
-      Enum.map(after_elts, fn %{"_type" => "Name", "id" => id} ->
-        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-      end)
-
-    {temp2_atom, context} = next_temp(context)
-    temp2_ref = {temp2_atom, [], nil}
-
-    split1 = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp_ref, n_before]}
-    bind_split1 = {:=, [], [{before_pat, temp2_ref}, split1]}
-
-    len_temp2 = {{:., [], [{:__aliases__, [], [:Kernel]}, :length]}, [], [temp2_ref]}
-    n_star = {:-, [], [len_temp2, n_after]}
-    split2 = {{:., [], [{:__aliases__, [], [:Enum]}, :split]}, [], [temp2_ref, n_star]}
-    bind_split2 = {:=, [], [{{star_atom, [], nil}, after_pat}, split2]}
-
-    {{:__block__, [], [bind_temp, bind_split1, bind_split2]}, context}
-  end
-
-  defp multi_target_assign(targets, value, node, context) do
-    # Validate target shapes early — reject anything we don't lower.
-    Enum.each(targets, fn t ->
-      case Map.get(t, "_type") do
-        "Name" -> :ok
-        "Subscript" -> :ok
-        other ->
-          raise UnsupportedNodeError,
-            node_type: "Assign",
-            hint:
-              "multi-target Assign supports Name and Subscript targets; got `#{other}`",
-            lineno: Map.get(node, "lineno"),
-            col_offset: Map.get(node, "col_offset")
-      end
-    end)
-
-    {value_ast, context} = convert(value, context)
-
-    # Single-eval the value RHS when non-trivial so each target sees the
-    # same evaluated value (matches Python: `a = b = expensive()` calls
-    # `expensive` once).
-    {bindings, value_ref, context} =
-      if Trivial.trivial?(value) do
-        {[], value_ast, context}
-      else
-        {temp_atom, context} = next_temp(context)
-        temp_ref = {temp_atom, [], nil}
-        {[{:=, [], [temp_ref, value_ast]}], temp_ref, context}
-      end
-
-    {assigns, context} =
-      Enum.reduce(targets, {[], context}, fn target, {acc, ctx} ->
-        {assign, ctx} = multi_assign_one(target, value_ref, node, ctx)
-        {[assign | acc], ctx}
-      end)
-
-    block = bindings ++ Enum.reverse(assigns)
-    {{:__block__, [], block}, context}
-  end
-
-  defp multi_assign_one(%{"_type" => "Name", "id" => id}, value_ref, _node, context) do
-    rewritten = id |> Naming.rewrite() |> String.to_atom()
-    context = bind_name(context, id)
-    {{:=, [], [{rewritten, [], nil}, value_ref]}, context}
-  end
-
-  # `coll[idx] = value_ref` — rebind `coll` via py_setitem, mirroring
-  # the single-target Subscript Assign path.
-  defp multi_assign_one(
-         %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => coll_id}, "slice" => slice},
-         value_ref,
-         _node,
-         context
-       ) do
-    {slice_ast, context} = convert(slice, context)
-    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
-    coll_ref = {coll_atom, [], nil}
-    context = bind_name(context, coll_id)
-
-    rhs = {:py_setitem, [], [coll_ref, slice_ast, value_ref]}
-    {{:=, [], [coll_ref, rhs]}, context}
-  end
-
-  defp multi_assign_one(other, _value_ref, node, _context) do
-    raise UnsupportedNodeError,
-      node_type: "Assign",
-      hint:
-        "multi-target Assign target shape `#{Map.get(other, "_type")}` is not supported (only Name and Subscript-on-Name)",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
-
-  defp bind_tuple_names!(elts, context) do
-    Enum.reduce(elts, context, fn
-      %{"_type" => "Name", "id" => id}, ctx ->
-        bind_name(ctx, id)
-
-      other, _ctx ->
-        raise UnsupportedNodeError,
-          node_type: "Assign",
-          hint:
-            "tuple-Assign target requires all elements to be `Name` nodes; got `#{Map.get(other, "_type")}`"
-    end)
-  end
-
-  # Mixed-target tuple-Assign emitter. Handles `a, b[i] = x, y`-shape
-  # cases where at least one LHS is a depth-1 Subscript rooted at a
-  # bare Name. RHS must be a Tuple literal with matching arity (the
-  # general-RHS case — `a, b = some_call()` with subscript LHS — would
-  # need destructure-then-index machinery; not implemented yet).
-  defp emit_mixed_tuple_assign(elts, value, node, context) do
-    rhs_elts =
-      case value do
-        %{"_type" => "Tuple", "elts" => rhs} when length(rhs) == length(elts) ->
-          rhs
-
-        _ ->
-          raise UnsupportedNodeError,
-            node_type: "Assign",
-            hint:
-              "tuple-Assign with a Subscript target requires a literal tuple RHS of matching arity",
-            lineno: Map.get(node, "lineno"),
-            col_offset: Map.get(node, "col_offset")
-      end
-
-    # Phase 1 — temp-bind every RHS value so writes can't clobber later
-    # reads. The swap idiom (`t[i], t[i+1] = t[i+1], t[i]`) and the
-    # mixed case (`y, xs[0] = xs[0], y` — where `y` is both LHS and
-    # RHS) both need it. `maybe_temp_bind` skips trivial expressions,
-    # but trivial-name RHS still gets clobbered when the same name is
-    # ALSO a LHS target — so we always emit a temp here.
-    {temps, bindings, context} =
-      Enum.reduce(rhs_elts, {[], [], context}, fn rhs, {temps, binds, ctx} ->
-        {ast, ctx} = convert(rhs, ctx)
-        {temp_atom, ctx} = next_temp(ctx)
-        temp_ref = {temp_atom, [], nil}
-        binding = {:=, [], [temp_ref, ast]}
-        {[temp_ref | temps], [binding | binds], ctx}
-      end)
-
-    temps = Enum.reverse(temps)
-    bindings = Enum.reverse(bindings)
-
-    # Phase 2 — apply each LHS in order using the matching temp.
-    {assigns, context} =
-      elts
-      |> Enum.zip(temps)
-      |> Enum.reduce({[], context}, fn {lhs, temp}, {acc, ctx} ->
-        {ast, ctx} = apply_mixed_tuple_target(lhs, temp, ctx)
-        {[ast | acc], ctx}
-      end)
-
-    assigns = Enum.reverse(assigns)
-    {{:__block__, [], bindings ++ assigns}, context}
-  end
-
-  defp apply_mixed_tuple_target(%{"_type" => "Name", "id" => id}, temp, context) do
-    context = bind_name(context, id)
-    atom = id |> Naming.rewrite() |> String.to_atom()
-    {{:=, [], [{atom, [], nil}, temp]}, context}
-  end
-
-  defp apply_mixed_tuple_target(
-         %{
-           "_type" => "Subscript",
-           "value" => %{"_type" => "Name", "id" => coll_id} = collection,
-           "slice" => slice
-         },
-         temp,
-         context
-       ) do
-    {slice_ast, context} = convert(slice, context)
-    {coll_ast, context} = convert(collection, context)
-    setitem = {:py_setitem, [], [coll_ast, slice_ast, temp]}
-    context = bind_name(context, coll_id)
-    {{:=, [], [coll_ast, setitem]}, context}
-  end
-
-  defp apply_mixed_tuple_target(other, _temp, _context) do
-    raise UnsupportedNodeError,
-      node_type: "Assign",
-      hint:
-        "tuple-Assign element shape `#{Map.get(other, "_type")}` is not supported (only Name and depth-1 Subscript)"
-  end
-
-  # Walk a Subscript chain ending at a bare Name. Returns
-  # `{:ok, root_id, slices_outermost_first}` or `:error` if the chain
-  # bottoms out at something other than a Name (Attribute, Call, etc.).
-  defp nested_subscript_chain(%{"_type" => "Subscript", "value" => v, "slice" => s}, acc) do
-    case v do
-      %{"_type" => "Name", "id" => id} -> {:ok, id, [s | acc]}
-      %{"_type" => "Subscript"} = inner -> nested_subscript_chain(inner, [s | acc])
-      _ -> :error
-    end
-  end
-
-  defp target_root_type(%{"_type" => "Subscript", "value" => v}), do: target_root_type(v)
-  defp target_root_type(%{"_type" => t}), do: t
-
-  # `m[a][b]...[z] = v` → rebind `m` to a deeply-rebuilt copy.
-  # Two-deep example: `m[a][b] = v` lowers to
-  #   m = py_setitem(m, a, py_setitem(py_getitem(m, a), b, v))
-  # The slices are temp-bound first to preserve Python's single-eval
-  # semantics; the root is a bare Name so re-reading it is safe.
-  defp emit_nested_subscript_assign(coll_id, slices, value, context) do
-    {value_ast, context} = convert(value, context)
-    {coll_ast, context} = convert(%{"_type" => "Name", "id" => coll_id}, context)
-
-    {slice_refs, bindings, context} =
-      Enum.reduce(slices, {[], [], context}, fn slice_node, {refs, binds, ctx} ->
-        {ref, binding, ctx} = maybe_temp_bind(slice_node, ctx)
-        binds = if binding, do: [binding | binds], else: binds
-        {[ref | refs], binds, ctx}
-      end)
-
-    slice_refs = Enum.reverse(slice_refs)
-    bindings = Enum.reverse(bindings)
-
-    new_value = build_nested_setitem(coll_ast, slice_refs, value_ast)
-    context = bind_name(context, coll_id)
-
-    assign = {:=, [], [coll_ast, new_value]}
-
-    case bindings do
-      [] -> {assign, context}
-      _ -> {{:__block__, [], bindings ++ [assign]}, context}
-    end
-  end
-
-  defp build_nested_setitem(coll_ast, [last_slice], value_ast) do
-    {:py_setitem, [], [coll_ast, last_slice, value_ast]}
-  end
-
-  defp build_nested_setitem(coll_ast, [s | rest], value_ast) do
-    inner_get = {:py_getitem, [], [coll_ast, s]}
-    inner_set = build_nested_setitem(inner_get, rest, value_ast)
-    {:py_setitem, [], [coll_ast, s, inner_set]}
-  end
 
   @doc false
   def bind_name(context, name) when is_binary(name) do
@@ -1850,57 +1063,6 @@ defmodule Pylixir.Converter do
     {atom, %{context | temp_counter: n + 1}}
   end
 
-  # --- JoinedStr (f-string) part dispatch -------------------------------
-
-  defp joined_str_part(%{"_type" => "Constant", "value" => v}, context) when is_binary(v),
-    do: {v, context}
-
-  defp joined_str_part(%{"_type" => "FormattedValue"} = node, context) do
-    {value_ast, context} = convert(Map.fetch!(node, "value"), context)
-    spec = extract_format_spec(Map.get(node, "format_spec"))
-
-    case spec do
-      :none ->
-        {{:py_str, [], [value_ast]}, context}
-
-      {:literal, text} ->
-        # Dispatch to the runtime helper that interprets the spec at
-        # runtime (Pylixir doesn't know `value`'s type statically).
-        {{:py_format_value, [], [value_ast, text]}, context}
-
-      :unsupported ->
-        raise UnsupportedNodeError,
-          node_type: "FormattedValue",
-          hint:
-            "f-string format specs with nested interpolation aren't supported — use a constant spec like `:.2f` or `\"{:.2f}\".format(x)`",
-          lineno: Map.get(node, "lineno"),
-          col_offset: Map.get(node, "col_offset")
-    end
-  end
-
-  defp joined_str_part(other, _context) do
-    raise UnsupportedNodeError,
-      node_type: "JoinedStr",
-      hint:
-        "unexpected JoinedStr child `#{Map.get(other, "_type")}` — expected Constant or FormattedValue"
-  end
-
-  # Format spec is itself a JoinedStr. If it's a single Constant string
-  # (the common `:.2f` / `:02d` case), return its text; if it has
-  # interpolations (`{width}`), fail.
-  defp extract_format_spec(nil), do: :none
-  defp extract_format_spec(%{"value" => nil}), do: :none
-
-  defp extract_format_spec(%{"_type" => "JoinedStr", "values" => values}) do
-    case values do
-      [] -> :none
-      [%{"_type" => "Constant", "value" => v}] when is_binary(v) -> {:literal, v}
-      _ -> :unsupported
-    end
-  end
-
-  defp extract_format_spec(m) when is_map(m) and map_size(m) == 0, do: :none
-  defp extract_format_spec(_), do: :unsupported
 
   # --- Literal-container rejections --------------------------------------
 
@@ -1928,22 +1090,16 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  # `from <stdlib_mod> import <name> [as <alias>]` — emit a binding
-  # for `<alias>` that mirrors what `import <mod>; <mod>.<name>` would
-  # produce. Strategy depends on the kind of symbol:
-  #
-  #   * value-shaped (`sys.argv`, `sys.maxsize`): bind directly.
-  #   * function-shaped (`bisect_left`, `gcd`, …): bind a lambda that
-  #     forwards to the runtime helper — preserves the user's call
-  #     shape (`gcd(a, b)`) without forcing the `mod.` prefix.
-  #   * `stdin` (sys): bind a sentinel; `.read()` / `.readline()` on
-  #     it dispatch via `attribute_methods` to the runtime helpers.
-  defp stdlib_from_import_alias(mod, name, alias, context, node) do
+  # `from <stdlib_mod> import <name> [as <alias>]` — delegates the
+  # per-name RHS shape to the stdlib's `import_binding/1` callback.
+  # The Converter only owns the alias-tracking + AST assembly here;
+  # what each name actually binds to lives in `Pylixir.Stdlib.<Mod>`.
+  defp stdlib_from_import_alias(mod, impl, name, alias, context, node) do
     alias_atom = alias |> Naming.rewrite() |> String.to_atom()
     alias_ref = {alias_atom, [], nil}
 
     rhs =
-      case import_alias_rhs(mod, name) do
+      case impl.import_binding(name) do
         {:ok, ast} ->
           ast
 
@@ -1963,84 +1119,6 @@ defmodule Pylixir.Converter do
     # `&py_permutations/1`.
     context = %{context | stdlib_aliases: Map.put(context.stdlib_aliases, alias, {mod, name})}
     {{:=, [], [alias_ref, rhs]}, context}
-  end
-
-  # `{:ok, ast}` returns the RHS to bind to the imported name.
-  # Function-shaped imports use `&name/arity` captures so the user's
-  # subsequent call shape works unchanged (and arity errors surface
-  # at compile time, not as cryptic runtime crashes).
-  defp import_alias_rhs("sys", "argv"),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:System]}, :argv]}, [], []}}
-
-  defp import_alias_rhs("sys", "maxsize"), do: {:ok, 9_223_372_036_854_775_807}
-
-  # `stdin` is bound to nil; bare attribute calls `stdin.read()` /
-  # `stdin.readline()` are special-cased in `attribute_methods`.
-  defp import_alias_rhs("sys", "stdin"), do: {:ok, nil}
-
-  defp import_alias_rhs("sys", "setrecursionlimit"),
-    do: {:ok, {:fn, [], [{:->, [], [[{:_n, [], nil}], nil]}]}}
-
-  defp import_alias_rhs("sys", _), do: :error
-
-  defp import_alias_rhs("math", name) do
-    case math_name_arity(name) do
-      {:ok, arity} -> {:ok, capture(name, arity)}
-      :error -> :error
-    end
-  end
-
-  defp import_alias_rhs("bisect", name) when name in ~w(bisect_left bisect_right bisect),
-    do: {:ok, capture(bisect_target(name), 2)}
-
-  defp import_alias_rhs("bisect", _), do: :error
-
-  # Heapq: heappush/heappop/heapify all rebind their heap argument.
-  # The rebind logic lives in the converter (see `emit_heapq_statement_rebind`
-  # and the single_target_assign heappop clause) — bare captures like
-  # `&py_heappush/2` wouldn't trigger that, so we bind a sentinel `nil`
-  # instead and rely on `context.stdlib_aliases` to route bare-Name calls
-  # back through the same rebind path used for `heapq.X(...)`.
-  defp import_alias_rhs("heapq", n) when n in ~w(heappush heappop heapify), do: {:ok, nil}
-  defp import_alias_rhs("heapq", _), do: :error
-
-  defp import_alias_rhs("itertools", "combinations"), do: {:ok, capture(:py_combinations, 2)}
-  # `permutations` is variadic in Python (1 or 2 args). Bind the 1-arg
-  # form by default — calls like `permutations(xs, r)` will fail with
-  # a clear arity error pointing to the import site.
-  defp import_alias_rhs("itertools", "permutations"), do: {:ok, capture(:py_permutations, 1)}
-  defp import_alias_rhs("itertools", _), do: :error
-
-  defp import_alias_rhs(_mod, _name), do: :error
-
-  defp math_name_arity(n) when n in ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp isqrt factorial),
-    do: {:ok, 1}
-
-  defp math_name_arity(n) when n in ~w(pow atan2 gcd comb), do: {:ok, 2}
-  defp math_name_arity(_), do: :error
-
-  defp bisect_target("bisect_left"), do: :py_bisect_left
-  defp bisect_target("bisect_right"), do: :py_bisect_right
-  # Python: `bisect.bisect` is an alias for `bisect_right`.
-  defp bisect_target("bisect"), do: :py_bisect_right
-
-  defp capture(name, arity) when is_atom(name) and is_integer(arity) do
-    # `&name/arity` — local capture; the helpers live in the same
-    # module via the splice, so no remote-module prefix is needed.
-    {:&, [], [{:/, [], [{name, [], nil}, arity]}]}
-  end
-
-  # Convenience for math: re-use the same Pylixir.Stdlib.Math lowering
-  # so renames there propagate automatically. Math is special because
-  # several names produce non-trivial AST (e.g. `floor` wraps with
-  # `trunc`); for them we synthesise a fn over fresh params.
-  defp capture(name_str, arity) when is_binary(name_str) do
-    params = Enum.map(1..arity, fn i -> {String.to_atom("a#{i}"), [], nil} end)
-
-    {:ok, body} =
-      Pylixir.Stdlib.Math.call([name_str], params, %{}, %{"_type" => "Call", "lineno" => nil})
-
-    {:fn, [], [{:->, [], [params, body]}]}
   end
 
   defp reject_starred!(elts, container_type) do

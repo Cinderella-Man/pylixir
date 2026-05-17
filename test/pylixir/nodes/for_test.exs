@@ -1,7 +1,7 @@
 defmodule Pylixir.Nodes.ForTest do
   use ExUnit.Case, async: true
 
-  alias Pylixir.{Context, Converter, TranspileHelpers, UnsupportedNodeError}
+  alias Pylixir.{Context, Converter, TranspileHelpers}
 
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp name(id), do: %{"_type" => "Name", "id" => id}

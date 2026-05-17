@@ -39,4 +39,12 @@ defmodule Pylixir.Stdlib.Re do
     do: {:ok, {:py_re_split, [], [pattern, string]}}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  @impl true
+  def import_binding("findall"), do: {:ok, Pylixir.Stdlib.capture(:py_re_findall, 2)}
+  def import_binding("search"), do: {:ok, Pylixir.Stdlib.capture(:py_re_search, 2)}
+  def import_binding("match"), do: {:ok, Pylixir.Stdlib.capture(:py_re_match, 2)}
+  def import_binding("sub"), do: {:ok, Pylixir.Stdlib.capture(:py_re_sub, 3)}
+  def import_binding("split"), do: {:ok, Pylixir.Stdlib.capture(:py_re_split, 2)}
+  def import_binding(_), do: :error
 end

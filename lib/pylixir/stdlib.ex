@@ -9,7 +9,9 @@ defmodule Pylixir.Stdlib do
   ## Adding a stdlib module
 
     1. Create `Pylixir.Stdlib.<Name>` and `@behaviour Pylixir.Stdlib`.
-    2. Implement `attribute/2` and `call/3` (see callbacks below).
+    2. Implement `attribute/2`, `call/4`, and `import_binding/1`
+       (see callbacks below). `import_binding/1` can return `:error`
+       for everything if your module doesn't support `from <mod> import`.
     3. Add the `"name" => Module` entry to `@implementations`.
 
   No other code changes needed — `Converter` discovers new entries via
@@ -44,6 +46,21 @@ defmodule Pylixir.Stdlib do
               node :: map()
             ) :: Pylixir.Lowering.result()
 
+  @doc """
+  RHS the converter binds to `<alias>` when emitting
+  `from <mod> import <name> [as <alias>]`. Three common shapes:
+
+    * value-binding (`sys.argv` → `System.argv()`): return the value AST
+    * function capture (`bisect_left` → `&py_bisect_left/2`): use
+      `capture/2` to build the AST
+    * sentinel (e.g. heapq names that are recognised at the call site
+      via `Context.stdlib_aliases`): return `{:ok, nil}` — the binding
+      just reserves the name in scope
+
+  Return `:error` for names this module doesn't expose via `from … import`.
+  """
+  @callback import_binding(name :: String.t()) :: {:ok, Macro.t()} | :error
+
   @implementations %{
     "bisect" => Pylixir.Stdlib.Bisect,
     "collections" => Pylixir.Stdlib.Collections,
@@ -62,4 +79,16 @@ defmodule Pylixir.Stdlib do
 
   @spec names() :: [String.t()]
   def names, do: Map.keys(@implementations) |> Enum.sort()
+
+  @doc """
+  Build a local-function capture AST (`&name/arity`). Stdlib modules
+  use this to bind `from <mod> import <name>` aliases that forward to
+  runtime helpers without a `mod.` prefix. The helper has to live in
+  the splice (since the generated `TranslatedCode` references it
+  unqualified) — the linkage test catches typos.
+  """
+  @spec capture(atom(), non_neg_integer()) :: Macro.t()
+  def capture(name, arity) when is_atom(name) and is_integer(arity) do
+    {:&, [], [{:/, [], [{name, [], nil}, arity]}]}
+  end
 end

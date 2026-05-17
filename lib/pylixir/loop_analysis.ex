@@ -79,32 +79,19 @@ defmodule Pylixir.LoopAnalysis do
   defp names_assigned_in(%{"_type" => "Assign", "targets" => targets, "value" => value}) do
     target_set = targets |> Enum.flat_map(&target_names/1) |> MapSet.new()
 
-    # `x = coll.pop()` rebinds `coll` as a side effect (see Converter's
-    # `single_target_assign` capture-return clauses). Mirror that here so
-    # loop/if state-tuples thread `coll` out.
-    case value do
-      %{
-        "_type" => "Call",
-        "func" => %{
-          "_type" => "Attribute",
-          "value" => %{"_type" => "Name", "id" => coll},
-          "attr" => method
-        }
-      }
-      when method in ["pop", "popleft"] ->
+    # `x = coll.pop()` rebinds `coll` as a side effect (see
+    # `Nodes.Assign` capture-return clauses). Mirror that here so
+    # loop/if state-tuples thread `coll` out. Same for the heapq
+    # capture-return form (recognised via `Stdlib.Heapq`).
+    cond do
+      coll = pop_capture_root(value) ->
         MapSet.put(target_set, coll)
 
-      # `x = heappop(heap)` after `from heapq import heappop` —
-      # bare-Name capture-return; rebinds `heap` via the converter's
-      # stdlib_aliases-rewrite path.
-      %{
-        "_type" => "Call",
-        "func" => %{"_type" => "Name", "id" => "heappop"},
-        "args" => [%{"_type" => "Name", "id" => coll} | _]
-      } ->
+      match?({:ok, _, _, _}, Pylixir.Stdlib.Heapq.capture_return_call(value, nil)) ->
+        {:ok, coll, _, _} = Pylixir.Stdlib.Heapq.capture_return_call(value, nil)
         MapSet.put(target_set, coll)
 
-      _ ->
+      true ->
         target_set
     end
   end
@@ -176,36 +163,16 @@ defmodule Pylixir.LoopAnalysis do
     |> MapSet.new()
   end
 
-  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` — rebinds
-  # `heap` via Pylixir's Expr-clause rewrite. For-loop bodies must
-  # thread `heap` through the accumulator.
-  defp names_assigned_in(%{
-         "_type" => "Expr",
-         "value" => %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => "heapq"},
-             "attr" => method
-           },
-           "args" => [%{"_type" => "Name", "id" => name} | _]
-         }
-       })
-       when method in ["heappush", "heapify"],
-       do: MapSet.new([name])
-
-  # Bare-Name `heappush(heap, x)` / `heapify(heap)` after
-  # `from heapq import ...` — same threading as the heapq.X(...) form.
-  defp names_assigned_in(%{
-         "_type" => "Expr",
-         "value" => %{
-           "_type" => "Call",
-           "func" => %{"_type" => "Name", "id" => method},
-           "args" => [%{"_type" => "Name", "id" => name} | _]
-         }
-       })
-       when method in ["heappush", "heapify"],
-       do: MapSet.new([name])
+  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` (and bare-Name
+  # forms after `from heapq import …`) rebind `heap` via the Converter's
+  # Expr-clause rewrite. For-loop bodies must thread `heap` through the
+  # accumulator. Recognizer lives on `Pylixir.Stdlib.Heapq`.
+  defp names_assigned_in(%{"_type" => "Expr", "value" => value}) do
+    case Pylixir.Stdlib.Heapq.statement_mutation_call(value, nil) do
+      {:ok, name, _, _} -> MapSet.new([name])
+      :none -> MapSet.new()
+    end
+  end
 
   # `def f(...): ...` in a runtime / control-flow position is emitted
   # by `Nodes.Functions` as `f = fn ... end` — same binding semantics
@@ -214,6 +181,19 @@ defmodule Pylixir.LoopAnalysis do
     do: MapSet.new([name])
 
   defp names_assigned_in(_), do: MapSet.new()
+
+  defp pop_capture_root(%{
+         "_type" => "Call",
+         "func" => %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => coll},
+           "attr" => method
+         }
+       })
+       when method in ["pop", "popleft"],
+       do: coll
+
+  defp pop_capture_root(_), do: nil
 
   # Python's idiomatic throwaway names (`_`, `__`, `___`, …) are *not*
   # tracked as assigned. `_` is Elixir's pattern-only discard; `__`

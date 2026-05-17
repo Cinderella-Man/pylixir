@@ -100,4 +100,25 @@ defmodule Pylixir.Stdlib.Math do
        "math.#{attr}/#{length(args)} is not supported (supported: #{Enum.join(@unary, "/1, ")}/1 + #{Enum.join(@binary, "/2, ")}/2)"}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  # --- from math import <name> ----------------------------------------
+  #
+  # Several math names produce non-trivial AST (e.g. `floor` wraps with
+  # `trunc`), so a `&py_floor/1` capture wouldn't be right. Re-use
+  # `call/4` to synthesize a fn over fresh params — keeps the lowering
+  # in one place.
+
+  @unary_arity ~w(sqrt floor ceil log log2 log10 sin cos tan asin acos atan exp isqrt factorial)
+  @binary_arity ~w(pow atan2 gcd comb)
+
+  @impl true
+  def import_binding(name) when name in @unary_arity, do: synth_fn(name, 1)
+  def import_binding(name) when name in @binary_arity, do: synth_fn(name, 2)
+  def import_binding(_), do: :error
+
+  defp synth_fn(name, arity) do
+    params = Enum.map(1..arity, fn i -> {String.to_atom("a#{i}"), [], nil} end)
+    {:ok, body} = call([name], params, %{}, %{"_type" => "Call", "lineno" => nil})
+    {:ok, {:fn, [], [{:->, [], [params, body]}]}}
+  end
 end

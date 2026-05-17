@@ -73,4 +73,20 @@ defmodule Pylixir.Stdlib.Sys do
   def call(["setrecursionlimit"], [_n], _kwargs, _node), do: {:ok, nil}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  @impl true
+  # `from sys import argv` → `argv = System.argv()` (value binding).
+  def import_binding("argv"),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:System]}, :argv]}, [], []}}
+
+  def import_binding("maxsize"), do: {:ok, 9_223_372_036_854_775_807}
+
+  # `stdin` is bound to nil; bare attribute calls `stdin.read()` /
+  # `stdin.readline()` are special-cased in `attribute_methods`.
+  def import_binding("stdin"), do: {:ok, nil}
+
+  def import_binding("setrecursionlimit"),
+    do: {:ok, {:fn, [], [{:->, [], [[{:_n, [], nil}], nil]}]}}
+
+  def import_binding(_), do: :error
 end

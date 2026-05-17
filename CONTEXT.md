@@ -56,15 +56,22 @@ shape Pylixir emits. Owns helpers, module attrs, defp's, and the
 `def py_main` entry point. Built by `Pylixir.Converter`'s Module clause.
 
 **Helper** — A `py_*` function spliced into every generated module so
-the output is self-contained. Source of truth is
-`Pylixir.RuntimeHelpers`; baked into `@helpers_source` by
-`Pylixir.HelpersCodegen` at Pylixir's own compile time. The
-`py_*` prefix is the load-bearing emission namespace: any AST tuple
-literal `{:py_*, [], args}` appearing in `Pylixir.Builtins`,
-`Pylixir.Converter`, or a `Pylixir.Stdlib` impl must resolve to a
-helper of matching arity. The helpers-linkage test
-(`test/pylixir/helpers_linkage_test.exs`) enforces this statically via
-`HelpersCodegen.helper_names/0`, so a rename or typo surfaces at
+the output is self-contained. Source of truth is split across the
+core `Pylixir.RuntimeHelpers` (arithmetic / collection / conversion /
+string-rep / banker-rounding / heapq / itertools / bitwise / slice /
+bisect / input — the always-loaded core) plus per-topic submodules
+under `lib/pylixir/runtime_helpers/`:
+`Pylixir.RuntimeHelpers.Format` (f-string format-spec parser),
+`Pylixir.RuntimeHelpers.Regex` (py_re_*), and
+`Pylixir.RuntimeHelpers.MathExt` (math.comb / factorial / hypot /
+pow_mod). `Pylixir.HelpersCodegen` reads each file's sentinel slice
+at Pylixir's own compile time and concatenates them into
+`@helpers_source`. The `py_*` prefix is the load-bearing emission
+namespace: any AST tuple literal `{:py_*, [], args}` appearing in
+`Pylixir.Builtins`, `Pylixir.Converter`, or a `Pylixir.Stdlib` impl
+must resolve to a helper of matching arity. The helpers-linkage test
+(`test/pylixir/helpers_linkage_test.exs`) enforces this statically
+via `HelpersCodegen.helper_names/0`, so a rename or typo surfaces at
 Pylixir's test time rather than in user code at runtime.
 
 **Entry point** — The `def py_main` function at the bottom of the
@@ -102,18 +109,44 @@ conflating their distinct roles.
 **Stdlib registry** — `Pylixir.Stdlib` holds a compile-time map from
 Python module name (`"math"`, `"sys"`) to its implementing module
 (`Pylixir.Stdlib.Math`, `Pylixir.Stdlib.Sys`). Implementations
-`@behaviour Pylixir.Stdlib` and define `attribute/2` + `call/4`, both
-returning a [[Lowering]] result. Adding a new stdlib module = one new
-file + one `@implementations` entry. The Converter discovers entries
-via `supported?/1` (Import gate) and `impl/1` (Attribute / Call
-dispatch via `stdlib_chain/1`).
+`@behaviour Pylixir.Stdlib` and define three callbacks:
+
+  * `attribute/2` — `mod.attr` access (`math.pi`).
+  * `call/4` — `mod.fn(args)` calls (`math.sqrt(x)`).
+  * `import_binding/1` — RHS shape for `from <mod> import <name>`
+    bindings: a value AST (`sys.argv`), a `&capture/N`
+    (`bisect_left`), or a sentinel `nil` for names recognised at the
+    call site via `Context.stdlib_aliases` (heapq's heappush/pop).
+
+All three return a [[Lowering]] result. Adding a new stdlib module =
+one new file + one `@implementations` entry. The Converter discovers
+entries via `supported?/1` (Import gate) and `impl/1` (Attribute /
+Call dispatch via `stdlib_chain/1`, plus from-import dispatch).
+
+`Pylixir.Stdlib.capture/2` is a shared helper that stdlib modules use
+to build `&py_helper/N` capture ASTs for their function-shaped imports.
+
+Some stdlib modules (currently just `Pylixir.Stdlib.Heapq`) also own
+shared *recognizer* predicates beyond the behaviour callbacks because
+their calls have special rewriting needs that multiple converter
+passes need to agree on. heapq's `statement_mutation_call/2` and
+`capture_return_call/2` are used by `Pylixir.Converter` (Expr
+clause), `Pylixir.Nodes.Assign` (capture-return Assigns),
+`Pylixir.ModuleAnalysis` (don't-promote-this-attr), and
+`Pylixir.LoopAnalysis` (thread-through-accumulator). All four sites
+recognise the heapq call shape via the stdlib module; each still
+emits its own rebind AST.
 
 **Node module** — Files under `lib/pylixir/nodes/<x>.ex` that own the
-lowering for a related group of Python AST node types: `Comprehension`
-(list/set/dict/generator), `Loop` (For/While/Break/Continue),
-`Functions` (FunctionDef/Lambda), `If` (if/elif/else), `Compare`
-(single + chained), `Mutations` (statement-context `.append`/`.sort`
-…), `AttributeMethods` (instance method dispatch). The Converter's
+lowering for a related group of Python AST node types: `Assign`
+(single/multi-target Assign + tuple/list destructure + starred unpack
++ nested-subscript writes + irregular Call-shape Assigns like
+`x = q.popleft()`), `Comprehension` (list/set/dict/generator), `Loop`
+(For/While/Break/Continue), `Functions` (FunctionDef/Lambda), `If`
+(if/elif/else), `Compare` (single + chained), `Mutations`
+(statement-context `.append`/`.sort` …), `AttributeMethods` (instance
+method dispatch), `FString` (JoinedStr + FormattedValue + format-spec
+extraction). The Converter's
 `convert/2` clauses delegate to the matching node module; cross-node
 mechanics (`convert_each`, `convert_keywords`, `convert_loop_target`,
 `convert_test`, `bind_name`, `body_to_block`, `tuple_pattern`,

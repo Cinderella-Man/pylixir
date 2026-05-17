@@ -46,4 +46,11 @@ defmodule Pylixir.Stdlib.Bisect do
     do: {:ok, {:py_bisect_right, [], [a, x, lo, hi]}}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  @impl true
+  def import_binding("bisect_left"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_left, 2)}
+  def import_binding("bisect_right"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_right, 2)}
+  # Python: `bisect.bisect` is an alias for `bisect_right`.
+  def import_binding("bisect"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_right, 2)}
+  def import_binding(_), do: :error
 end

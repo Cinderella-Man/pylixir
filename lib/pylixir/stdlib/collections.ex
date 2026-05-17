@@ -26,4 +26,13 @@ defmodule Pylixir.Stdlib.Collections do
   end
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
+
+  @impl true
+  # `from collections import deque, Counter, defaultdict` — these are
+  # all bare-Name builtins (handled via `Pylixir.Builtins`). Bind nil
+  # as a sentinel; subsequent `Counter(...)` calls go through the
+  # builtin path. Anything else is rejected — the previous Converter
+  # implementation rejected unknown names too.
+  def import_binding(n) when n in ~w(deque Counter defaultdict), do: {:ok, nil}
+  def import_binding(_), do: :error
 end
