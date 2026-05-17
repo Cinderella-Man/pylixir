@@ -44,9 +44,11 @@ defmodule Pylixir.Nodes.AttributeMethods do
   @dict_methods ~w(keys values items get)
   @string_methods ~w(lower upper title capitalize swapcase casefold
                      strip lstrip rstrip startswith endswith
-                     split replace find count index zfill isdigit isalpha isalnum
+                     split replace find rfind count index zfill isdigit isalpha isalnum
+                     islower isupper isspace isdecimal isnumeric isascii
                      join splitlines read readline
-                     ljust rjust center partition rpartition)
+                     ljust rjust center partition rpartition
+                     removeprefix removesuffix)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -239,29 +241,38 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("rpartition", target, [sep], _kw, _node),
     do: {:py_str_rpartition, [], [target, sep]}
 
+  # Python 3.9+ `str.removeprefix(p)` / `str.removesuffix(s)` — strip
+  # exactly one occurrence if it's there; otherwise return unchanged.
+  # NOT the same as `lstrip(p)` (which strips a *set* of chars
+  # repeatedly).
+  defp do_dispatch("removeprefix", target, [prefix], _kw, _node),
+    do: {:py_str_remove_prefix, [], [target, prefix]}
+
+  defp do_dispatch("removesuffix", target, [suffix], _kw, _node),
+    do: {:py_str_remove_suffix, [], [target, suffix]}
+
+  # 0-arg form: trim whitespace via Elixir's `String.trim*`.
   defp do_dispatch("strip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target]}
-
-  defp do_dispatch("strip", target, [chars], _kw, node) do
-    reject_multichar_strip!(chars, node)
-    {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target, chars]}
-  end
 
   defp do_dispatch("lstrip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim_leading]}, [], [target]}
 
-  defp do_dispatch("lstrip", target, [chars], _kw, node) do
-    reject_multichar_strip!(chars, node)
-    {{:., [], [{:__aliases__, [], [:String]}, :trim_leading]}, [], [target, chars]}
-  end
-
   defp do_dispatch("rstrip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim_trailing]}, [], [target]}
 
-  defp do_dispatch("rstrip", target, [chars], _kw, node) do
-    reject_multichar_strip!(chars, node)
-    {{:., [], [{:__aliases__, [], [:String]}, :trim_trailing]}, [], [target, chars]}
-  end
+  # 1-arg form: `s.strip("abc")` in Python treats the arg as a SET
+  # of chars to strip from each end repeatedly — NOT a substring.
+  # Elixir's `String.trim/2` strips exactly that string, so we route
+  # through a runtime helper that does the char-set semantics.
+  defp do_dispatch("strip", target, [chars], _kw, _node),
+    do: {:py_str_strip_chars, [], [target, chars]}
+
+  defp do_dispatch("lstrip", target, [chars], _kw, _node),
+    do: {:py_str_lstrip_chars, [], [target, chars]}
+
+  defp do_dispatch("rstrip", target, [chars], _kw, _node),
+    do: {:py_str_rstrip_chars, [], [target, chars]}
 
   defp do_dispatch("startswith", target, [prefix], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :starts_with?]}, [], [target, prefix]}
@@ -315,8 +326,26 @@ defmodule Pylixir.Nodes.AttributeMethods do
       col_offset: Map.get(node, "col_offset")
   end
 
+  # `str.find(sub[, start[, end]])` — returns the leftmost index of
+  # `sub` in the slice `s[start:end]` (translated to absolute), or -1.
   defp do_dispatch("find", target, [sub], _kw, _node),
     do: {:py_str_find, [], [target, sub]}
+
+  defp do_dispatch("find", target, [sub, start], _kw, _node),
+    do: {:py_str_find, [], [target, sub, start]}
+
+  defp do_dispatch("find", target, [sub, start, stop], _kw, _node),
+    do: {:py_str_find, [], [target, sub, start, stop]}
+
+  # `str.rfind(sub[, start[, end]])` — rightmost index, otherwise -1.
+  defp do_dispatch("rfind", target, [sub], _kw, _node),
+    do: {:py_str_rfind, [], [target, sub]}
+
+  defp do_dispatch("rfind", target, [sub, start], _kw, _node),
+    do: {:py_str_rfind, [], [target, sub, start]}
+
+  defp do_dispatch("rfind", target, [sub, start, stop], _kw, _node),
+    do: {:py_str_rfind, [], [target, sub, start, stop]}
 
   defp do_dispatch("count", target, [sub], _kw, _node),
     do: {:py_str_count, [], [target, sub]}
@@ -339,6 +368,35 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("isalnum", target, [], _kw, _node) do
     {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[A-Za-z0-9]+$")]}
+  end
+
+  # `str.islower()` — non-empty AND all cased chars are lowercase AND
+  # at least one cased char exists. `str.isupper()` is the mirror.
+  # Both delegate to a runtime helper so the "at least one cased char"
+  # check stays correct against strings like " ", "123" (those return
+  # False in Python, but a pure regex check would say True).
+  defp do_dispatch("islower", target, [], _kw, _node), do: {:py_str_islower, [], [target]}
+  defp do_dispatch("isupper", target, [], _kw, _node), do: {:py_str_isupper, [], [target]}
+
+  # `str.isspace()` — non-empty AND every char is whitespace.
+  defp do_dispatch("isspace", target, [], _kw, _node) do
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[[:space:]]+$")]}
+  end
+
+  # `str.isdecimal()` / `str.isnumeric()` — Pylixir conflates both with
+  # isdigit for simplicity (Unicode distinctions don't matter for the
+  # ASCII inputs competitive code feeds).
+  defp do_dispatch("isdecimal", target, [], _kw, _node) do
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[0-9]+$")]}
+  end
+
+  defp do_dispatch("isnumeric", target, [], _kw, _node) do
+    {:&&, [], [{:!=, [], [target, ""]}, regex_match(target, "^[0-9]+$")]}
+  end
+
+  # `str.isascii()` — empty OR all chars are ASCII (< 0x80).
+  defp do_dispatch("isascii", target, [], _kw, _node) do
+    {:||, [], [{:==, [], [target, ""]}, regex_match(target, "^[\\x00-\\x7f]+$")]}
   end
 
   # Python's `str.splitlines()` — split on `\r\n`, `\r`, `\n`, and other
@@ -394,18 +452,4 @@ defmodule Pylixir.Nodes.AttributeMethods do
      [{:sigil_r, [], [{:<<>>, [], [pattern]}, []]}, target]}
   end
 
-  # The chars AST has already been converted by emit_attribute_call — for
-  # a Python Constant string, that's just the binary value. Reject if the
-  # resulting AST is a multi-char binary literal.
-  defp reject_multichar_strip!(chars_ast, node)
-       when is_binary(chars_ast) and byte_size(chars_ast) > 1 do
-    raise UnsupportedNodeError,
-      node_type: "Call",
-      hint:
-        "str.strip(<multi-char>) is not supported — Python strips ANY of those chars from ends; Elixir's String.trim/2 strips exactly that string (RFC §6.24)",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
-
-  defp reject_multichar_strip!(_chars, _node), do: :ok
 end

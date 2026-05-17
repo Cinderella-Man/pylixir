@@ -160,15 +160,14 @@ defmodule Pylixir.Nodes.StringMethodsTest do
   end
 
   describe "T29 rejections" do
-    test "multi-char strip raises (RFC §6.24)" do
+    test "multi-char strip lowers to py_str_strip_chars (treats arg as char-set)" do
       python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
 
       case System.cmd(python, ["--version"], stderr_to_stdout: true) do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
-            assert_raise Pylixir.UnsupportedNodeError, ~r/multi-char/, fn ->
-              Pylixir.transpile(~s|"abc".strip("ab")\n|)
-            end
+            out_src = Pylixir.transpile(~s|"abc".strip("ab")\n|)
+            assert out_src =~ "py_str_strip_chars"
           end
 
         _ ->

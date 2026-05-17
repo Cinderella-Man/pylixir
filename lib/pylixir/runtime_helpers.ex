@@ -305,8 +305,70 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
+  # `s.find(sub, start)` / `s.find(sub, start, stop)` — search inside
+  # the slice s[start:stop]. Returned index is absolute (start-relative
+  # is wrong for Python). -1 if not found.
+  def py_str_find(s, sub, start) do
+    case py_str_find(String.slice(s, start..-1//1), sub) do
+      -1 -> -1
+      idx -> idx + start
+    end
+  end
+
+  def py_str_find(s, sub, start, stop) do
+    case py_str_find(String.slice(s, start, stop - start), sub) do
+      -1 -> -1
+      idx -> idx + start
+    end
+  end
+
+  # `s.rfind(sub[, start[, stop]])` — same as find but right-anchored.
+  # Reverse the string + sub, find in reversed, then map back.
+  def py_str_rfind(s, sub) do
+    case String.split(s, sub) do
+      [_] ->
+        -1
+
+      parts ->
+        # Length of everything except the last segment, plus (n-1) sub-lengths,
+        # gives the start of the last sub-occurrence.
+        {init, [_last]} = Enum.split(parts, -1)
+        Enum.reduce(init, 0, fn p, acc -> acc + String.length(p) + String.length(sub) end) -
+          String.length(sub)
+    end
+  end
+
+  def py_str_rfind(s, sub, start), do: py_str_rfind(s, sub, start, String.length(s))
+
+  def py_str_rfind(s, sub, start, stop) do
+    sliced = String.slice(s, start, stop - start)
+
+    case py_str_rfind(sliced, sub) do
+      -1 -> -1
+      idx -> idx + start
+    end
+  end
+
   def py_str_count(s, ""), do: String.length(s) + 1
   def py_str_count(s, sub), do: length(String.split(s, sub)) - 1
+
+  # Python's `str.islower()` / `str.isupper()` — non-empty AND every
+  # cased char matches the predicate AND at least one cased char
+  # exists. A regex like `^[a-z ]+$` would falsely say "abc 123" is
+  # lower-case; Python requires the presence of *at least one* cased
+  # character, which is what the != against the case-flipped form
+  # checks.
+  def py_str_islower(""), do: false
+  def py_str_islower(s) when is_binary(s) do
+    has_cased? = s != String.upcase(s) or s != String.downcase(s)
+    has_cased? and s == String.downcase(s)
+  end
+
+  def py_str_isupper(""), do: false
+  def py_str_isupper(s) when is_binary(s) do
+    has_cased? = s != String.upcase(s) or s != String.downcase(s)
+    has_cased? and s == String.upcase(s)
+  end
 
   # Python's `str.title()` — capitalise the first letter of every run
   # of alphabetic characters; lowercase the rest. Non-alpha chars
@@ -347,6 +409,61 @@ defmodule Pylixir.RuntimeHelpers do
       end
     end)
     |> Enum.join()
+  end
+
+  # Python's `s.strip(chars)` / `s.lstrip(chars)` / `s.rstrip(chars)`
+  # treat `chars` as a SET of chars to strip from the relevant end
+  # repeatedly — NOT a substring (which is what Elixir's String.trim/2
+  # would do). Iterates grapheme by grapheme until a non-set char is
+  # found.
+  def py_str_lstrip_chars(s, chars) when is_binary(s) and is_binary(chars) do
+    set = chars |> String.graphemes() |> MapSet.new()
+    py_str_strip_iter(s, set, :leading)
+  end
+
+  def py_str_rstrip_chars(s, chars) when is_binary(s) and is_binary(chars) do
+    set = chars |> String.graphemes() |> MapSet.new()
+    py_str_strip_iter(s, set, :trailing)
+  end
+
+  def py_str_strip_chars(s, chars) when is_binary(s) and is_binary(chars) do
+    set = chars |> String.graphemes() |> MapSet.new()
+    s |> py_str_strip_iter(set, :leading) |> py_str_strip_iter(set, :trailing)
+  end
+
+  def py_str_strip_iter(s, set, :leading) do
+    case String.next_grapheme(s) do
+      nil -> s
+      {ch, rest} -> if MapSet.member?(set, ch), do: py_str_strip_iter(rest, set, :leading), else: s
+    end
+  end
+
+  def py_str_strip_iter(s, set, :trailing) do
+    case String.last(s) do
+      nil ->
+        s
+
+      ch ->
+        if MapSet.member?(set, ch),
+          do: py_str_strip_iter(String.slice(s, 0, String.length(s) - 1), set, :trailing),
+          else: s
+    end
+  end
+
+  # Python 3.9+ `str.removeprefix(p)` / `str.removesuffix(s)` — strip
+  # exactly one occurrence if the prefix/suffix matches, else return
+  # unchanged. Different from lstrip/rstrip (which strip a *set* of
+  # chars repeatedly).
+  def py_str_remove_prefix(s, prefix) when is_binary(s) and is_binary(prefix) do
+    if String.starts_with?(s, prefix),
+      do: binary_part(s, byte_size(prefix), byte_size(s) - byte_size(prefix)),
+      else: s
+  end
+
+  def py_str_remove_suffix(s, suffix) when is_binary(s) and is_binary(suffix) do
+    if String.ends_with?(s, suffix),
+      do: binary_part(s, 0, byte_size(s) - byte_size(suffix)),
+      else: s
   end
 
   # Python's `str.partition(sep)` / `str.rpartition(sep)` — split into

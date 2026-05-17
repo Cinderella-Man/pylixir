@@ -137,17 +137,8 @@ defmodule Pylixir.Builtins do
   def emit("zip", [a, b | rest], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [[a, b | rest]]}}
 
-  def emit("sum", [xs], _kw) do
-    # Python sum() coerces booleans (RFC §6.11). Use py_add to retain that.
-    reducer =
-      {:fn, [],
-       [
-         {:->, [],
-          [[{:a, [], nil}, {:b, [], nil}], {:py_add, [], [{:a, [], nil}, {:b, [], nil}]}]}
-       ]}
-
-    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, 0, reducer]}}
-  end
+  def emit("sum", [xs], _kw), do: emit_sum(xs, 0)
+  def emit("sum", [xs, start], _kw), do: emit_sum(xs, start)
 
   def emit("min", [xs], kw), do: {:ok, minmax_call(:min, xs, kw)}
   def emit("max", [xs], kw), do: {:ok, minmax_call(:max, xs, kw)}
@@ -321,6 +312,20 @@ defmodule Pylixir.Builtins do
 
   defp sub_one(ast) when is_integer(ast), do: ast - 1
   defp sub_one(ast), do: {:-, [], [ast, 1]}
+
+  defp emit_sum(xs, start) do
+    # Python sum() coerces booleans (RFC §6.11). Use py_add to retain that.
+    # Reducer takes (elem, acc) — pass acc first to py_add so list concat
+    # (`sum([[1,2],[3,4]], [])`) preserves source order: acc ++ elem.
+    reducer =
+      {:fn, [],
+       [
+         {:->, [],
+          [[{:elem, [], nil}, {:acc, [], nil}], {:py_add, [], [{:acc, [], nil}, {:elem, [], nil}]}]}
+       ]}
+
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, start, reducer]}}
+  end
 
   defp classify_float_literal(v) do
     case String.downcase(String.trim(v)) do
