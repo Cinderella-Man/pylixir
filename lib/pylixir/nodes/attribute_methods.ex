@@ -343,11 +343,15 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("rstrip", target, [chars], _kw, _node),
     do: {:py_str_rstrip_chars, [], [target, chars]}
 
+  # `startswith`/`endswith` accept a single string OR a tuple of
+  # strings in Python; Elixir's `String.starts_with?/2` accepts a
+  # string or a LIST. Route through runtime helpers that coerce a
+  # tuple to a list when needed.
   defp do_dispatch("startswith", target, [prefix], _kw, _node),
-    do: {{:., [], [{:__aliases__, [], [:String]}, :starts_with?]}, [], [target, prefix]}
+    do: {:py_str_startswith, [], [target, prefix]}
 
   defp do_dispatch("endswith", target, [suffix], _kw, _node),
-    do: {{:., [], [{:__aliases__, [], [:String]}, :ends_with?]}, [], [target, suffix]}
+    do: {:py_str_endswith, [], [target, suffix]}
 
   # sep.join(items) — RFC §10.1 arg-swap (Python: sep.join(items); Elixir: Enum.join(items, sep))
   defp do_dispatch("join", sep, [items], _kw, _node),
@@ -370,6 +374,12 @@ defmodule Pylixir.Nodes.AttributeMethods do
   end
 
   defp do_dispatch("split", target, [sep], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target, sep]}
+
+  # `split(sep, -1)` means "no limit" in Python (matches the `split(sep)`
+  # form). The literal-(-1) case is folded by the converter to the AST
+  # `-1`, so we recognise it here and route to the plain `String.split/2`.
+  defp do_dispatch("split", target, [sep, -1], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target, sep]}
 
   defp do_dispatch("split", target, [sep, maxsplit], _kw, _node),

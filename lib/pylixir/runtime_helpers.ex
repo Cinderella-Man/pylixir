@@ -56,6 +56,13 @@ defmodule Pylixir.RuntimeHelpers do
   def py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
   def py_add(a, b) when is_number(a) and is_number(b), do: a + b
   def py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
+
+  # Python's `(1, 2) + (3, 4) == (1, 2, 3, 4)` — tuple concat. Round-
+  # trip through lists for the concat (no native tuple-append in BEAM)
+  # and convert back. Matches the existing list/binary concat clauses.
+  def py_add(a, b) when is_tuple(a) and is_tuple(b),
+    do: (Tuple.to_list(a) ++ Tuple.to_list(b)) |> List.to_tuple()
+
   def py_add(a, b), do: a + b
 
   # RFC §6.11 — booleans coerce to ints in arithmetic.
@@ -469,6 +476,10 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str(x) when is_atom(x), do: Atom.to_string(x)
   def py_str(x) when is_list(x), do: py_repr_list(x)
   def py_str(x) when is_tuple(x), do: py_repr_tuple(x)
+  # Python set repr: `{1, 2, 3}` or `set()` for empty. (Python can't
+  # write `{}` for empty set because that's a dict literal; the repr
+  # uses `set()` to disambiguate.)
+  def py_str(%MapSet{} = s), do: py_repr_set(s)
   def py_str(x) when is_map(x) and not is_struct(x), do: py_repr_map(x)
   def py_str(x) when is_float(x), do: py_str_float(x)
   def py_str(x), do: to_string(x)
@@ -480,6 +491,15 @@ defmodule Pylixir.RuntimeHelpers do
   # for whole-number floats like `1000.0` (`"1.0e3"`), which doesn't
   # match Python. We use the short repr as the source of digits and
   # decide format based on the exponent.
+  # BEAM has no IEEE +inf / -inf float representation; `float("inf")`
+  # at the codegen level clamps to `+/- 1.0e308` (the max-finite IEEE
+  # double). Print those exact clamp values back out as `inf`/`-inf`
+  # to match Python's repr. False-positive risk (a real `1.0e308`
+  # computation result) is theoretical — algorithmic Python code
+  # doesn't land on that exact value.
+  def py_str_float(1.0e308), do: "inf"
+  def py_str_float(-1.0e308), do: "-inf"
+
   def py_str_float(x) when is_float(x) do
     s = :erlang.float_to_binary(x, [:short])
 
@@ -573,6 +593,16 @@ defmodule Pylixir.RuntimeHelpers do
   def py_repr_map(m) do
     "{" <>
       Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
+  end
+
+  # `{1, 2, 3}` or `set()`. The empty form disambiguates from `{}`
+  # (which Python parses as a dict). MapSet has no insertion-order
+  # guarantee — output element order may differ from Python.
+  def py_repr_set(%MapSet{} = s) do
+    case MapSet.to_list(s) do
+      [] -> "set()"
+      items -> "{" <> Enum.map_join(items, ", ", &py_repr/1) <> "}"
+    end
   end
 
   def py_repr(x) when is_binary(x), do: "'" <> x <> "'"
@@ -798,6 +828,20 @@ defmodule Pylixir.RuntimeHelpers do
   # repeatedly — NOT a substring (which is what Elixir's String.trim/2
   # would do). Iterates grapheme by grapheme until a non-set char is
   # found.
+  # Python's `s.startswith(prefix_or_tuple)` and `s.endswith(...)` —
+  # the prefix can be a single string OR a tuple of strings. Elixir's
+  # `String.starts_with?/2` accepts a string or a LIST; coerce a
+  # tuple to a list. Single-string case passes through unchanged.
+  def py_str_startswith(s, prefix) when is_tuple(prefix),
+    do: String.starts_with?(s, Tuple.to_list(prefix))
+
+  def py_str_startswith(s, prefix), do: String.starts_with?(s, prefix)
+
+  def py_str_endswith(s, suffix) when is_tuple(suffix),
+    do: String.ends_with?(s, Tuple.to_list(suffix))
+
+  def py_str_endswith(s, suffix), do: String.ends_with?(s, suffix)
+
   def py_str_lstrip_chars(s, chars) when is_binary(s) and is_binary(chars) do
     set = chars |> String.graphemes() |> MapSet.new()
     py_str_strip_iter(s, set, :leading)
@@ -1120,8 +1164,14 @@ defmodule Pylixir.RuntimeHelpers do
   # isn't an Enumerable in Elixir). Used by the star-unpack destructure
   # path (`a, *b = expr`) and anywhere else we need a list from an
   # arbitrary Pylixir-shaped value.
+  # No-op for lists — the common case, called every for-loop iter.
+  def py_iter_to_list(l) when is_list(l), do: l
   def py_iter_to_list(s) when is_binary(s), do: String.graphemes(s)
   def py_iter_to_list(t) when is_tuple(t), do: Tuple.to_list(t)
+  # Python iterates dicts by KEYS, not entries. `Enum.to_list/1` on a
+  # map yields `[{k, v}, ...]` which is `dict.items()` shape — wrong
+  # for `for k in d:`, `list(d)`, `sorted(d)`. Match Python's default.
+  def py_iter_to_list(m) when is_map(m) and not is_struct(m), do: Map.keys(m)
   def py_iter_to_list(other), do: Enum.to_list(other)
 
   # === Slice assignment ===

@@ -215,6 +215,7 @@ defmodule Pylixir.Nodes.Loop do
     pre_loop_context = context
 
     {iter_ast, context} = Converter.convert(iter, context)
+    iter_ast = wrap_for_iter(iter_ast)
     {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
 
     analysis = LoopAnalysis.analyze(body)
@@ -339,6 +340,7 @@ defmodule Pylixir.Nodes.Loop do
     pre_loop_context = context
 
     {iter_ast, context} = Converter.convert(iter, context)
+    iter_ast = wrap_for_iter(iter_ast)
 
     # Save scopes BEFORE convert_loop_target (which binds the target)
     # so we can drop the target binding after the loop. Pylixir's
@@ -537,4 +539,14 @@ defmodule Pylixir.Nodes.Loop do
       nil
     end
   end
+
+  # Wrap a for-loop's iter expression in `py_iter_to_list/1` so Python
+  # iteration semantics match. Without it: `for k in some_dict:` yields
+  # `{k, v}` tuples (Elixir's Map Enumerable), not `k` (Python's dict
+  # iter). `py_iter_to_list/1` is a no-op pass-through for lists,
+  # converts maps to their keys, tuples to lists, strings to graphemes,
+  # and falls back to `Enum.to_list/1` for anything else (ranges, etc.).
+  # Cheap for the common list-iter case; the materialization cost on
+  # ranges is bounded by the iteration itself.
+  defp wrap_for_iter(iter_ast), do: {:py_iter_to_list, [], [iter_ast]}
 end

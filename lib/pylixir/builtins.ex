@@ -103,8 +103,12 @@ defmodule Pylixir.Builtins do
         [{:..//, [], [start, sub_one(stop), step]}]}}
 
   def emit("sorted", [xs], kw) do
-    base = {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs]}
-    {:ok, apply_sorted_kw(base, xs, kw)}
+    # Wrap in `py_iter_to_list/1` so Python iteration semantics apply:
+    # `sorted(d)` returns sorted KEYS of the dict, not sorted entries.
+    # No-op for lists; cheap.
+    coerced = {:py_iter_to_list, [], [xs]}
+    base = {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [coerced]}
+    {:ok, apply_sorted_kw(base, coerced, kw)}
   end
 
   def emit("reversed", [xs], _kw),
@@ -122,8 +126,14 @@ defmodule Pylixir.Builtins do
   def emit("sum", [xs], _kw), do: emit_sum(xs, 0)
   def emit("sum", [xs, start], _kw), do: emit_sum(xs, start)
 
-  def emit("min", [xs], kw), do: {:ok, minmax_call(:min, xs, kw)}
-  def emit("max", [xs], kw), do: {:ok, minmax_call(:max, xs, kw)}
+  # `min(iter)` / `max(iter)` — wrap `iter` in py_iter_to_list so dict
+  # → keys (matching Python's `min({"banana": 1, "apple": 2})` = "apple"
+  # not the entry tuple). No-op for lists.
+  def emit("min", [xs], kw),
+    do: {:ok, minmax_call(:min, {:py_iter_to_list, [], [xs]}, kw)}
+
+  def emit("max", [xs], kw),
+    do: {:ok, minmax_call(:max, {:py_iter_to_list, [], [xs]}, kw)}
   def emit("min", [a, b | rest], _kw), do: {:ok, minmax_variadic(:min, [a, b | rest])}
   def emit("max", [a, b | rest], _kw), do: {:ok, minmax_variadic(:max, [a, b | rest])}
 
@@ -189,8 +199,13 @@ defmodule Pylixir.Builtins do
 
   def emit("list", [], _kw), do: {:ok, []}
 
+  # `list(iter)` — route through `py_iter_to_list/1` so tuples (which
+  # Elixir doesn't treat as Enumerable) and strings (Python iterates
+  # grapheme-by-grapheme) work alongside lists/ranges/maps. Earlier
+  # `Enum.to_list/1` crashed on tuple inputs with
+  # `Protocol.UndefinedError`.
   def emit("list", [x], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}}
+    do: {:ok, {:py_iter_to_list, [], [x]}}
 
   def emit("tuple", [], _kw), do: {:ok, {:{}, [], []}}
 

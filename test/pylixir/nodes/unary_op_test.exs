@@ -18,9 +18,23 @@ defmodule Pylixir.Nodes.UnaryOpTest do
       assert ast == 5
     end
 
-    test "USub emits py_sub(0, x) — handles bool→int coercion per RFC §6.11" do
+    test "USub on a numeric literal constant-folds to the negated literal — preserves IEEE-754 negative zero" do
+      # `-5` folds to `-5`; `-0.0` folds to `-0.0`. Bool-coercion path
+      # (where the operand isn't a number literal at codegen time)
+      # still goes through `py_sub(0, x)` — see the next test.
       {ast, _} = Converter.convert(unary("USub", const(5)), Context.new())
-      assert ast == {:py_sub, [], [0, 5]}
+      assert ast == -5
+
+      {ast_f, _} = Converter.convert(unary("USub", const(0.0)), Context.new())
+      assert ast_f === -0.0
+    end
+
+    test "USub on a non-literal operand emits py_sub(0, x) — handles bool→int coercion per RFC §6.11" do
+      # `-some_name` lowers via `py_sub(0, x)` because `x` is an Elixir
+      # AST node `{:some_name, [], nil}`, not an integer/float literal.
+      name_node = %{"_type" => "Name", "id" => "x", "ctx" => %{"_type" => "Load"}}
+      {ast, _} = Converter.convert(unary("USub", name_node), Context.new())
+      assert ast == {:py_sub, [], [0, {:x, [], nil}]}
     end
 
     test "Invert emits Bitwise.bnot (fully-qualified — no import Bitwise)" do

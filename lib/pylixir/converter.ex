@@ -691,6 +691,18 @@ defmodule Pylixir.Converter do
   # --- Operator emission -------------------------------------------------
 
   defp unary_op_ast(%{"_type" => "UAdd"}, operand_ast, _node), do: operand_ast
+
+  # Constant-fold `-<float-literal>` to the negated literal so IEEE-754
+  # negative-zero survives. `py_sub(0, 0.0)` would yield `0.0` (a
+  # positive zero) — losing the sign and producing `print(-0.0)` →
+  # `"0.0"` instead of Python's `"-0.0"`. Same fold for integer
+  # literals so trivial expressions stay readable.
+  defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node) when is_float(operand_ast),
+    do: -operand_ast
+
+  defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node) when is_integer(operand_ast),
+    do: -operand_ast
+
   defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node), do: {:py_sub, [], [0, operand_ast]}
 
   defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node) do
