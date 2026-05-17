@@ -65,6 +65,16 @@ mix eval.hints                              # all buckets, latest run
 mix eval.hints unsupported--Call            # one bucket, latest run
 mix eval.hints reports/run-<TIMESTAMP>      # explicit run dir
 
+# 2.5. Showcase the package — see Pylixir's actual output.
+#      `eval.show` is a one-file demo (no CPython needed); pair with
+#      `eval.run --save-ok N` to dump N (.py, .ex) before/after pairs
+#      under reports/<ts>/ok/.
+mix eval.show path/to/file.py                  # full Elixir (~2k lines: runtime helpers + user code)
+mix eval.show path/to/file.py --strip-runtime  # just @moduledoc + @docs + user defs + py_main
+mix eval.show path/to/file.py --out f.ex       # write to disk
+mix eval.show Call/4                           # short form (latest run)
+mix eval.run --limit 100 --save-ok 20          # 20 OK pairs in reports/<ts>/ok/
+
 # 3. Probe a sample end-to-end (or a hand-rolled /tmp/probe.py).
 #    Runs CPython (stdin redirected from /dev/null so stdin-reading
 #    samples don't hang), transpiles + compiles + invokes py_main,

@@ -61,6 +61,7 @@ defmodule Pylixir.Converter do
     }
 
     {class_asts, context} = convert_class_defs(analysis.class_defs, context)
+    {hoisted_asts, context} = emit_hoisted_imports(analysis.hoisted_imports, context)
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
     {fn_asts, context} = convert_each(analysis.function_defs, context)
 
@@ -82,7 +83,9 @@ defmodule Pylixir.Converter do
     body_block =
       moduledoc ++
         helpers ++
-        attr_asts ++ class_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
+        attr_asts ++
+        hoisted_asts ++
+        class_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
 
     defmodule_ast =
       {:defmodule, [],
@@ -249,12 +252,54 @@ defmodule Pylixir.Converter do
           "`from functools import #{unknown["name"]}` is not supported (allowed: #{Enum.join(allowed, ", ")})"
     end
 
-    cmp_aliases =
-      Enum.filter(names, fn %{"name" => n} -> n == "cmp_to_key" end)
+    # Each imported name that has a real runtime value (not a no-op
+    # decorator like lru_cache / cache) gets bound as a lambda.
+    # `cmp_to_key` tags its arg `{:py_cmp_to_key, cmp}` for sorted's
+    # routing. `reduce` shims Python's `functools.reduce(fn, iter[, init])`
+    # via Elixir's `Enum.reduce/3` — but only when NOT hoisted to a
+    # module-top defp (see `emit_hoisted_imports/2`); hoisted names
+    # are already module-level so the runtime binding here would
+    # shadow them with a py_main local. The hoisted-name check
+    # mirrors the ImportFrom-stdlib path.
+    runtime_aliases =
+      Enum.filter(names, fn %{"name" => n} = entry ->
+        alias_name = Map.get(entry, "asname") || n
+        already_hoisted? = Map.has_key?(context.known_function_arities, alias_name)
+        n in ~w(cmp_to_key reduce) and not already_hoisted?
+      end)
 
-    case cmp_aliases do
+    case runtime_aliases do
       [] ->
         {{:__block__, [], []}, context}
+
+      [%{"name" => "reduce"} = entry] ->
+        alias_name = Map.get(entry, "asname") || "reduce"
+        atom = alias_name |> Naming.rewrite() |> String.to_atom()
+        # `reduce(fn, iter, init)` — Python's signature. Elixir's
+        # `Enum.reduce/3` takes `(iter, init, fn(x, acc))`, so we
+        # flip both the arg order and the inner-fn arg order.
+        # (2-arg `reduce(fn, iter)` form not supported here; an `fn`
+        # clause can't mix arities.)
+        lambda =
+          {:fn, [],
+           [
+             {:->, [],
+              [
+                [{:fn_arg, [], nil}, {:iter, [], nil}, {:init, [], nil}],
+                {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [],
+                 [
+                   {:iter, [], nil},
+                   {:init, [], nil},
+                   {:fn, [],
+                    [{:->, [], [[{:x, [], nil}, {:acc, [], nil}],
+                                {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}]}]}
+                 ]}
+              ]}
+           ]}
+
+        assign = {:=, [], [{atom, [], nil}, lambda]}
+        context = bind_name(context, alias_name)
+        {assign, context}
 
       [%{"name" => "cmp_to_key"} = entry] ->
         alias_name = Map.get(entry, "asname") || "cmp_to_key"
@@ -295,8 +340,21 @@ defmodule Pylixir.Converter do
           Enum.reduce(names, {[], context}, fn entry, {acc, ctx} ->
             n = entry["name"]
             alias = entry["asname"] || n
-            {stmt, ctx} = stdlib_from_import_alias(mod, impl, n, alias, ctx, node)
-            {[stmt | acc], ctx}
+
+            # Hoisted imports were emitted as module-top defps by
+            # `emit_hoisted_imports/2`. Skip the runtime binding —
+            # the call site routes to the defp via the
+            # `known_functions` check in `emit_name_call`. Still
+            # register the alias→stdlib mapping so call-site arity
+            # mismatch routing (`stdlib_aliases`) keeps working.
+            if Map.has_key?(ctx.known_function_arities, alias) and
+                 MapSet.member?(ctx.known_functions, alias) do
+              ctx = %{ctx | stdlib_aliases: Map.put(ctx.stdlib_aliases, alias, {mod, n})}
+              {[{:__block__, [], []} | acc], ctx}
+            else
+              {stmt, ctx} = stdlib_from_import_alias(mod, impl, n, alias, ctx, node)
+              {[stmt | acc], ctx}
+            end
           end)
 
         body =
@@ -745,6 +803,15 @@ defmodule Pylixir.Converter do
       Builtins.unary_capturable?(id) ->
         {Builtins.unary_capture(id), context}
 
+      arity = Map.get(context.known_function_arities, id) ->
+        # Top-level `def f(args)` referenced as a VALUE (not called):
+        # `lambda f: identity`, `map(int, xs)`, `sorted(xs, key=hash)`.
+        # Emit `&f/arity` so Elixir treats it as a callable function
+        # value; without this the bare name `f` is a variable lookup
+        # and fails compilation with "undefined variable".
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        {{:&, [], [{:/, [], [{atom, [], nil}, arity]}]}, context}
+
       true ->
         atom = id |> Naming.rewrite() |> String.to_atom()
         {{atom, [], nil}, context}
@@ -783,6 +850,87 @@ defmodule Pylixir.Converter do
       node_type: type,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- Hoisted stdlib imports ------------------------------------------
+  #
+  # `ModuleAnalysis.hoistable_imports/1` selects `from <stdlib> import
+  # <name>` cases where the binding is a pure function — emit those as
+  # module-top `defp`s so top-level user `def`s can call them without
+  # being demoted into py_main lambdas. Each clause below mirrors the
+  # runtime lambda shape that the corresponding `Stdlib.<Mod>` import
+  # path would otherwise emit at runtime; keeping them in sync is the
+  # cost of avoiding closure-demotion for the common case.
+
+  defp emit_hoisted_imports([], context), do: {[], context}
+
+  defp emit_hoisted_imports(imports, context) do
+    asts =
+      Enum.map(imports, fn {alias_n, orig, mod, _arity} ->
+        hoisted_defp(mod, orig, alias_n)
+      end)
+
+    {asts, context}
+  end
+
+  defp hoisted_defp("functools", "reduce", alias_n) do
+    name = alias_n |> Naming.rewrite() |> String.to_atom()
+
+    body =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [],
+       [
+         {:iter, [], nil},
+         {:init, [], nil},
+         {:fn, [],
+          [{:->, [], [
+            [{:x, [], nil}, {:acc, [], nil}],
+            {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}
+          ]}]}
+       ]}
+
+    {:defp, [],
+     [
+       {name, [], [{:fn_arg, [], nil}, {:iter, [], nil}, {:init, [], nil}]},
+       [do: body]
+     ]}
+  end
+
+  defp hoisted_defp("itertools", "repeat", alias_n) do
+    name = alias_n |> Naming.rewrite() |> String.to_atom()
+
+    body =
+      {{:., [], [{:__aliases__, [], [:List]}, :duplicate]}, [],
+       [{:elem, [], nil}, {:times, [], nil}]}
+
+    {:defp, [],
+     [
+       {name, [], [{:elem, [], nil}, {:times, [], nil}]},
+       [do: body]
+     ]}
+  end
+
+  defp hoisted_defp("itertools", "chain", alias_n) do
+    name = alias_n |> Naming.rewrite() |> String.to_atom()
+    body = {:py_itertools_chain, [], [{:iters, [], nil}]}
+
+    {:defp, [],
+     [{name, [], [{:iters, [], nil}]}, [do: body]]}
+  end
+
+  defp hoisted_defp("itertools", "accumulate", alias_n) do
+    name = alias_n |> Naming.rewrite() |> String.to_atom()
+    body = {:py_itertools_accumulate, [], [{:iter, [], nil}]}
+
+    {:defp, [],
+     [{name, [], [{:iter, [], nil}]}, [do: body]]}
+  end
+
+  defp hoisted_defp("itertools", "groupby", alias_n) do
+    name = alias_n |> Naming.rewrite() |> String.to_atom()
+    body = {:py_itertools_groupby, [], [{:iter, [], nil}]}
+
+    {:defp, [],
+     [{name, [], [{:iter, [], nil}]}, [do: body]]}
   end
 
   # --- Expr-clause helpers (statement-form mutations & class calls) ------

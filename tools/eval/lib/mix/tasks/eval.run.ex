@@ -42,6 +42,7 @@ defmodule Mix.Tasks.Eval.Run do
     skip: :integer,
     concurrency: :integer,
     samples_per_bucket: :integer,
+    save_ok: :integer,
     dataset: :string,
     split: :string,
     field: :string,

@@ -42,7 +42,11 @@ defmodule Pylixir.ModuleAnalysis do
           function_defs: [map()],
           runtime_statements: [map()],
           known_functions: MapSet.t(String.t()),
+          known_function_arities: %{optional(String.t()) => non_neg_integer()},
           class_defs: [Pylixir.ClassAnalysis.t()],
+          # `[{alias_name, original_name, mod_name, arity}]` — stdlib
+          # imports we hoist to module-top defps. See `hoistable_imports/1`.
+          hoisted_imports: [{String.t(), String.t(), String.t(), non_neg_integer()}],
           module_doc: nil | String.t()
         }
 
@@ -50,7 +54,9 @@ defmodule Pylixir.ModuleAnalysis do
             function_defs: [],
             runtime_statements: [],
             known_functions: MapSet.new(),
+            known_function_arities: %{},
             class_defs: [],
+            hoisted_imports: [],
             module_doc: nil
 
   @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault
@@ -88,6 +94,8 @@ defmodule Pylixir.ModuleAnalysis do
     {module_doc, body} = extract_module_docstring(body)
     {class_nodes, body_no_classes} = extract_classes(body)
     class_defs = Enum.map(class_nodes, &Pylixir.ClassAnalysis.analyze/1)
+    hoisted_imports = hoistable_imports(body_no_classes)
+    hoisted_names = MapSet.new(hoisted_imports, fn {alias_n, _, _, _} -> alias_n end)
     promotable = mutation_free_literal_names(body_no_classes)
     reject_mutated_in_top_defs!(body_no_classes, promotable)
     {attrs, fns, stmts} = partition(body_no_classes, promotable)
@@ -104,22 +112,84 @@ defmodule Pylixir.ModuleAnalysis do
     # it back into runtime_statements at its original position — the
     # nested-FunctionDef path will emit it as a `name = fn ... end`
     # lambda closure that does close over the surrounding scope.
-    mutable_module_names = mutable_top_level_names(body, attrs)
+    # Hoisted-import names DON'T count as runtime-mutable (they
+    # become module-top defps via the Converter Module clause), so
+    # excluding them stops `def f(x): return reduce(...)` from
+    # getting demoted unnecessarily.
+    mutable_module_names =
+      mutable_top_level_names(body, attrs)
+      |> MapSet.difference(hoisted_names)
+
     {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
 
     stmts = merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
 
-    known = MapSet.new(fns, & &1["name"])
+    fn_known = MapSet.new(fns, & &1["name"])
+    # Hoisted import names also become module-top defps, so they
+    # behave like top-level functions for call-site routing.
+    known = MapSet.union(fn_known, hoisted_names)
+
+    # Arity = positional-arg count, including any with defaults. Used
+    # by the Name converter to emit `&fn/arity` capture when a
+    # top-level def is referenced as a value (e.g. `map(int, xs)` or
+    # `lambda f: identity`). Variadic functions (*args / **kwargs)
+    # don't appear here — captures need a fixed arity.
+    fn_arities =
+      for fn_node <- fns,
+          args = fn_node["args"],
+          args["vararg"] == nil,
+          args["kwarg"] == nil,
+          into: %{} do
+        {fn_node["name"], length(args["args"])}
+      end
+
+    import_arities =
+      for {alias_n, _orig, _mod, arity} <- hoisted_imports, into: %{} do
+        {alias_n, arity}
+      end
+
+    arities = Map.merge(fn_arities, import_arities)
 
     %__MODULE__{
       module_attrs: attrs,
       function_defs: fns,
       runtime_statements: stmts,
       known_functions: known,
+      known_function_arities: arities,
       class_defs: class_defs,
+      hoisted_imports: hoisted_imports,
       module_doc: module_doc
     }
   end
+
+  # `from <stdlib> import <name>` cases where the binding is a
+  # pure (capture-free) function — hoistable to a module-top defp
+  # instead of a py_main local. Returns `[{alias_name, original_name,
+  # mod_name, arity}]`. Conservative: only the imports we have an
+  # explicit hardcoded shape for (in
+  # `Pylixir.Converter.emit_hoisted_imports/1`).
+  defp hoistable_imports(body) do
+    Enum.flat_map(body, fn
+      %{"_type" => "ImportFrom", "module" => mod, "names" => names}
+      when mod in ~w(functools itertools) ->
+        Enum.flat_map(names, fn %{"name" => n} = entry ->
+          case import_arity(mod, n) do
+            nil -> []
+            arity -> [{Map.get(entry, "asname") || n, n, mod, arity}]
+          end
+        end)
+
+      _ ->
+        []
+    end)
+  end
+
+  defp import_arity("functools", "reduce"), do: 3
+  defp import_arity("itertools", "repeat"), do: 2
+  defp import_arity("itertools", "chain"), do: 1
+  defp import_arity("itertools", "accumulate"), do: 1
+  defp import_arity("itertools", "groupby"), do: 1
+  defp import_arity(_, _), do: nil
 
   # Collect ClassDef nodes from both the module top AND any nested
   # position inside a top-level FunctionDef body (recursively across
@@ -366,9 +436,24 @@ defmodule Pylixir.ModuleAnalysis do
     MapSet.member?(names, id) and not MapSet.member?(locals, id)
   end
 
-  defp refs_free_name?(%{"_type" => type}, _names, _locals)
-       when type in ~w(FunctionDef AsyncFunctionDef Lambda ClassDef),
-       do: false
+  defp refs_free_name?(%{"_type" => "ClassDef"}, _names, _locals), do: false
+
+  # Lambdas and nested FunctionDefs are both Python closures — they
+  # inherit the enclosing scope, so a reference to a runtime-bound
+  # name inside them still triggers closure-demotion of the outer
+  # def. Walk into the body, extending `locals` with the inner
+  # function's own parameter names so they don't shadow demotion
+  # candidates.
+  defp refs_free_name?(%{"_type" => "Lambda", "args" => args, "body" => body}, names, locals) do
+    inner_locals = MapSet.union(locals, MapSet.new(arg_names(args)))
+    refs_free_name?(body, names, inner_locals)
+  end
+
+  defp refs_free_name?(%{"_type" => type, "args" => args, "body" => body}, names, locals)
+       when type in ~w(FunctionDef AsyncFunctionDef) do
+    inner_locals = MapSet.union(locals, MapSet.new(arg_names(args)))
+    refs_free_name?(body, names, inner_locals)
+  end
 
   defp refs_free_name?(%{"_type" => _} = node, names, locals) do
     node

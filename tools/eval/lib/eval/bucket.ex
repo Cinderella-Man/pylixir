@@ -39,12 +39,16 @@ defmodule Eval.Bucket do
           | {:internal, atom()}
 
   @spec classify(sample(), outcome()) :: {bucket_key(), metadata()}
-  def classify(_sample, {:transpile_ok, _src, {:compile_ok, diagnostics}}) do
+  def classify(_sample, {:transpile_ok, src, {:compile_ok, diagnostics}}) do
     real = Enum.reject(diagnostics, &stylistic?/1)
 
     case real do
       [] ->
-        {:ok, %{diagnostics: diagnostics}}
+        # Stash the generated Elixir on `:ok` metadata so
+        # `Eval.Report.write/2`'s `--save-ok` path can write the
+        # `.py` + `.ex` pair without re-transpiling. Other buckets
+        # don't carry the source — they don't need it.
+        {:ok, %{diagnostics: diagnostics, elixir_source: src}}
 
       [first | _] ->
         {{:compile_error, fingerprint(first)},

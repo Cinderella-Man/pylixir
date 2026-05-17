@@ -22,6 +22,7 @@ defmodule Eval.Report do
     write_json(run_dir, accumulator)
     write_markdown(run_dir, accumulator)
     write_failure_samples(run_dir, accumulator)
+    write_ok_samples(run_dir, accumulator)
 
     run_dir
   end
@@ -116,6 +117,46 @@ defmodule Eval.Report do
         end)
       end
     end)
+  end
+
+  # `--save-ok N` populates `accumulator.samples[:ok]` (capped by N).
+  # For each entry, write the Python source and the generated Elixir
+  # side-by-side under `reports/<ts>/ok/`. Browse the directory to see
+  # real Python → Elixir pairs; pair well with `mix eval.show` for
+  # one-off pretty-print. Skipped silently when no OK samples were
+  # collected (the default, since `--save-ok` defaults to 0).
+  defp write_ok_samples(run_dir, acc) do
+    entries = Map.get(acc.samples, :ok, [])
+
+    unless entries == [] do
+      ok_dir = Path.join(run_dir, "ok")
+      File.mkdir_p!(ok_dir)
+
+      entries
+      |> Enum.with_index(1)
+      |> Enum.each(fn {entry, idx} ->
+        padded = String.pad_leading(Integer.to_string(idx), 3, "0")
+        py_path = Path.join(ok_dir, "#{padded}.py")
+        ex_path = Path.join(ok_dir, "#{padded}.ex")
+
+        File.write!(py_path, build_ok_python_file(entry))
+
+        case entry.metadata[:elixir_source] do
+          nil -> :ok
+          src -> File.write!(ex_path, src)
+        end
+      end)
+    end
+  end
+
+  defp build_ok_python_file(entry) do
+    """
+    # sample id: #{entry.id}
+    # bucket: :ok
+    # see the matching <NNN>.ex in this directory for the generated Elixir
+
+    #{entry.source}
+    """
   end
 
   defp build_sample_file(bucket_key, entry) do

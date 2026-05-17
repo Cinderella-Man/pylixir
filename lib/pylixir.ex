@@ -30,7 +30,10 @@ defmodule Pylixir do
   @spec to_source(map()) :: String.t()
   def to_source(python_ast) when is_map(python_ast) do
     analysis = ModuleAnalysis.analyze(python_ast["body"] || [])
-    context = Context.new(analysis.known_functions)
+    context = %{
+      Context.new(analysis.known_functions)
+      | known_function_arities: analysis.known_function_arities
+    }
     {elixir_ast, _context} = Converter.convert(python_ast, context, analysis)
     Formatter.format(elixir_ast)
   end

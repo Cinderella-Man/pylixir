@@ -58,6 +58,9 @@ defmodule Eval do
       opts[:concurrency] || System.schedulers_online() * @default_concurrency_multiplier
 
     samples_per_bucket = opts[:samples_per_bucket] || @default_samples_per_bucket
+    # `--save-ok N` overrides the cap *only for the :ok bucket* — the
+    # showcase workflow wants more clean transpiles than failures.
+    save_ok = opts[:save_ok] || 0
     on_sample = opts[:on_sample] || fn _ -> :ok end
 
     initial = %{
@@ -84,11 +87,13 @@ defmodule Eval do
         update_in(acc.totals.skipped, &(&1 + 1))
 
       {:ok, {sample, bucket_key, metadata}}, acc ->
+        cap = if bucket_key == :ok, do: save_ok, else: samples_per_bucket
+
         acc
         |> update_in([:totals, :processed], &(&1 + 1))
         |> maybe_count_transpiled(bucket_key)
         |> bump_count(bucket_key)
-        |> maybe_store_sample(bucket_key, sample, metadata, samples_per_bucket)
+        |> maybe_store_sample(bucket_key, sample, metadata, cap)
 
       {:exit, reason}, acc ->
         IO.warn("worker task exited: #{inspect(reason)}")
