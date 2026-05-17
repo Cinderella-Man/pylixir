@@ -52,6 +52,59 @@ defmodule Pylixir.Builtins do
   @spec supported?(String.t()) :: boolean()
   def supported?(id), do: MapSet.member?(@supported, id)
 
+  # Python builtins that Pylixir knows about but deliberately does NOT
+  # lower. Without this set, a bare call like `iter(xs)` or `eval(s)`
+  # would fall through the Converter's Name-call clause and become a
+  # raw `iter(xs)` Elixir call — which then fails at compile time with
+  # `undefined function iter/1` and surfaces as a generic
+  # `compile_error--compile_quoted_raised` bucket with no actionable
+  # hint. Catching them here turns the silent compile error into a
+  # transpile-time `unsupported--Call` with a precise reason, so eval
+  # buckets are informative.
+  @unsupported %{
+    "iter" => "iterator protocol (`iter`/`next`) is not supported",
+    "next" => "iterator protocol (`iter`/`next`) is not supported",
+    "eval" => "`eval` (runtime code evaluation) is not supported",
+    "exec" => "`exec` (runtime code evaluation) is not supported",
+    "compile" => "`compile` (runtime code evaluation) is not supported",
+    "getattr" => "dynamic attribute access (`getattr`) is not supported",
+    "setattr" => "dynamic attribute mutation (`setattr`) is not supported",
+    "hasattr" => "dynamic attribute access (`hasattr`) is not supported",
+    "delattr" => "dynamic attribute deletion (`delattr`) is not supported",
+    "vars" => "`vars` (introspection) is not supported",
+    "locals" => "`locals` (introspection) is not supported",
+    "globals" => "`globals` (introspection) is not supported",
+    "dir" => "`dir` (introspection) is not supported",
+    "id" => "`id` (object identity) is not supported",
+    "hash" => "`hash` is not supported",
+    "callable" => "`callable` is not supported",
+    "super" => "`super` (classes are not supported)",
+    # NOTE: `open` is deliberately not listed. The competitive-code
+    # idiom `open(0).read()` reaches stdin via attribute_methods.ex's
+    # receiver-discarding `.read()` clause — rejecting `open` here
+    # would break that path. Real file I/O (e.g. `with open(p) as f`)
+    # fails downstream in the With clause; that's the right layer.
+    "slice" => "`slice` objects are not supported",
+    "bytes" => "`bytes` is not supported",
+    "bytearray" => "`bytearray` is not supported",
+    "memoryview" => "`memoryview` is not supported",
+    "complex" => "`complex` numbers are not supported",
+    "issubclass" => "`issubclass` (classes are not supported)",
+    "property" => "`property` (classes are not supported)",
+    "classmethod" => "`classmethod` (classes are not supported)",
+    "staticmethod" => "`staticmethod` (classes are not supported)",
+    "object" => "`object` (classes are not supported)",
+    "__import__" => "`__import__` (dynamic import) is not supported",
+    "breakpoint" => "`breakpoint` is not supported",
+    "help" => "`help` is not supported",
+    "ascii" => "`ascii` is not supported",
+    "aiter" => "async iteration is not supported",
+    "anext" => "async iteration is not supported"
+  }
+
+  @spec unsupported_hint(String.t()) :: String.t() | nil
+  def unsupported_hint(id), do: Map.get(@unsupported, id)
+
   # Builtins with a clean single-arg `emit/3` clause. When a bare Python
   # reference to one of these (e.g. `map(int, xs)`) reaches the Name
   # converter, emit a unary lambda delegating to that clause rather than

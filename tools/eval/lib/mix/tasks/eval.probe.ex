@@ -17,7 +17,14 @@ defmodule Mix.Tasks.Eval.Probe do
   ## Usage
 
       mix eval.probe path/to/file.py
+      mix eval.probe Call/4                  # short form: latest run
+      mix eval.probe unsupported--Call/4     # full bucket slug also fine
       mix eval.probe path/to/file.py --show
+
+  Short forms resolve `<bucket>/<n>` against the most recent
+  `reports/run-*` directory: `Call` matches any bucket slug containing
+  the word (`unsupported--Call`), and `<n>` is the integer sample
+  index — leading zeros optional (`4` → `004.py`).
 
   ## Flags
 
@@ -38,8 +45,8 @@ defmodule Mix.Tasks.Eval.Probe do
 
     file =
       case positional do
-        [f] -> f
-        _ -> Mix.raise("usage: mix eval.probe <file.py> [--show]")
+        [f] -> resolve_sample(f)
+        _ -> Mix.raise("usage: mix eval.probe <file.py | bucket/N> [--show]")
       end
 
     unless File.exists?(file), do: Mix.raise("file not found: #{file}")
@@ -64,10 +71,88 @@ defmodule Mix.Tasks.Eval.Probe do
     diff(actual, expected)
   end
 
+  # --- input resolution ------------------------------------------------
+
+  # Pass through real paths; otherwise interpret as `<bucket>/<n>` and
+  # resolve against the latest `reports/run-*` directory.
+  defp resolve_sample(arg) do
+    cond do
+      File.exists?(arg) ->
+        arg
+
+      String.contains?(arg, "/") ->
+        [bucket, index] = String.split(arg, "/", parts: 2)
+        latest = latest_report_dir!()
+        bucket_dir = match_bucket_dir!(latest, bucket)
+        file = sample_filename!(bucket_dir, index)
+        Path.join(bucket_dir, file)
+
+      true ->
+        Mix.raise("not a file and not a bucket/N shorthand: #{arg}")
+    end
+  end
+
+  defp latest_report_dir! do
+    case Path.wildcard("reports/run-*") |> Enum.sort() |> List.last() do
+      nil -> Mix.raise("no reports/run-* directories found — run `mix eval.run` first")
+      dir -> dir
+    end
+  end
+
+  # Accept both exact slugs (`unsupported--Call`) and shortened tails
+  # (`Call`). Ambiguous shortenings raise so the caller picks one.
+  defp match_bucket_dir!(report_dir, bucket) do
+    failures = Path.join(report_dir, "failures")
+
+    case File.ls(failures) do
+      {:ok, names} ->
+        candidates =
+          Enum.filter(names, fn n ->
+            n == bucket or String.ends_with?(n, "--" <> bucket) or
+              String.contains?(n, bucket)
+          end)
+
+        case candidates do
+          [match] -> Path.join(failures, match)
+          [] -> Mix.raise("no bucket matching `#{bucket}` under #{failures}")
+          many -> Mix.raise("ambiguous bucket `#{bucket}`: #{Enum.join(many, ", ")}")
+        end
+
+      {:error, _} ->
+        Mix.raise("no failures/ dir under #{report_dir}")
+    end
+  end
+
+  defp sample_filename!(bucket_dir, index) do
+    # Reports store samples as `NNN.py` (3-digit zero-padded). Accept
+    # any positive integer; pad it.
+    case Integer.parse(index) do
+      {n, ""} when n >= 0 ->
+        padded = n |> Integer.to_string() |> String.pad_leading(3, "0")
+        name = padded <> ".py"
+
+        unless File.exists?(Path.join(bucket_dir, name)),
+          do: Mix.raise("no sample #{name} under #{bucket_dir}")
+
+        name
+
+      _ ->
+        Mix.raise("expected integer sample index, got `#{index}`")
+    end
+  end
+
   # --- pipeline stages -------------------------------------------------
 
   defp run_python(file) do
-    case System.cmd("python3", [file], stderr_to_stdout: false) do
+    # Redirect stdin from /dev/null so CPython sees EOF on reads —
+    # matches the Pylixir side, where the runtime's `py_stdin_*`
+    # helpers also see EOF (capture_io supplies no input). Without
+    # this, any sample that calls `sys.stdin.read()` blocks the
+    # probe until the Mix task's outer timeout. Same trick as
+    # `test/pylixir/golden_corpus_test.exs:43`.
+    case System.cmd("sh", ["-c", "exec python3 \"$0\" < /dev/null", file],
+           stderr_to_stdout: false
+         ) do
       {stdout, 0} ->
         stdout
 

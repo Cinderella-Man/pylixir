@@ -136,4 +136,94 @@ defmodule Pylixir.TranspileTest do
       end
     end
   end
+
+  describe "unsupported Python builtins are caught at transpile time" do
+    # Regression: bare calls to known-unsupported builtins (`iter`,
+    # `next`, `eval`, ...) used to fall through the Call clause as
+    # raw Elixir function references, producing opaque downstream
+    # `undefined function iter/1` compile errors with no actionable
+    # hint (eval-corpus bucket `compile_error--compile_quoted_raised`).
+    # `Pylixir.Builtins.unsupported_hint/1` now flags them at transpile.
+
+    test "`iter(xs)` raises with `iter`/`next` hint" do
+      if python_available?() do
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile("iter([1, 2, 3])\n")
+          end
+
+        assert err.node_type == "Call"
+        assert err.hint =~ "iter"
+        assert err.lineno == 1
+      end
+    end
+
+    test "`next(it)` raises with `iter`/`next` hint" do
+      if python_available?() do
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile("next(x)\n")
+          end
+
+        assert err.node_type == "Call"
+        assert err.hint =~ "next"
+      end
+    end
+
+    test "`eval(s)` raises with `eval` hint" do
+      if python_available?() do
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile("eval(\"1 + 1\")\n")
+          end
+
+        assert err.node_type == "Call"
+        assert err.hint =~ "eval"
+      end
+    end
+
+    test "`getattr(o, n)` raises with dynamic-attribute hint" do
+      if python_available?() do
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile("getattr(x, \"a\")\n")
+          end
+
+        assert err.node_type == "Call"
+        assert err.hint =~ "getattr"
+      end
+    end
+
+    test "user `def` shadowing an unsupported builtin name is NOT rejected" do
+      # If the user defines `def hash(x): return x`, calls to `hash(5)`
+      # resolve to the local def and must reach the Name-in-scope clause
+      # before the unsupported-builtin check fires. Without this, every
+      # codebase that reused a builtin's name for its own helper would
+      # break at transpile.
+      if python_available?() do
+        src = """
+        def hash(x):
+            return x + 1
+
+        print(hash(5))
+        """
+
+        out = Pylixir.transpile(src)
+        assert out =~ "defmodule TranslatedCode"
+      end
+    end
+
+    test "`open(0).read()` still works — receiver-discard idiom preserved" do
+      # `.read()` in attribute_methods.ex discards its receiver and
+      # lowers to `py_stdin_read/0`, which is why `open(0).read()`
+      # transpiles cleanly despite `open` being unsupported as
+      # general file I/O. Rejecting `open` here would break the
+      # competitive-code stdin idiom — see the comment on the
+      # `@unsupported` map in `Pylixir.Builtins`.
+      if python_available?() do
+        out = Pylixir.transpile("data = open(0).read()\nprint(data)\n")
+        assert out =~ "py_stdin_read"
+      end
+    end
+  end
 end

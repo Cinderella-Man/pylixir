@@ -16,11 +16,15 @@ defmodule Mix.Tasks.Eval.Hints do
 
   ## Usage
 
+      mix eval.hints                            # auto-pick latest run
+      mix eval.hints <bucket-slug>              # latest run, one bucket
       mix eval.hints <report-dir>
       mix eval.hints <report-dir> <bucket-slug>
 
   ## Examples
 
+      mix eval.hints
+      mix eval.hints unsupported--Call
       mix eval.hints reports/run-2026-05-17T14-22-08Z
       mix eval.hints reports/run-2026-05-17T14-22-08Z unsupported--Call
   """
@@ -36,16 +40,40 @@ defmodule Mix.Tasks.Eval.Hints do
   @impl true
   def run(argv) do
     case argv do
-      [report_dir] ->
+      [] ->
+        report_dir = latest_report_dir!()
+        announce(report_dir)
         emit(report_dir, all_buckets(report_dir))
+
+      [maybe_dir_or_slug] ->
+        if File.dir?(maybe_dir_or_slug) do
+          emit(maybe_dir_or_slug, all_buckets(maybe_dir_or_slug))
+        else
+          # Treat as a bucket-slug against the latest report.
+          report_dir = latest_report_dir!()
+          announce(report_dir)
+          emit(report_dir, [Path.join([report_dir, "failures", maybe_dir_or_slug])])
+        end
 
       [report_dir, bucket_slug] ->
         emit(report_dir, [Path.join([report_dir, "failures", bucket_slug])])
 
       _ ->
-        Mix.raise("usage: mix eval.hints <report-dir> [<bucket-slug>]")
+        Mix.raise("usage: mix eval.hints [<report-dir>] [<bucket-slug>]")
     end
   end
+
+  # ISO-8601 timestamps sort lexically, so the lexically-greatest
+  # `reports/run-*` directory is the most recent run. No mtime stat
+  # needed.
+  defp latest_report_dir! do
+    case Path.wildcard("reports/run-*") |> Enum.sort() |> List.last() do
+      nil -> Mix.raise("no reports/run-* directories found — run `mix eval.run` first")
+      dir -> dir
+    end
+  end
+
+  defp announce(report_dir), do: IO.puts("# report: #{report_dir}\n")
 
   defp all_buckets(report_dir) do
     failures = Path.join(report_dir, "failures")

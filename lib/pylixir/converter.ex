@@ -17,6 +17,7 @@ defmodule Pylixir.Converter do
     Context,
     ControlFlow,
     HelpersCodegen,
+    LoopAnalysis,
     Lowering,
     ModuleAnalysis,
     Naming,
@@ -419,6 +420,29 @@ defmodule Pylixir.Converter do
     orelse = Map.get(node, "orelse", [])
     finalbody = Map.get(node, "finalbody", [])
 
+    # Compute the set of names assigned inside the try body (and
+    # `else`) BEFORE conversion — this is the set of bindings that
+    # need to escape the Elixir `try do ... end` scope. Without
+    # threading them out, code like
+    #   try: fact = ...
+    #   except: ...
+    #   q = fact // p
+    # fails to compile because `fact` is bound only inside the try
+    # scope and the post-try read sees an undefined variable.
+    pre_try_context = context
+
+    assigned =
+      (body ++ orelse)
+      |> LoopAnalysis.analyze()
+      |> Map.get(:assigned_vars)
+      |> MapSet.to_list()
+      |> Enum.sort()
+      # Only thread out names NOT already bound in the surrounding
+      # scope — those already-bound names would shadow the outer
+      # value with `nil` on the rescue path. (Outer bindings stay
+      # outer; only NEW names get the bind-or-nil treatment.)
+      |> Enum.reject(&var_bound?(pre_try_context, &1))
+
     {body_asts, context} = convert_each(body, context)
     body_block = body_to_block(body_asts)
 
@@ -433,6 +457,8 @@ defmodule Pylixir.Converter do
           {body_to_block([body_block, else_block]), context}
       end
 
+    body_block = append_binding_tuple(body_block, assigned)
+
     {rescue_clauses, context} =
       Enum.map_reduce(handlers, context, fn handler, ctx ->
         {handler_asts, ctx} = convert_each(handler["body"] || [], ctx)
@@ -440,6 +466,17 @@ defmodule Pylixir.Converter do
         # Catch-any pattern; ignore the type (Pylixir doesn't track
         # exception classes) and the optional `as e` binding (the
         # user's `e` would shadow our pinned `_`).
+        #
+        # Pre-bind every threaded name to `nil` so the appended
+        # binding tuple references defined variables even when the
+        # handler short-circuits (e.g. `except: return default` —
+        # `return` lowers to a throw, so the binding tuple is
+        # unreachable at runtime but still gets compile-time
+        # variable resolution). Handler-side assignments rebind the
+        # nils; Elixir treats rebinding as plain reassignment, no
+        # shadow warning.
+        handler_block = prepend_nil_bindings(handler_block, assigned)
+        handler_block = append_binding_tuple(handler_block, assigned)
         {{:->, [], [[{:_, [], nil}], handler_block]}, ctx}
       end)
 
@@ -462,7 +499,23 @@ defmodule Pylixir.Converter do
           {[do: body_block, rescue: rescue_clauses, after: after_block], context}
       end
 
-    {{:try, [], [try_args]}, context}
+    try_expr = {:try, [], [try_args]}
+
+    case assigned do
+      [] ->
+        {try_expr, context}
+
+      _ ->
+        # Pattern-match the try expression's result into the outer
+        # scope so the assigned names survive the try boundary.
+        # `_try_value` discards the body's tail expression value (we
+        # only care about the bindings). Bind each name in the
+        # surrounding context too.
+        names = Enum.map(assigned, &name_atom_ref/1)
+        pattern = tuple_pattern([{:_try_value, [], nil} | names])
+        context = Enum.reduce(assigned, context, fn n, ctx -> bind_name(ctx, n) end)
+        {{:=, [], [pattern, try_expr]}, context}
+    end
   end
 
   # Expr: drop the result unless the inner value is a recognised
@@ -649,6 +702,39 @@ defmodule Pylixir.Converter do
       node_type: type,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- `try` binding-threading helpers -----------------------------------
+  #
+  # Together these make names first-assigned inside a Python `try` body
+  # visible after the Elixir `try ... end` expression. See the Try
+  # `convert/2` clause above for the full lowering and the rescue-side
+  # nil-prebind rationale.
+
+  defp name_atom_ref(name) do
+    atom = name |> Naming.rewrite() |> String.to_atom()
+    {atom, [], nil}
+  end
+
+  # Append `{tail_value, var1, var2, ...}` to a block expression so the
+  # surrounding `try`/`rescue` clause's result carries the bindings.
+  defp append_binding_tuple(block, []), do: block
+
+  defp append_binding_tuple(block, names) do
+    refs = Enum.map(names, &name_atom_ref/1)
+    body_to_block([block, tuple_pattern([block_tail_marker() | refs])])
+  end
+
+  defp block_tail_marker, do: nil
+
+  # Prepend `name = nil` for each name to a block. Used in `try`'s
+  # rescue clause so the appended binding tuple always references
+  # in-scope variables; see the call site for the full reasoning.
+  defp prepend_nil_bindings(block, []), do: block
+
+  defp prepend_nil_bindings(block, names) do
+    nil_binds = Enum.map(names, fn n -> {:=, [], [name_atom_ref(n), nil]} end)
+    body_to_block(nil_binds ++ [block])
   end
 
   # --- heapq statement-mutation rebind emitter ---------------------------
@@ -931,6 +1017,25 @@ defmodule Pylixir.Converter do
               node,
               context
             )
+
+          hint = Builtins.unsupported_hint(id) ->
+            # Known Python builtin we deliberately don't lower (iter,
+            # next, eval, ...) — fail loudly at transpile time instead
+            # of emitting a bare call that breaks compilation later.
+            # Skip when the user has shadowed the builtin with their
+            # own top-level `def` of the same name; that resolves to
+            # the user's function via the bare-call fallthrough.
+            if MapSet.member?(context.known_functions, id) do
+              no_kwargs!(kwargs, id, node)
+              atom = id |> Naming.rewrite() |> String.to_atom()
+              {{atom, [], arg_asts}, context}
+            else
+              raise UnsupportedNodeError,
+                node_type: "Call",
+                hint: hint,
+                lineno: Map.get(node, "lineno"),
+                col_offset: Map.get(node, "col_offset")
+            end
 
           true ->
             no_kwargs!(kwargs, id, node)
