@@ -20,6 +20,35 @@ Needs Elixir 1.19+, OTP 26+, Python 3.14+.
 
 ## The loop
 
+**The point of the loop is to grow what Pylixir can do.** Every
+iteration should land one of:
+
+1. **A new feature** — make a previously-rejected Python construct
+   transpile correctly (Loop examples: `while/else` lowering,
+   `re.DOTALL`/`MULTILINE`/`IGNORECASE` + `flags=` kwarg,
+   `from itertools import groupby`, `from functools import cmp_to_key`
+   + `sorted(..., key=cmp_to_key(...))`). Each lands one stdlib
+   addition, one converter clause, or one runtime helper — small
+   enough to ship in one iteration.
+
+2. **A fix for an existing feature that's silently broken** — a
+   `compile_error--*` bucket means the transpiler *accepted* the
+   source but emitted Elixir that won't compile. That's a silent bug
+   (the user sees `:ok` from `Pylixir.transpile/1` and a crash from
+   `Code.compile_quoted/1`). Either repair the lowering, or — when
+   the construct is genuinely beyond Pylixir's model — convert the
+   silent compile failure into a precise `UnsupportedNodeError` with
+   a `hint:` that tells the user what to refactor.
+
+**Anti-goals**: chasing hint-count for its own sake, rewriting
+working lowerings, or papering over a real semantic gap with a
+rejection broad enough to over-fire. Every change must be a
+strict improvement: pass rate on the eval window stays flat or goes
+up, golden corpus stays at 0 failures, and the new behaviour is
+locked in by **both** a negative `transpile_test.exs` assertion and
+a positive `test/fixtures/python/<NNN>_<slug>.py` fixture that
+exercises a now-working path.
+
 Run from `tools/eval/` (the Mix tasks live in this sibling project, not
 the root). One full iteration:
 
@@ -57,7 +86,24 @@ mix eval.probe Call/4                  # short form: bucket / sample-N
   there means the transpiler accepted the source but emitted broken
   Elixir — i.e. a silent bug. Fix these even when they're tiny.
 - When the histogram dries up to only out-of-scope buckets, switch to
-  manual probing of common idioms to find more silent bugs.
+  manual probing of common idioms to find more silent bugs — or pick
+  a feature gap from the `unsupported--*` buckets and implement it.
+
+### When you reach for a "reject loudly" fix — measure twice
+
+A rejection that turns a silent compile-error into a precise
+`UnsupportedNodeError` is a strict win **only** when the rejection
+predicate is tight. A past loop tried to fix a single
+catalan-inside-a-demoted-`while` case by rejecting "any demoted def
+whose body contains a `while`" — and over-fired on 90 legit programs
+of the form `from sys import stdin; def main(): while True: ...`
+(`stdin` is a runtime binding, so `main` gets demoted; the `while`
+inside is harmless). Pass rate dropped from 97.5% → 93.1% before
+the revert.
+
+Before adding a `raise UnsupportedNodeError`, re-run `mix eval.run`
+and compare the `:ok` count. If it dropped by more than the bucket
+you're fixing, the predicate is too broad — narrow it or skip.
 
 ### Fixing a silent bug — exact procedure
 

@@ -1,7 +1,7 @@
 defmodule Pylixir.Nodes.WhileTest do
   use ExUnit.Case, async: true
 
-  alias Pylixir.{Converter, TranspileHelpers, UnsupportedNodeError}
+  alias Pylixir.TranspileHelpers
 
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp name(id), do: %{"_type" => "Name", "id" => id}
@@ -24,14 +24,26 @@ defmodule Pylixir.Nodes.WhileTest do
 
   defp module_with(stmts), do: %{"_type" => "Module", "body" => stmts}
 
-  describe "While.orelse rejection" do
-    test "non-empty orelse raises" do
-      assert_raise UnsupportedNodeError, ~r/while\/else/, fn ->
-        Converter.convert(
-          while_node(const(true), [%{"_type" => "Pass"}], [const(1)]),
-          Pylixir.Context.new()
-        )
-      end
+  describe "While.orelse support" do
+    # Mirrors the for/else lowering: wrap the recursive `while_N` call
+    # in a try that returns `{state, broke?}`. The else block runs
+    # only when the loop exited because cond went false (`broke? == false`).
+    test "non-empty orelse no longer raises and the else block runs on natural exit" do
+      ast =
+        module_with([
+          assign(name("found"), const(false)),
+          assign(name("i"), const(0)),
+          %{
+            "_type" => "While",
+            "test" => compare(name("i"), "Lt", const(3)),
+            "body" => [aug_assign(name("i"), "Add", const(1))],
+            "orelse" => [assign(name("found"), const(true))]
+          },
+          name("found")
+        ])
+
+      {_, value, _, _} = TranspileHelpers.transpile_and_run(ast)
+      assert value == true
     end
   end
 

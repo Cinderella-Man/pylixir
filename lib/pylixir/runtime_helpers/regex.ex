@@ -44,5 +44,28 @@ defmodule Pylixir.RuntimeHelpers.Regex do
   def py_re_split(pattern, string) when is_binary(pattern) and is_binary(string),
     do: Regex.split(Regex.compile!(pattern), string)
 
+  # `py_re_with_flags(pattern, flags)` — prepend the PCRE inline
+  # modifier for each bit set in `flags`. `Pylixir.Stdlib.Re`'s
+  # `@flag_bits` map keeps these in sync: DOTALL=1, MULTILINE=2,
+  # IGNORECASE=4. Multiple flags combine via `|`, same as Python.
+  # Inline modifiers are used (rather than the second arg of
+  # `Regex.compile!`) because the pattern can still flow through
+  # any helper that calls `Regex.compile!/1` unchanged.
+  def py_re_with_flags(pattern, flags) when is_binary(pattern) and is_integer(flags) do
+    prefix =
+      [
+        {1, "s"},
+        {2, "m"},
+        {4, "i"}
+      ]
+      |> Enum.filter(fn {bit, _} -> Bitwise.band(flags, bit) != 0 end)
+      |> Enum.map_join("", fn {_, ch} -> ch end)
+
+    case prefix do
+      "" -> pattern
+      flags_str -> "(?" <> flags_str <> ")" <> pattern
+    end
+  end
+
   # --- HELPERS END ---
 end

@@ -1089,6 +1089,54 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
+  # `sorted(xs, key=k)` lowers to `py_sorted_by(xs, k)` so a
+  # `functools.cmp_to_key`-wrapped comparator routes to `Enum.sort`
+  # with the comparator semantics instead of being misused as a
+  # 1-arg key function. Plain key fns fall through to `Enum.sort_by`.
+  # `cmp_to_key` tags its argument as `{:py_cmp_to_key, cmp}`; the
+  # pattern-match here keeps the wrap localised — call sites stay
+  # unchanged.
+  def py_sorted_by(xs, {:py_cmp_to_key, cmp}) when is_function(cmp, 2) do
+    Enum.sort(xs, fn a, b -> cmp.(a, b) <= 0 end)
+  end
+
+  def py_sorted_by(xs, key) when is_function(key, 1) do
+    Enum.sort_by(xs, key)
+  end
+
+  def py_sorted_by_desc(xs, {:py_cmp_to_key, cmp}) when is_function(cmp, 2) do
+    Enum.sort(xs, fn a, b -> cmp.(a, b) >= 0 end)
+  end
+
+  def py_sorted_by_desc(xs, key) when is_function(key, 1) do
+    Enum.sort_by(xs, key, :desc)
+  end
+
+  # Python's `itertools.groupby(iter)` — group CONSECUTIVE equal
+  # elements. Returns a list of `{key, [elements]}` tuples that
+  # destructure cleanly via `for k, g in groupby(xs)`. Strings iterate
+  # as characters in Python; `py_iter_to_list` already normalises that.
+  # `Enum.chunk_by/2` does the same consecutive-group split — wrap
+  # each chunk as `{hd(chunk), chunk}`.
+  def py_itertools_groupby(iter) do
+    iter
+    |> py_iter_to_list()
+    |> Enum.chunk_by(& &1)
+    |> Enum.map(fn group -> {hd(group), group} end)
+  end
+
+  # `itertools.groupby(iter, key)` — group by `key(elem)` rather than
+  # equality on the element itself. Mirrors Python's docs note that
+  # the iterable must be sorted by `key` for groups to be complete;
+  # we just do the same `chunk_by` regardless and let the caller
+  # handle pre-sorting (Python's behaviour is the same).
+  def py_itertools_groupby_key(iter, key) when is_function(key, 1) do
+    iter
+    |> py_iter_to_list()
+    |> Enum.chunk_by(key)
+    |> Enum.map(fn group -> {key.(hd(group)), group} end)
+  end
+
   # Python's `itertools.combinations_with_replacement(iter, r)` —
   # r-length subsets where elements may repeat (the same index can
   # be picked multiple times). Differs from `combinations` in the

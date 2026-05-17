@@ -86,6 +86,22 @@ defmodule Pylixir.Stdlib.Itertools do
     {:ok, {:py_product, [], [iters, repeat]}}
   end
 
+  # `itertools.groupby(iter[, key])` — group CONSECUTIVE equal (or
+  # equal-under-key) elements. Returns an iterator of `(key, group)`
+  # pairs. Pylixir lowers each pair to a 2-tuple so the common
+  # `for k, g in groupby(xs)` shape destructures correctly. Accepts
+  # `key` as either a positional 2nd arg or a `key=` kwarg (Python
+  # allows both shapes).
+  def call(["groupby"], [iter], kwargs, _node) do
+    case Map.get(kwargs, "key") do
+      nil -> {:ok, {:py_itertools_groupby, [], [iter]}}
+      key_fn -> {:ok, {:py_itertools_groupby_key, [], [iter, key_fn]}}
+    end
+  end
+
+  def call(["groupby"], [iter, key_fn], _kwargs, _node),
+    do: {:ok, {:py_itertools_groupby_key, [], [iter, key_fn]}}
+
   def call(_path, _args, _kwargs, _node), do: :no_clause
 
   @impl true
@@ -147,6 +163,11 @@ defmodule Pylixir.Stdlib.Itertools do
               [{:elem, [], nil}, {:times, [], nil}]}
            ]}
         ]}}
+
+  # `from itertools import groupby` — bind as a 1-arg lambda. The
+  # 2-arg form (`groupby(xs, key)`) goes through the stdlib-alias
+  # rewrite which re-invokes `call/4` above.
+  def import_binding("groupby"), do: {:ok, Pylixir.Stdlib.capture(:py_itertools_groupby, 1)}
   # `permutations` is variadic (1 or 2 args). Bind the 1-arg form;
   # 2-arg calls go through stdlib_aliases-rewrite at the call site.
   def import_binding("permutations"), do: {:ok, Pylixir.Stdlib.capture(:py_permutations, 1)}

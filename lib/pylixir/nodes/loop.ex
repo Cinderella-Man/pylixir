@@ -48,15 +48,13 @@ defmodule Pylixir.Nodes.Loop do
 
   @spec while_(map(), Context.t()) :: {Macro.t(), Context.t()}
   def while_(%{"test" => test, "body" => body} = node, context) do
-    if Map.get(node, "orelse", []) != [] do
-      raise UnsupportedNodeError,
-        node_type: "While",
-        hint: "while/else (Python's while-loop `else` clause) is not supported",
-        lineno: Map.get(node, "lineno"),
-        col_offset: Map.get(node, "col_offset")
-    end
+    orelse = Map.get(node, "orelse", [])
 
-    emit_while(%{"test" => test, "body" => body}, context)
+    if orelse == [] do
+      emit_while(%{"test" => test, "body" => body}, context)
+    else
+      emit_while_else(test, body, orelse, context)
+    end
   end
 
   @spec for_(map(), Context.t()) :: {Macro.t(), Context.t()}
@@ -190,6 +188,179 @@ defmodule Pylixir.Nodes.Loop do
   defp state_value_ast([], _refs), do: :ok
   defp state_value_ast([_single], [ref]), do: ref
   defp state_value_ast(_, refs), do: Converter.tuple_pattern(refs)
+
+  # --- While/else emission (Python's `while cond: ... else: ...`) -------
+  #
+  # Semantics: the `else` block runs after the loop ONLY when the loop
+  # exited because `cond` became false — NOT when it exited via
+  # `break`. Strategy mirrors `emit_for_else`: build the same recursive
+  # `while_N` helper as `emit_while`, but wrap the caller call in a
+  # try that returns `{state, broke?}`. Bind the threaded vars from
+  # `state`, then `unless broke?, do: else_block`.
+  defp emit_while_else(test, body, orelse, context) do
+    saved_scopes = context.scopes
+    {while_ast, threaded, context} = build_while_helper(test, body, context)
+
+    broke_var = {:pylixir_broke?, [], nil}
+    state_var = {:pylixir_while_else_state, [], nil}
+
+    try_ast =
+      {:try, [], [[
+        do: {:__block__, [], [{:=, [], [state_var, while_ast]}, {state_var, false}]},
+        catch: [
+          {:->, [],
+           [
+             [:throw, {:pylixir_break, {:payload, [], nil}}],
+             {{:payload, [], nil}, true}
+           ]}
+        ]
+      ]]}
+
+    bind_state = {:=, [], [{state_var, broke_var}, try_ast]}
+
+    threaded_refs =
+      Enum.map(threaded, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    bind_threaded =
+      case threaded_refs do
+        [] -> nil
+        [single] -> {:=, [], [single, state_var]}
+        many -> {:=, [], [Converter.tuple_pattern(many), state_var]}
+      end
+
+    context = %{context | scopes: saved_scopes}
+    context = Enum.reduce(threaded, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
+
+    # The else block can assign its own names that must escape the
+    # `if` expression's scope. Collect them, then arrange both `if`
+    # branches to return a tuple of those names: the run-the-else
+    # branch evaluates the user's block then yields the tuple of the
+    # post-block values; the skip-else branch yields the same tuple
+    # of pre-else values (or `nil` for names not yet in scope). Bind
+    # the tuple in the outer context. Mirrors the IfStmt threading
+    # pattern.
+    pre_else_context = context
+    orelse_assigned =
+      orelse
+      |> LoopAnalysis.analyze()
+      |> Map.get(:assigned_vars)
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    {else_asts, context} = Converter.convert_each(orelse, context)
+    else_block = Converter.body_to_block(else_asts)
+
+    {cond_else, context} =
+      case orelse_assigned do
+        [] ->
+          {{:if, [], [{:!, [], [broke_var]}, [do: else_block, else: nil]]}, context}
+
+        names ->
+          refs =
+            Enum.map(names, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+          pre_values =
+            Enum.map(names, fn v ->
+              if Converter.var_bound?(pre_else_context, v) do
+                {v |> Naming.rewrite() |> String.to_atom(), [], nil}
+              else
+                nil
+              end
+            end)
+
+          do_tail = tuple_or_single(refs)
+          else_tail = tuple_or_single(pre_values)
+          do_body = Converter.body_to_block([else_block, do_tail])
+          pattern = tuple_or_single(refs)
+
+          if_expr =
+            {:if, [], [{:!, [], [broke_var]}, [do: do_body, else: else_tail]]}
+
+          context = Enum.reduce(names, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
+          {{:=, [], [pattern, if_expr]}, context}
+      end
+
+    pieces = Enum.reject([bind_state, bind_threaded, cond_else], &is_nil/1)
+    {Converter.body_to_block(pieces), context}
+  end
+
+  defp tuple_or_single([single]), do: single
+  defp tuple_or_single(many), do: Converter.tuple_pattern(many)
+
+  # Build the `defp while_N` helper + return the raw caller call (the
+  # value the helper returns when cond goes false — without any
+  # break-catching wrap). `emit_while_else` then wraps that itself.
+  # Returns `{caller_call, threaded_names, context_with_helper_in_helpers}`.
+  defp build_while_helper(test, body, context) do
+    n = context.while_counter
+    fn_name = String.to_atom("while_#{n}")
+    context = %{context | while_counter: n + 1}
+
+    pre_loop_context = context
+    analysis = LoopAnalysis.analyze(body)
+    threaded = analysis.assigned_vars |> MapSet.to_list() |> Enum.sort()
+    threaded_set = MapSet.new(threaded)
+
+    referenced_in_test =
+      Walk.walk_scope(test, MapSet.new(), fn
+        %{"_type" => "Name", "id" => id}, acc -> MapSet.put(acc, id)
+        _, acc -> acc
+      end)
+
+    read_only =
+      analysis.referenced_vars
+      |> MapSet.union(referenced_in_test)
+      |> MapSet.difference(threaded_set)
+      |> MapSet.to_list()
+      |> Enum.filter(&Converter.var_bound?(pre_loop_context, &1))
+      |> Enum.sort()
+
+    {payload_ast, _refs} = build_acc_refs(threaded)
+    flow = loop_flow(body)
+
+    saved_payload = context.loop_break_payload
+    context = %{context | loop_break_payload: payload_ast}
+    {test_ast, context} = Converter.convert_test(test, context)
+    {body_asts, context} = Converter.convert_each(body, context)
+    context = %{context | loop_break_payload: saved_payload}
+
+    threaded_refs =
+      Enum.map(threaded, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    read_only_refs =
+      Enum.map(read_only, fn v -> {v |> Naming.rewrite() |> String.to_atom(), [], nil} end)
+
+    param_refs = threaded_refs ++ read_only_refs
+    state_value = state_value_ast(threaded, threaded_refs)
+    initial_args = Enum.map(threaded ++ read_only, &initial_ref(&1, pre_loop_context))
+
+    recurse_call = {fn_name, [], param_refs}
+    body_with_recurse = Converter.body_to_block(body_asts ++ [recurse_call])
+    inner_body = maybe_continue_while(body_with_recurse, payload_ast, recurse_call, elem(flow, 1))
+
+    cond_ast =
+      {:cond, [],
+       [
+         [
+           do: [
+             {:->, [], [[test_ast], inner_body]},
+             {:->, [], [[true], state_value]}
+           ]
+         ]
+       ]}
+
+    defp_ast =
+      {:defp, [],
+       [
+         {fn_name, [], param_refs},
+         [do: cond_ast]
+       ]}
+
+    context = %{context | while_helpers: context.while_helpers ++ [defp_ast]}
+
+    caller_call = {fn_name, [], initial_args}
+    {caller_call, threaded, context}
+  end
 
   # While-specific continue: catch arm calls the recursive helper with the
   # captured state (post-body-so-far values), so continue advances rather

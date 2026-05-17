@@ -207,12 +207,16 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "ImportFrom", "module" => "__future__"}, context),
     do: {{:__block__, [], []}, context}
 
-  # `from functools import lru_cache, cache` — both are decorator
-  # no-ops (we don't memoize; functions just re-compute). functools
-  # isn't a Stdlib registry member (no `call/4` lowerings), so it has
-  # its own no-op clause rather than going through `import_binding/1`.
+  # `from functools import lru_cache, cache, reduce` — decorator
+  # no-ops (Pylixir doesn't memoize) and `reduce` (handled at the
+  # call site). `cmp_to_key` is the exception: it's a real runtime
+  # value because `sorted(xs, key=cmp_to_key(f))` must reach the
+  # `Enum.sort` path with a comparator instead of `Enum.sort_by`
+  # with a key function. Bind it as a lambda that tags its arg
+  # `{:py_cmp_to_key, cmp}`; the runtime `py_sorted_by/2` helper
+  # pattern-matches the tag.
   def convert(%{"_type" => "ImportFrom", "module" => "functools", "names" => names}, context) do
-    allowed = ~w(lru_cache cache reduce)
+    allowed = ~w(lru_cache cache reduce cmp_to_key)
 
     unknown = Enum.find(names, fn %{"name" => n} -> n not in allowed end)
 
@@ -223,7 +227,30 @@ defmodule Pylixir.Converter do
           "`from functools import #{unknown["name"]}` is not supported (allowed: #{Enum.join(allowed, ", ")})"
     end
 
-    {{:__block__, [], []}, context}
+    cmp_aliases =
+      Enum.filter(names, fn %{"name" => n} -> n == "cmp_to_key" end)
+
+    case cmp_aliases do
+      [] ->
+        {{:__block__, [], []}, context}
+
+      [%{"name" => "cmp_to_key"} = entry] ->
+        alias_name = Map.get(entry, "asname") || "cmp_to_key"
+        atom = alias_name |> Naming.rewrite() |> String.to_atom()
+        lambda =
+          {:fn, [],
+           [
+             {:->, [],
+              [
+                [{:cmp, [], nil}],
+                {:{}, [], [:py_cmp_to_key, {:cmp, [], nil}]}
+              ]}
+           ]}
+
+        assign = {:=, [], [{atom, [], nil}, lambda]}
+        context = bind_name(context, alias_name)
+        {assign, context}
+    end
   end
 
   # `from <stdlib_mod> import <names>` — delegates the per-name RHS

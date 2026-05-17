@@ -429,8 +429,13 @@ defmodule Pylixir.Builtins do
     case {key, desc?} do
       {nil, false} -> base
       {nil, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs, :desc]}
-      {f, false} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f]}
-      {f, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f, :desc]}
+      # Route key-bearing sorts through `py_sorted_by` so the runtime
+      # can pattern-match a `{:py_cmp_to_key, cmp}` shape (Python's
+      # `functools.cmp_to_key` wraps a comparator into a key) and use
+      # `Enum.sort` with the comparator instead of `Enum.sort_by`.
+      # Plain key fns fall through to `Enum.sort_by` as before.
+      {f, false} -> {:py_sorted_by, [], [xs, f]}
+      {f, true} -> {:py_sorted_by_desc, [], [xs, f]}
     end
     |> maybe_runtime_reverse(reverse, key, xs)
   end
@@ -449,7 +454,7 @@ defmodule Pylixir.Builtins do
     ascending =
       case key do
         nil -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs]}
-        f -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f]}
+        f -> {:py_sorted_by, [], [xs, f]}
       end
 
     {:if, [],
