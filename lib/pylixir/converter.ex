@@ -423,6 +423,21 @@ defmodule Pylixir.Converter do
           end
 
         {ControlFlow.throw_return(value_ast), context}
+
+      :tuple_with_self ->
+        # Mutating class methods return `{return_value, updated_self}`
+        # so the caller can both receive the value AND see the mutated
+        # instance. The caller-side destructure happens in the Expr
+        # clause (statement form: `{_, obj} = ...`) and the Assign
+        # clause (value form: `{x, obj} = ...`).
+        {value_ast, context} =
+          case Map.get(node, "value") do
+            nil -> {nil, context}
+            value -> convert(value, context)
+          end
+
+        self_atom = "self" |> Naming.rewrite() |> String.to_atom()
+        {{value_ast, {self_atom, [], nil}}, context}
     end
   end
 
@@ -606,69 +621,14 @@ defmodule Pylixir.Converter do
         emit_heapq_statement_rebind(heap_name, fn_name, args, context)
 
       :none ->
-        case detect_mutating_class_method_call(value, context) do
-          {:ok, obj_name, class_name, method, args} ->
-            # `obj.method(args)` as a STATEMENT on a mutating method:
-            # the method returns updated self, so rebind obj. Without
-            # this, the mutation (a Map.put on a fresh map) would be
-            # discarded as the Expr's value.
-            emit_class_method_rebind(obj_name, class_name, method, args, context)
+        case Pylixir.Stdlib.Bisect.statement_mutation_call(value, context) do
+          {:ok, list_name, method, args} ->
+            emit_bisect_insort_rebind(list_name, method, args, context)
 
-          :no ->
-            case Nodes.Mutations.detect(value) do
-              :none ->
-                convert(value, context)
-
-              {:name, target_name, method, args, kwargs, source_node} ->
-                Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
-
-              {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
-                Nodes.Mutations.emit_subscript(
-                  coll_name,
-                  slice,
-                  method,
-                  args,
-                  kwargs,
-                  source_node,
-                  context
-                )
-            end
+          :none ->
+            convert_expr_continue(value, context)
         end
     end
-  end
-
-  # Recognise `obj.<method>(args)` where `method` is a known mutating
-  # class method. Returns `{:ok, obj_name, class_name, method, args}`
-  # or `:no`. The obj must be a bare Name (we rebind it).
-  defp detect_mutating_class_method_call(
-         %{
-           "_type" => "Call",
-           "func" => %{
-             "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => obj_name},
-             "attr" => method
-           },
-           "args" => args,
-           "keywords" => []
-         },
-         context
-       ) do
-    case Map.get(context.class_methods, method, []) do
-      [{class_name, :mutating}] -> {:ok, obj_name, class_name, method, args}
-      _ -> :no
-    end
-  end
-
-  defp detect_mutating_class_method_call(_, _), do: :no
-
-  defp emit_class_method_rebind(obj_name, class_name, method, args, context) do
-    {arg_asts, context} = convert_each(args, context)
-    fn_name = method_fn_name(class_name, method)
-    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
-    obj_ref = {obj_atom, [], nil}
-    call = {fn_name, [], [obj_ref | arg_asts]}
-    context = bind_name(context, obj_name)
-    {{:=, [], [obj_ref, call]}, context}
   end
 
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
@@ -823,6 +783,142 @@ defmodule Pylixir.Converter do
       node_type: type,
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # --- Expr-clause helpers (statement-form mutations & class calls) ------
+  #
+  # All the helpers that drive the `Expr` clause's nested-case routing
+  # live below the catch-all `convert/2`. Keeping them out of the
+  # `def convert` cluster avoids the "clauses with the same name and
+  # arity should be grouped" compile-time warning.
+
+  defp emit_bisect_insort_rebind(list_name, method, args, context) do
+    {arg_asts, context} = convert_each(args, context)
+    list_atom = list_name |> Naming.rewrite() |> String.to_atom()
+    list_ref = {list_atom, [], nil}
+
+    helper =
+      case method do
+        "insort_left" -> :py_bisect_insort_left
+        _ -> :py_bisect_insort_right
+      end
+
+    call = {helper, [], [list_ref | arg_asts]}
+    context = bind_name(context, list_name)
+    {{:=, [], [list_ref, call]}, context}
+  end
+
+  defp convert_expr_continue(value, context) do
+    case detect_mutating_class_method_call(value, context) do
+      {:ok, obj_name, class_name, method, args} ->
+        # `obj.method(args)` as a STATEMENT on a mutating method:
+        # the method returns updated self, so rebind obj. Without
+        # this, the mutation (a Map.put on a fresh map) would be
+        # discarded as the Expr's value.
+        emit_class_method_rebind(obj_name, class_name, method, args, context)
+
+      :no_subscript_receiver ->
+        # `dsu[t].method(args)` style — receiver is a Subscript,
+        # so we can't rebind the obj slot. Emit `_ = call` to
+        # silence Elixir's "result is ignored" warning; the
+        # mutation is lost (Pylixir's first-pass class lowering
+        # doesn't model "rebind into a subscript slot"). The
+        # call still runs for any side effects.
+        convert_discarded_mutating_call(value, context)
+
+      :no ->
+        case Nodes.Mutations.detect(value) do
+          :none ->
+            convert(value, context)
+
+          {:name, target_name, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
+
+          {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit_subscript(
+              coll_name,
+              slice,
+              method,
+              args,
+              kwargs,
+              source_node,
+              context
+            )
+
+          {:obj_attr_subscript, obj_name, attr_name, slice, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit_obj_attr_subscript(
+              obj_name,
+              attr_name,
+              slice,
+              method,
+              args,
+              kwargs,
+              source_node,
+              context
+            )
+        end
+    end
+  end
+
+  # Recognise `obj.<method>(args)` where `method` is a known mutating
+  # class method. Returns `{:ok, obj_name, class_name, method, args}`
+  # when obj is a bare Name (we rebind it), `:no_subscript_receiver`
+  # when obj is a Subscript (caller wraps with `_ = ...` to discard
+  # cleanly; mutation is lost), or `:no` otherwise.
+  defp detect_mutating_class_method_call(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => obj_name},
+             "attr" => method
+           },
+           "args" => args,
+           "keywords" => []
+         },
+         context
+       ) do
+    case Map.get(context.class_methods, method, []) do
+      [{class_name, :mutating}] -> {:ok, obj_name, class_name, method, args}
+      _ -> :no
+    end
+  end
+
+  defp detect_mutating_class_method_call(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Subscript"},
+             "attr" => method
+           }
+         },
+         context
+       ) do
+    case Map.get(context.class_methods, method, []) do
+      [{_class_name, :mutating}] -> :no_subscript_receiver
+      _ -> :no
+    end
+  end
+
+  defp detect_mutating_class_method_call(_, _), do: :no
+
+  defp convert_discarded_mutating_call(value, context) do
+    {call_ast, context} = convert(value, context)
+    {{:=, [], [{:_, [], nil}, call_ast]}, context}
+  end
+
+  defp emit_class_method_rebind(obj_name, class_name, method, args, context) do
+    {arg_asts, context} = convert_each(args, context)
+    fn_name = method_fn_name(class_name, method)
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
+    call = {fn_name, [], [obj_ref | arg_asts]}
+    context = bind_name(context, obj_name)
+    # Mutating methods return `{return_value, updated_self}`; the
+    # statement-form caller discards the value and rebinds obj only.
+    pattern = {{:_, [], nil}, obj_ref}
+    {{:=, [], [pattern, call]}, context}
   end
 
   # --- `try` binding-threading helpers -----------------------------------
@@ -994,11 +1090,12 @@ defmodule Pylixir.Converter do
     {{:=, [], [target_ref, rhs]}, context}
   end
 
-  # `self.<attr> += value` — read+write the self-map attribute.
+  # `<obj>.<attr> += value` — read+write an instance-map attribute.
+  # Mirrors the Assign clause's general `obj.attr = ...` handling.
   defp aug_assign(
          %{
            "_type" => "Attribute",
-           "value" => %{"_type" => "Name", "id" => "self"},
+           "value" => %{"_type" => "Name", "id" => obj_name},
            "attr" => attr
          },
          op,
@@ -1008,29 +1105,30 @@ defmodule Pylixir.Converter do
        ) do
     {value_ast, context} = convert(value, context)
     attr_atom = String.to_atom(attr)
-    self_atom = "self" |> Naming.rewrite() |> String.to_atom()
-    self_ref = {self_atom, [], nil}
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
 
     attr_read =
-      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [obj_ref, attr_atom]}
 
     combined = bin_op_ast(op, attr_read, value_ast, node)
 
     map_put =
-      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, combined]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, attr_atom, combined]}
 
-    {{:=, [], [self_ref, map_put]}, context}
+    context = bind_name(context, obj_name)
+    {{:=, [], [obj_ref, map_put]}, context}
   end
 
-  # `self.<attr>[<slice>] += value` — common FenwickTree / SegmentTree
-  # shape. Threads the read+write back into the self map. Must precede
-  # the generic Subscript clause so it actually matches.
+  # `<obj>.<attr>[<slice>] += value` — common FenwickTree / SegmentTree
+  # shape, generalised to any object root. Must precede the generic
+  # Subscript clause so it actually matches.
   defp aug_assign(
          %{
            "_type" => "Subscript",
            "value" => %{
              "_type" => "Attribute",
-             "value" => %{"_type" => "Name", "id" => "self"},
+             "value" => %{"_type" => "Name", "id" => obj_name},
              "attr" => attr
            },
            "slice" => slice
@@ -1043,20 +1141,21 @@ defmodule Pylixir.Converter do
     {slice_ast, context} = convert(slice, context)
     {value_ast, context} = convert(value, context)
     attr_atom = String.to_atom(attr)
-    self_atom = "self" |> Naming.rewrite() |> String.to_atom()
-    self_ref = {self_atom, [], nil}
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
 
     attr_read =
-      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [obj_ref, attr_atom]}
 
     getitem = {:py_getitem, [], [attr_read, slice_ast]}
     combined = bin_op_ast(op, getitem, value_ast, node)
     setitem = {:py_setitem, [], [attr_read, slice_ast, combined]}
 
     map_put =
-      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, setitem]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, attr_atom, setitem]}
 
-    {{:=, [], [self_ref, map_put]}, context}
+    context = bind_name(context, obj_name)
+    {{:=, [], [obj_ref, map_put]}, context}
   end
 
   defp aug_assign(
@@ -1374,6 +1473,23 @@ defmodule Pylixir.Converter do
             {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
             fn_name = method_fn_name(class_name, attr)
             {{fn_name, [], [target_ast | arg_asts]}, context}
+
+          match?([{_, :mutating}], owners) ->
+            # Mutating-method call in an expression context (e.g.
+            # `print(dsu.find(x))`, `if dsu.union(a, b): ...`). We
+            # can't rebind `obj` here — the call's result needs to
+            # be a single value, not a `{value, updated_self}` tuple.
+            # Compromise: emit `elem(call, 0)` to extract just the
+            # value; the self update is dropped. Callers that need
+            # the mutation to persist must call as a statement
+            # (`obj.method(args)`) or assign (`x = obj.method(args)`),
+            # both of which are handled separately and rebind obj.
+            [{class_name, :mutating}] = owners
+            {target_ast, context} = convert(target, context)
+            {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+            fn_name = method_fn_name(class_name, attr)
+            call = {fn_name, [], [target_ast | arg_asts]}
+            {{:elem, [], [call, 0]}, context}
 
           length(owners) > 1 ->
             names = Enum.map_join(owners, ", ", fn {c, _} -> c end)
@@ -1730,23 +1846,37 @@ defmodule Pylixir.Converter do
     [%{"arg" => "self"} | rest_args] = args["args"]
     param_atoms = Enum.map(rest_args, fn %{"arg" => a} -> a end)
 
+    # Default values for trailing positional args (`def m(self, i, d=1)`).
+    # The defaults list aligns to the TAIL of args; skip the `self`
+    # offset since defaults can never apply to it.
+    defaults = Map.get(args, "defaults", [])
+    defaults_start = length(rest_args) - length(defaults)
+
     saved_scopes = context.scopes
     saved_return_mode = context.return_mode
     inner_scope = MapSet.new(["self" | param_atoms])
 
+    return_mode =
+      case kind do
+        :mutating -> :tuple_with_self
+        _ -> :unwrapped
+      end
+
     inner_ctx = %{
       context
       | scopes: [inner_scope | context.scopes],
-        return_mode: :unwrapped
+        return_mode: return_mode
     }
 
     inner_ctx = bind_name(inner_ctx, "self")
     inner_ctx = Enum.reduce(param_atoms, inner_ctx, &bind_name(&2, &1))
 
-    # `:init` seeds `self = %{}`; other methods receive `self` as the
-    # first param. Mutating methods return `self` at the end (caller
-    # rebinds). Read-only methods return whatever their last expr or
-    # `return` produces — the convert_each output already encodes that.
+    # `:init` seeds `self = %{}` and returns it. `:mutating` methods
+    # return `{return_value, updated_self}` (the Return clause in
+    # `:tuple_with_self` mode produces the tuple for explicit
+    # returns; the implicit-None tail below covers fall-through). The
+    # caller destructures both shapes — see `emit_class_method_rebind`
+    # and the Assign clause's mutating-method-RHS branch.
     {body_asts, inner_ctx} = convert_each(body, inner_ctx)
 
     self_atom = "self" |> Naming.rewrite() |> String.to_atom()
@@ -1759,7 +1889,18 @@ defmodule Pylixir.Converter do
           body_to_block([seed | body_asts] ++ [self_ref])
 
         :mutating ->
-          body_to_block(body_asts ++ [self_ref])
+          # Implicit-None return tail: `{nil, var_self}` is the
+          # function's value when the body falls through without an
+          # explicit `return`. If the original Python body's last
+          # statement IS a `Return`, the tail would actually
+          # *shadow* that return's `{value, var_self}` tuple (which
+          # the Return clause already emitted). Skip the tail in
+          # that case so the explicit return value flows through.
+          if List.last(body) |> is_map() and Map.get(List.last(body), "_type") == "Return" do
+            body_to_block(body_asts)
+          else
+            body_to_block(body_asts ++ [{nil, self_ref}])
+          end
 
         :read_only ->
           body_to_block(body_asts)
@@ -1771,10 +1912,23 @@ defmodule Pylixir.Converter do
         _ -> [self_ref]
       end
 
-    param_refs =
-      Enum.map(param_atoms, fn name ->
-        {name |> Naming.rewrite() |> String.to_atom(), [], nil}
+    {param_refs, inner_ctx} =
+      param_atoms
+      |> Enum.with_index()
+      |> Enum.reduce({[], inner_ctx}, fn {name, i}, {acc, ctx} ->
+        atom = name |> Naming.rewrite() |> String.to_atom()
+        ref = {atom, [], nil}
+
+        if i >= defaults_start do
+          default_node = Enum.at(defaults, i - defaults_start)
+          {default_ast, ctx} = convert(default_node, ctx)
+          {[{:\\, [], [ref, default_ast]} | acc], ctx}
+        else
+          {[ref | acc], ctx}
+        end
       end)
+
+    param_refs = Enum.reverse(param_refs)
 
     defp_ast =
       {:defp, [],

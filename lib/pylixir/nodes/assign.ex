@@ -366,47 +366,67 @@ defmodule Pylixir.Nodes.Assign do
   end
 
   defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
-    {value_ast, context} = Converter.convert(value, context)
-    context = Converter.bind_name(context, id)
-    {target_ast, context} = Converter.convert(target, context)
-    {{:=, [], [target_ast, value_ast]}, context}
+    # `x = obj.method(args)` where method is a known mutating class
+    # method returns `{value, updated_self}` — destructure into both.
+    # The non-mutating path stays a plain assign.
+    case detect_mutating_method_call(value, context) do
+      {:ok, obj_name, class_name, method, args} ->
+        {arg_asts, context} = Converter.convert_each(args, context)
+        fn_name = Pylixir.Converter.method_fn_name(class_name, method)
+        obj_atom = obj_name |> Pylixir.Naming.rewrite() |> String.to_atom()
+        obj_ref = {obj_atom, [], nil}
+        call = {fn_name, [], [obj_ref | arg_asts]}
+        target_atom = id |> Pylixir.Naming.rewrite() |> String.to_atom()
+        target_ref = {target_atom, [], nil}
+        context = Converter.bind_name(context, obj_name)
+        context = Converter.bind_name(context, id)
+        pattern = {target_ref, obj_ref}
+        {{:=, [], [pattern, call]}, context}
+
+      :no ->
+        {value_ast, context} = Converter.convert(value, context)
+        context = Converter.bind_name(context, id)
+        {target_ast, context} = Converter.convert(target, context)
+        {{:=, [], [target_ast, value_ast]}, context}
+    end
   end
 
-  # `self.<attr> = expr` inside a class method body — `self` is bound
-  # to a map (the instance state), so the assignment rewrites to
-  # `self = Map.put(self, :<attr>, expr)`. Any bare Name-target
-  # whose root is in `context.class_names` would also fit here, but
-  # Pylixir's first-pass class lowering only supports `self.x = ...`
-  # — other forms (e.g. `obj.x = ...` from outside the class) still
-  # require explicit rebind through method calls.
+  # `<obj>.<attr> = expr` where obj is a bare Name. Treated as an
+  # instance-map field set: `obj = Map.put(obj, :<attr>, expr)`. Fires
+  # for `self.x = ...` inside class methods AND for general
+  # `node.children = ...` outside (when classes are in scope; pre-class
+  # code would have rejected this entirely). The runtime semantics
+  # match Python's instance-attribute assignment for our map-backed
+  # instances — `obj` is rebound so subsequent reads see the update.
   defp single_target_assign(
-         %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => "self"}, "attr" => attr} = _target,
+         %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => obj_name}, "attr" => attr} = _target,
          value,
          _node,
          context
        ) do
     {value_ast, context} = Converter.convert(value, context)
     attr_atom = String.to_atom(attr)
-    self_atom = "self" |> Pylixir.Naming.rewrite() |> String.to_atom()
-    self_ref = {self_atom, [], nil}
+    obj_atom = obj_name |> Pylixir.Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
 
     map_put =
-      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, value_ast]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, attr_atom, value_ast]}
 
-    {{:=, [], [self_ref, map_put]}, context}
+    context = Converter.bind_name(context, obj_name)
+    {{:=, [], [obj_ref, map_put]}, context}
   end
 
-  # `self.<attr>[<slice>] = expr` — collection mutation on a self
-  # attribute. Lowers to
-  #   `self = Map.put(self, :<attr>, py_setitem(Map.fetch!(self, :<attr>), slice, expr))`
-  # so the updated attribute lives back inside the updated self map.
-  # Mutating-method detection in Converter.method_mutates_self?/1 picks
-  # this shape up via the Subscript-rooted-at-self-attribute check.
+  # `<obj>.<attr>[<slice>] = expr` — collection mutation on an
+  # instance attribute. Lowers to
+  #   `obj = Map.put(obj, :<attr>, py_setitem(Map.fetch!(obj, :<attr>), slice, expr))`
+  # Mirrors the self-attr path; works for both `self.x[i] = v` (inside
+  # methods) and `node.children[bit] = v` (outside, treating `node` as
+  # an instance map).
   defp single_target_assign(
          %{
            "_type" => "Subscript",
            "value" =>
-             %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => "self"}, "attr" => attr},
+             %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => obj_name}, "attr" => attr},
            "slice" => slice
          },
          value,
@@ -416,18 +436,19 @@ defmodule Pylixir.Nodes.Assign do
     {value_ast, context} = Converter.convert(value, context)
     {slice_ast, context} = Converter.convert(slice, context)
     attr_atom = String.to_atom(attr)
-    self_atom = "self" |> Pylixir.Naming.rewrite() |> String.to_atom()
-    self_ref = {self_atom, [], nil}
+    obj_atom = obj_name |> Pylixir.Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
 
     attr_read =
-      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [obj_ref, attr_atom]}
 
     new_attr = {:py_setitem, [], [attr_read, slice_ast, value_ast]}
 
     map_put =
-      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, new_attr]}
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, attr_atom, new_attr]}
 
-    {{:=, [], [self_ref, map_put]}, context}
+    context = Converter.bind_name(context, obj_name)
+    {{:=, [], [obj_ref, map_put]}, context}
   end
 
   defp single_target_assign(target, _value, node, _context) do
@@ -438,6 +459,34 @@ defmodule Pylixir.Nodes.Assign do
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
+
+  # --- single-target Assign helpers -------------------------------------
+  #
+  # `detect_mutating_method_call/2` powers the Name-target clause's
+  # `x = obj.method(args)` destructure path (mutating class methods
+  # return `{value, updated_self}`). Lives below the catch-all so it
+  # doesn't split the `single_target_assign/4` clause cluster.
+
+  defp detect_mutating_method_call(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => obj_name},
+             "attr" => method
+           },
+           "args" => args,
+           "keywords" => []
+         },
+         context
+       ) do
+    case Map.get(context.class_methods, method, []) do
+      [{class_name, :mutating}] -> {:ok, obj_name, class_name, method, args}
+      _ -> :no
+    end
+  end
+
+  defp detect_mutating_method_call(_, _), do: :no
 
   # --- multi-target Assign (`a = b = c = expr`) ------------------------
 

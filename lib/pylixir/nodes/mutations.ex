@@ -33,6 +33,8 @@ defmodule Pylixir.Nodes.Mutations do
           :none
           | {:name, String.t(), String.t(), [map()], [map()], map()}
           | {:subscript, String.t(), map(), String.t(), [map()], [map()], map()}
+          | {:obj_attr_subscript, String.t(), String.t(), map(), String.t(), [map()], [map()],
+             map()}
   def detect(
         %{
           "_type" => "Call",
@@ -72,6 +74,39 @@ defmodule Pylixir.Nodes.Mutations do
     if attr in @methods do
       kwargs_raw = Map.get(source, "keywords", [])
       {:subscript, name, slice, attr, args, kwargs_raw, source}
+    else
+      :none
+    end
+  end
+
+  # `<obj>.<attr>[<slice>].method(args)` — common in class methods
+  # like `self.graph[fr].append(forward)`. Lowers to a rebind of
+  # `obj` where `obj.<attr>` is updated to a list/dict with the
+  # mutated slot. Mirrors the subscript-only clause but threads
+  # through one extra `Map.put`/`Map.fetch!` layer for the attr.
+  def detect(
+        %{
+          "_type" => "Call",
+          "func" => %{
+            "_type" => "Attribute",
+            "value" => %{
+              "_type" => "Subscript",
+              "value" => %{
+                "_type" => "Attribute",
+                "value" => %{"_type" => "Name", "id" => obj_name},
+                "attr" => attr_name
+              },
+              "slice" => slice
+            },
+            "attr" => method
+          },
+          "args" => args
+        } = source
+      )
+      when method != nil do
+    if method in @methods do
+      kwargs_raw = Map.get(source, "keywords", [])
+      {:obj_attr_subscript, obj_name, attr_name, slice, method, args, kwargs_raw, source}
     else
       :none
     end
@@ -121,6 +156,53 @@ defmodule Pylixir.Nodes.Mutations do
     assign = {:=, [], [coll_ref, setitem]}
 
     context = Converter.bind_name(context, coll_name)
+
+    ast =
+      case slice_binding do
+        nil -> assign
+        b -> {:__block__, [], [b, assign]}
+      end
+
+    {ast, context}
+  end
+
+  # `<obj>.<attr>[<slice>].method(args)` — rebind `obj` so its
+  # attr-map's slice slot reflects the mutated inner value.
+  # Lowering shape:
+  #   obj = Map.put(obj, :<attr>,
+  #     py_setitem(Map.fetch!(obj, :<attr>), slice,
+  #                <mutation_rhs of py_getitem(...)>))
+  @spec emit_obj_attr_subscript(
+          String.t(),
+          String.t(),
+          map(),
+          String.t(),
+          [map()],
+          [map()],
+          map(),
+          Pylixir.Context.t()
+        ) :: {Macro.t(), Pylixir.Context.t()}
+  def emit_obj_attr_subscript(obj_name, attr_name, slice_node, method, args, kwargs_raw, source, context) do
+    {arg_asts, context} = Converter.convert_each(args, context)
+    {kwargs, context} = Converter.convert_keywords(kwargs_raw, context)
+    {slice_ref, slice_binding, context} = Converter.maybe_temp_bind(slice_node, context)
+
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
+    attr_atom = String.to_atom(attr_name)
+
+    attr_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [obj_ref, attr_atom]}
+
+    inner_get = {:py_getitem, [], [attr_read, slice_ref]}
+    new_inner = mutation_rhs(method, inner_get, arg_asts, kwargs, source)
+    new_attr = {:py_setitem, [], [attr_read, slice_ref, new_inner]}
+
+    map_put =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, attr_atom, new_attr]}
+
+    assign = {:=, [], [obj_ref, map_put]}
+    context = Converter.bind_name(context, obj_name)
 
     ast =
       case slice_binding do

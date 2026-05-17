@@ -1278,6 +1278,26 @@ defmodule Pylixir.RuntimeHelpers do
     lo + py_bisect_right(slice, x)
   end
 
+  # `bisect.insort(list, x)` / `bisect.insort_right(list, x)` — insert
+  # `x` into the sorted `list` AFTER any existing equal entries.
+  # `insort_left` inserts BEFORE. Returns the new list; the caller
+  # rebinds (the in-place semantics from Python is lost since Elixir
+  # lists are immutable, but the rebind via `xs = py_bisect_insort(xs, x)`
+  # gives the same observable behaviour).
+  def py_bisect_insort(list, x) when is_list(list) do
+    py_bisect_insort_right(list, x)
+  end
+
+  def py_bisect_insort_right(list, x) when is_list(list) do
+    pos = py_bisect_right(list, x)
+    List.insert_at(list, pos, x)
+  end
+
+  def py_bisect_insort_left(list, x) when is_list(list) do
+    pos = py_bisect_left(list, x)
+    List.insert_at(list, pos, x)
+  end
+
   # === Integer methods ===
 
   # Python's `int.bit_length()` — bits required to represent the int

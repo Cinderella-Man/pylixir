@@ -30,7 +30,7 @@ defmodule Pylixir.Context do
 
   @type def_position :: :module_top | :nested_fn | :other
 
-  @type return_mode :: nil | :unwrapped | :wrapped
+  @type return_mode :: nil | :unwrapped | :wrapped | :tuple_with_self
 
   @type t :: %__MODULE__{
           scopes: [MapSet.t(String.t())],

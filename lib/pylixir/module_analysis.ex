@@ -737,8 +737,14 @@ defmodule Pylixir.ModuleAnalysis do
   # `Pylixir.Stdlib.Heapq.statement_mutation_call/2` for the contract.
   defp mutates_name?(%{"_type" => "Expr", "value" => value}, name) do
     case Pylixir.Stdlib.Heapq.statement_mutation_call(value, nil) do
-      {:ok, ^name, _, _} -> true
-      _ -> false
+      {:ok, ^name, _, _} ->
+        true
+
+      _ ->
+        case Pylixir.Stdlib.Bisect.statement_mutation_call(value, nil) do
+          {:ok, ^name, _, _} -> true
+          _ -> false
+        end
     end
   end
 

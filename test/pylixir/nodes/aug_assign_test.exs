@@ -95,8 +95,16 @@ defmodule Pylixir.Nodes.AugAssignTest do
   end
 
   describe "AST shape — unsupported targets" do
-    test "Attribute target raises" do
-      target = %{"_type" => "Attribute", "value" => name("obj"), "attr" => "x"}
+    test "Attribute target with non-Name receiver still raises" do
+      # `<obj>.<attr> += value` is now lowered (instance-map field
+      # set), but only when the receiver is a bare Name. A nested
+      # Attribute chain (`a.b.c += 1`) still falls through to the
+      # generic AugAssign rejection.
+      target = %{
+        "_type" => "Attribute",
+        "value" => %{"_type" => "Attribute", "value" => name("a"), "attr" => "b"},
+        "attr" => "c"
+      }
 
       assert_raise UnsupportedNodeError, ~r/AugAssign/, fn ->
         Converter.convert(aug_assign(target, "Add", const(1)), Context.new())
