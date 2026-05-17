@@ -372,6 +372,64 @@ defmodule Pylixir.Nodes.Assign do
     {{:=, [], [target_ast, value_ast]}, context}
   end
 
+  # `self.<attr> = expr` inside a class method body — `self` is bound
+  # to a map (the instance state), so the assignment rewrites to
+  # `self = Map.put(self, :<attr>, expr)`. Any bare Name-target
+  # whose root is in `context.class_names` would also fit here, but
+  # Pylixir's first-pass class lowering only supports `self.x = ...`
+  # — other forms (e.g. `obj.x = ...` from outside the class) still
+  # require explicit rebind through method calls.
+  defp single_target_assign(
+         %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => "self"}, "attr" => attr} = _target,
+         value,
+         _node,
+         context
+       ) do
+    {value_ast, context} = Converter.convert(value, context)
+    attr_atom = String.to_atom(attr)
+    self_atom = "self" |> Pylixir.Naming.rewrite() |> String.to_atom()
+    self_ref = {self_atom, [], nil}
+
+    map_put =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, value_ast]}
+
+    {{:=, [], [self_ref, map_put]}, context}
+  end
+
+  # `self.<attr>[<slice>] = expr` — collection mutation on a self
+  # attribute. Lowers to
+  #   `self = Map.put(self, :<attr>, py_setitem(Map.fetch!(self, :<attr>), slice, expr))`
+  # so the updated attribute lives back inside the updated self map.
+  # Mutating-method detection in Converter.method_mutates_self?/1 picks
+  # this shape up via the Subscript-rooted-at-self-attribute check.
+  defp single_target_assign(
+         %{
+           "_type" => "Subscript",
+           "value" =>
+             %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => "self"}, "attr" => attr},
+           "slice" => slice
+         },
+         value,
+         _node,
+         context
+       ) do
+    {value_ast, context} = Converter.convert(value, context)
+    {slice_ast, context} = Converter.convert(slice, context)
+    attr_atom = String.to_atom(attr)
+    self_atom = "self" |> Pylixir.Naming.rewrite() |> String.to_atom()
+    self_ref = {self_atom, [], nil}
+
+    attr_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+
+    new_attr = {:py_setitem, [], [attr_read, slice_ast, value_ast]}
+
+    map_put =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, new_attr]}
+
+    {{:=, [], [self_ref, map_put]}, context}
+  end
+
   defp single_target_assign(target, _value, node, _context) do
     raise UnsupportedNodeError,
       node_type: "Assign",

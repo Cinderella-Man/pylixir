@@ -7,8 +7,8 @@ defmodule Pylixir.ConverterTest do
     test "raises UnsupportedNodeError on unknown node type, exposing the _type string" do
       ctx = Context.new()
 
-      assert_raise UnsupportedNodeError, ~r/ClassDef/, fn ->
-        Converter.convert(%{"_type" => "ClassDef"}, ctx)
+      assert_raise UnsupportedNodeError, ~r/Yield/, fn ->
+        Converter.convert(%{"_type" => "Yield"}, ctx)
       end
     end
 
@@ -32,7 +32,7 @@ defmodule Pylixir.ConverterTest do
       err =
         try do
           Converter.convert(
-            %{"_type" => "ClassDef", "lineno" => 14, "col_offset" => 2},
+            %{"_type" => "Yield", "lineno" => 14, "col_offset" => 2},
             ctx
           )
 
@@ -52,14 +52,14 @@ defmodule Pylixir.ConverterTest do
 
       err =
         try do
-          Converter.convert(%{"_type" => "ClassDef", "lineno" => 1, "col_offset" => 0}, ctx)
+          Converter.convert(%{"_type" => "Yield", "lineno" => 1, "col_offset" => 0}, ctx)
           flunk("expected UnsupportedNodeError")
         rescue
           e in UnsupportedNodeError -> e
         end
 
       assert err.hint != nil
-      assert err.message =~ "classes are not supported"
+      assert err.hint =~ "generators"
     end
 
     test "falls back gracefully when the node has no location info (synthesized nodes)" do
@@ -67,7 +67,7 @@ defmodule Pylixir.ConverterTest do
 
       err =
         try do
-          Converter.convert(%{"_type" => "ClassDef"}, ctx)
+          Converter.convert(%{"_type" => "Yield"}, ctx)
           flunk("expected UnsupportedNodeError")
         rescue
           e in UnsupportedNodeError -> e

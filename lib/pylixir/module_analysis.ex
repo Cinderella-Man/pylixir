@@ -42,6 +42,7 @@ defmodule Pylixir.ModuleAnalysis do
           function_defs: [map()],
           runtime_statements: [map()],
           known_functions: MapSet.t(String.t()),
+          class_defs: [Pylixir.ClassAnalysis.t()],
           module_doc: nil | String.t()
         }
 
@@ -49,6 +50,7 @@ defmodule Pylixir.ModuleAnalysis do
             function_defs: [],
             runtime_statements: [],
             known_functions: MapSet.new(),
+            class_defs: [],
             module_doc: nil
 
   @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault
@@ -84,9 +86,11 @@ defmodule Pylixir.ModuleAnalysis do
 
   def analyze(body) when is_list(body) do
     {module_doc, body} = extract_module_docstring(body)
-    promotable = mutation_free_literal_names(body)
-    reject_mutated_in_top_defs!(body, promotable)
-    {attrs, fns, stmts} = partition(body, promotable)
+    {class_nodes, body_no_classes} = extract_classes(body)
+    class_defs = Enum.map(class_nodes, &Pylixir.ClassAnalysis.analyze/1)
+    promotable = mutation_free_literal_names(body_no_classes)
+    reject_mutated_in_top_defs!(body_no_classes, promotable)
+    {attrs, fns, stmts} = partition(body_no_classes, promotable)
 
     # Elixir warns (treated as a compile error in our test harness)
     # when a module attribute is set but never used. Drop any promoted
@@ -112,9 +116,55 @@ defmodule Pylixir.ModuleAnalysis do
       function_defs: fns,
       runtime_statements: stmts,
       known_functions: known,
+      class_defs: class_defs,
       module_doc: module_doc
     }
   end
+
+  # Collect ClassDef nodes from both the module top AND any nested
+  # position inside a top-level FunctionDef body (recursively across
+  # If / While / For / Try, but stopping at nested FunctionDef /
+  # Lambda / ClassDef boundaries — those have their own scope and
+  # are handled in their own analyse pass if/when supported).
+  # Hoisting means a class defined inside `def main():` becomes a
+  # module-level `defp __cls_<Class>_*` that any function can call,
+  # which matches how competitive-programming code uses these helper
+  # classes (defined once, used throughout the script).
+  defp extract_classes(body) do
+    classes =
+      Enum.flat_map(body, fn node ->
+        collect_classes(node)
+      end)
+
+    {classes, body}
+  end
+
+  defp collect_classes(%{"_type" => "ClassDef"} = node) do
+    inner = Enum.flat_map(Map.get(node, "body", []), &collect_classes/1)
+    [node | inner]
+  end
+
+  defp collect_classes(%{"_type" => type} = node)
+       when type in ["FunctionDef", "AsyncFunctionDef"] do
+    Enum.flat_map(Map.get(node, "body", []), &collect_classes/1)
+  end
+
+  defp collect_classes(%{"_type" => type} = node)
+       when type in ["If", "While", "For", "AsyncFor"] do
+    Enum.flat_map(Map.get(node, "body", []), &collect_classes/1) ++
+      Enum.flat_map(Map.get(node, "orelse", []), &collect_classes/1)
+  end
+
+  defp collect_classes(%{"_type" => "Try"} = node) do
+    Enum.flat_map(Map.get(node, "body", []), &collect_classes/1) ++
+      Enum.flat_map(Map.get(node, "orelse", []), &collect_classes/1) ++
+      Enum.flat_map(Map.get(node, "finalbody", []), &collect_classes/1) ++
+      Enum.flat_map(Map.get(node, "handlers", []), fn h ->
+        Enum.flat_map(Map.get(h, "body", []), &collect_classes/1)
+      end)
+  end
+
+  defp collect_classes(_), do: []
 
   # --- Pass 2 — classification -------------------------------------------
 

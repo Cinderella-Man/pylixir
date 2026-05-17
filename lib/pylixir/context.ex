@@ -45,7 +45,9 @@ defmodule Pylixir.Context do
           return_mode: return_mode(),
           recursive_lambdas: MapSet.t(String.t()),
           recursive_self_binding: nil | String.t(),
-          stdlib_aliases: %{optional(String.t()) => {String.t(), String.t()}}
+          stdlib_aliases: %{optional(String.t()) => {String.t(), String.t()}},
+          class_names: MapSet.t(String.t()),
+          class_methods: %{optional(String.t()) => [{String.t(), :mutating | :read_only}]}
         }
 
   @enforce_keys [:scopes]
@@ -61,7 +63,9 @@ defmodule Pylixir.Context do
             return_mode: nil,
             recursive_lambdas: MapSet.new(),
             recursive_self_binding: nil,
-            stdlib_aliases: %{}
+            stdlib_aliases: %{},
+            class_names: MapSet.new(),
+            class_methods: %{}
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

@@ -38,8 +38,29 @@ defmodule Pylixir.Converter do
     attr_names =
       for {name, _value} <- analysis.module_attrs, into: MapSet.new(), do: name
 
-    context = %{context | module_attrs: attr_names}
+    class_names =
+      for cls <- analysis.class_defs, into: MapSet.new(), do: cls.name
 
+    # method-name → [{class_name, :mutating | :read_only}] map; lets
+    # the attribute-call router pick a unique class for a method name.
+    # Ambiguous lookups (same method name on multiple classes) are
+    # rejected at the call site with a clear hint.
+    class_methods =
+      Enum.reduce(analysis.class_defs, %{}, fn cls, acc ->
+        Enum.reduce(cls.methods, acc, fn m, acc2 ->
+          kind = if method_mutates_self?(m.body), do: :mutating, else: :read_only
+          Map.update(acc2, m.name, [{cls.name, kind}], &[{cls.name, kind} | &1])
+        end)
+      end)
+
+    context = %{
+      context
+      | module_attrs: attr_names,
+        class_names: class_names,
+        class_methods: class_methods
+    }
+
+    {class_asts, context} = convert_class_defs(analysis.class_defs, context)
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
     {fn_asts, context} = convert_each(analysis.function_defs, context)
 
@@ -60,7 +81,8 @@ defmodule Pylixir.Converter do
 
     body_block =
       moduledoc ++
-        helpers ++ attr_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
+        helpers ++
+        attr_asts ++ class_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
 
     defmodule_ast =
       {:defmodule, [],
@@ -344,14 +366,35 @@ defmodule Pylixir.Converter do
             {{:py_type_name, [], [value_ast]}, context}
 
           :no ->
-            target_type = Map.get(node["value"], "_type")
+            # First-pass class lowering treats `obj.<attr>` reads as
+            # `Map.fetch!(obj, :<attr>)` whenever a class is in scope
+            # (instance state is represented as a plain map). Pylixir
+            # doesn't yet track which name is an instance of which
+            # class — so the routing fires for ALL non-stdlib name
+            # reads when classes are defined in the module. For code
+            # without classes, the rejection below still fires
+            # unchanged. The runtime `Map.fetch!` raises a `KeyError`
+            # equivalent if the name isn't actually an instance map.
+            value = node["value"]
+            value_type = Map.get(value, "_type")
 
-            raise UnsupportedNodeError,
-              node_type: "Attribute",
-              hint:
-                "attribute access on a non-stdlib value (`<#{target_type}>.#{attr}`) is not supported (known stdlib modules: #{Enum.join(Stdlib.names(), ", ")})",
-              lineno: Map.get(node, "lineno"),
-              col_offset: Map.get(node, "col_offset")
+            cond do
+              MapSet.size(context.class_names) > 0 and
+                  value_type == "Name" ->
+                {value_ast, context} = convert(value, context)
+                attr_atom = String.to_atom(attr)
+
+                {{{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [],
+                  [value_ast, attr_atom]}, context}
+
+              true ->
+                raise UnsupportedNodeError,
+                  node_type: "Attribute",
+                  hint:
+                    "attribute access on a non-stdlib value (`<#{value_type}>.#{attr}`) is not supported (known stdlib modules: #{Enum.join(Stdlib.names(), ", ")})",
+                  lineno: Map.get(node, "lineno"),
+                  col_offset: Map.get(node, "col_offset")
+            end
         end
     end
   end
@@ -385,6 +428,13 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "FunctionDef"} = node, context),
     do: Nodes.Functions.function_def(node, context)
+
+  # A ClassDef encountered while converting a function body has
+  # already been hoisted by `ModuleAnalysis.extract_classes/1` to a
+  # top-level `defp __cls_<Class>_*` set. Emit an empty block here
+  # so the body-block builder doesn't choke on a `nil`. The class is
+  # globally callable via its name from any function in the module.
+  def convert(%{"_type" => "ClassDef"}, context), do: {{:__block__, [], []}, context}
 
   def convert(%{"_type" => "ListComp", "elt" => elt, "generators" => generators}, context) do
     Nodes.Comprehension.emit(:list, elt, generators, context)
@@ -556,25 +606,69 @@ defmodule Pylixir.Converter do
         emit_heapq_statement_rebind(heap_name, fn_name, args, context)
 
       :none ->
-        case Nodes.Mutations.detect(value) do
-          :none ->
-            convert(value, context)
+        case detect_mutating_class_method_call(value, context) do
+          {:ok, obj_name, class_name, method, args} ->
+            # `obj.method(args)` as a STATEMENT on a mutating method:
+            # the method returns updated self, so rebind obj. Without
+            # this, the mutation (a Map.put on a fresh map) would be
+            # discarded as the Expr's value.
+            emit_class_method_rebind(obj_name, class_name, method, args, context)
 
-          {:name, target_name, method, args, kwargs, source_node} ->
-            Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
+          :no ->
+            case Nodes.Mutations.detect(value) do
+              :none ->
+                convert(value, context)
 
-          {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
-            Nodes.Mutations.emit_subscript(
-              coll_name,
-              slice,
-              method,
-              args,
-              kwargs,
-              source_node,
-              context
-            )
+              {:name, target_name, method, args, kwargs, source_node} ->
+                Nodes.Mutations.emit(target_name, method, args, kwargs, source_node, context)
+
+              {:subscript, coll_name, slice, method, args, kwargs, source_node} ->
+                Nodes.Mutations.emit_subscript(
+                  coll_name,
+                  slice,
+                  method,
+                  args,
+                  kwargs,
+                  source_node,
+                  context
+                )
+            end
         end
     end
+  end
+
+  # Recognise `obj.<method>(args)` where `method` is a known mutating
+  # class method. Returns `{:ok, obj_name, class_name, method, args}`
+  # or `:no`. The obj must be a bare Name (we rebind it).
+  defp detect_mutating_class_method_call(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => obj_name},
+             "attr" => method
+           },
+           "args" => args,
+           "keywords" => []
+         },
+         context
+       ) do
+    case Map.get(context.class_methods, method, []) do
+      [{class_name, :mutating}] -> {:ok, obj_name, class_name, method, args}
+      _ -> :no
+    end
+  end
+
+  defp detect_mutating_class_method_call(_, _), do: :no
+
+  defp emit_class_method_rebind(obj_name, class_name, method, args, context) do
+    {arg_asts, context} = convert_each(args, context)
+    fn_name = method_fn_name(class_name, method)
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
+    call = {fn_name, [], [obj_ref | arg_asts]}
+    context = bind_name(context, obj_name)
+    {{:=, [], [obj_ref, call]}, context}
   end
 
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
@@ -900,6 +994,71 @@ defmodule Pylixir.Converter do
     {{:=, [], [target_ref, rhs]}, context}
   end
 
+  # `self.<attr> += value` — read+write the self-map attribute.
+  defp aug_assign(
+         %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => "self"},
+           "attr" => attr
+         },
+         op,
+         value,
+         node,
+         context
+       ) do
+    {value_ast, context} = convert(value, context)
+    attr_atom = String.to_atom(attr)
+    self_atom = "self" |> Naming.rewrite() |> String.to_atom()
+    self_ref = {self_atom, [], nil}
+
+    attr_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+
+    combined = bin_op_ast(op, attr_read, value_ast, node)
+
+    map_put =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, combined]}
+
+    {{:=, [], [self_ref, map_put]}, context}
+  end
+
+  # `self.<attr>[<slice>] += value` — common FenwickTree / SegmentTree
+  # shape. Threads the read+write back into the self map. Must precede
+  # the generic Subscript clause so it actually matches.
+  defp aug_assign(
+         %{
+           "_type" => "Subscript",
+           "value" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "self"},
+             "attr" => attr
+           },
+           "slice" => slice
+         },
+         op,
+         value,
+         node,
+         context
+       ) do
+    {slice_ast, context} = convert(slice, context)
+    {value_ast, context} = convert(value, context)
+    attr_atom = String.to_atom(attr)
+    self_atom = "self" |> Naming.rewrite() |> String.to_atom()
+    self_ref = {self_atom, [], nil}
+
+    attr_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [self_ref, attr_atom]}
+
+    getitem = {:py_getitem, [], [attr_read, slice_ast]}
+    combined = bin_op_ast(op, getitem, value_ast, node)
+    setitem = {:py_setitem, [], [attr_read, slice_ast, combined]}
+
+    map_put =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [self_ref, attr_atom, setitem]}
+
+    {{:=, [], [self_ref, map_put]}, context}
+  end
+
   defp aug_assign(
          %{"_type" => "Subscript", "value" => collection, "slice" => slice},
          op,
@@ -1005,6 +1164,14 @@ defmodule Pylixir.Converter do
         {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
 
         cond do
+          # `Foo(args)` where `Foo` is a registered class — route to
+          # the `Foo__init__/N` constructor `defp` emitted by
+          # `convert_class_defs/2`. Returns the instance map.
+          MapSet.member?(context.class_names, id) ->
+            no_kwargs!(kwargs, id, node)
+            fn_name = init_fn_name(id)
+            {{fn_name, [], arg_asts}, context}
+
           # `from <mod> import <name>` was lowered to a capture of a
           # fixed arity. If the user calls it with a different arity,
           # bypass the in-scope lambda and dispatch through the stdlib
@@ -1193,10 +1360,36 @@ defmodule Pylixir.Converter do
         )
 
       :no_stdlib ->
-        {target_ast, context} = convert(target, context)
-        {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
-        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
-        {Nodes.AttributeMethods.dispatch(attr, target_ast, arg_asts, kwargs, node), context}
+        # `obj.<method>(args)` on a registered class method: route to
+        # `__cls_<Class>_<method>(obj, args)`. Only read-only methods
+        # are handled here (a mutating method's return value is `self`
+        # and the caller must rebind `obj` — that path lives in the
+        # Expr clause for statement-form calls, added in a later loop).
+        owners = Map.get(context.class_methods, attr, [])
+
+        cond do
+          match?([{_, :read_only}], owners) ->
+            [{class_name, :read_only}] = owners
+            {target_ast, context} = convert(target, context)
+            {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+            fn_name = method_fn_name(class_name, attr)
+            {{fn_name, [], [target_ast | arg_asts]}, context}
+
+          length(owners) > 1 ->
+            names = Enum.map_join(owners, ", ", fn {c, _} -> c end)
+
+            raise UnsupportedNodeError,
+              node_type: "Call",
+              hint:
+                "method `.#{attr}()` is defined on multiple registered classes (#{names}); receiver-type inference is too weak to pick one — rename one of the methods or move the call into a method of the owning class",
+              lineno: Map.get(node, "lineno")
+
+          true ->
+            {target_ast, context} = convert(target, context)
+            {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+            {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+            {Nodes.AttributeMethods.dispatch(attr, target_ast, arg_asts, kwargs, node), context}
+        end
     end
   end
 
@@ -1490,6 +1683,171 @@ defmodule Pylixir.Converter do
     do: "Python literal of kind `#{kind}` is not supported"
 
   # --- Module-wrapper emission helpers ----------------------------------
+
+  # Emit one constructor + one per-method `defp` for each registered
+  # Python class. The init body is converted as a normal function
+  # body with `self` pre-bound, seeded as `self = %{}` — every
+  # `self.x = expr` rewrites to `self = Map.put(self, :x, expr)` via
+  # the Attribute-target Assign clause. Methods are lowered the same
+  # way; whether they "mutate self" or "return a value" is decided
+  # by a static walk of the body (`method_mutates_self?/1`):
+  #
+  #   * mutating method → return `self` at the end; caller rebinds
+  #     `obj = __cls_<C>_<m>(obj, ...)`.
+  #   * read-only method → return whatever the body's last expr or
+  #     explicit `return` yields; caller uses the value directly.
+  #
+  # Function name shape `__cls_<Class>_<method>` keeps the namespace
+  # distinct from user-defined `defp`s and unambiguous across classes.
+  defp convert_class_defs([], context), do: {[], context}
+
+  defp convert_class_defs(class_defs, context) do
+    {ast_lists, context} =
+      Enum.map_reduce(class_defs, context, &emit_class/2)
+
+    {List.flatten(ast_lists), context}
+  end
+
+  defp emit_class(class, context) do
+    %{name: class_name, init: init, methods: methods} = class
+
+    {init_ast, context} = emit_method(class_name, init, :init, context)
+    {method_asts, context} = Enum.map_reduce(methods, context, fn m, ctx ->
+      kind = if method_mutates_self?(m.body), do: :mutating, else: :read_only
+      emit_method(class_name, m, kind, ctx)
+    end)
+
+    {[init_ast | method_asts], context}
+  end
+
+  defp emit_method(class_name, %{args: args, body: body} = method, kind, context) do
+    fn_name =
+      case kind do
+        :init -> init_fn_name(class_name)
+        _ -> method_fn_name(class_name, method.name)
+      end
+
+    [%{"arg" => "self"} | rest_args] = args["args"]
+    param_atoms = Enum.map(rest_args, fn %{"arg" => a} -> a end)
+
+    saved_scopes = context.scopes
+    saved_return_mode = context.return_mode
+    inner_scope = MapSet.new(["self" | param_atoms])
+
+    inner_ctx = %{
+      context
+      | scopes: [inner_scope | context.scopes],
+        return_mode: :unwrapped
+    }
+
+    inner_ctx = bind_name(inner_ctx, "self")
+    inner_ctx = Enum.reduce(param_atoms, inner_ctx, &bind_name(&2, &1))
+
+    # `:init` seeds `self = %{}`; other methods receive `self` as the
+    # first param. Mutating methods return `self` at the end (caller
+    # rebinds). Read-only methods return whatever their last expr or
+    # `return` produces — the convert_each output already encodes that.
+    {body_asts, inner_ctx} = convert_each(body, inner_ctx)
+
+    self_atom = "self" |> Naming.rewrite() |> String.to_atom()
+    self_ref = {self_atom, [], nil}
+
+    body_block =
+      case kind do
+        :init ->
+          seed = {:=, [], [self_ref, {:%{}, [], []}]}
+          body_to_block([seed | body_asts] ++ [self_ref])
+
+        :mutating ->
+          body_to_block(body_asts ++ [self_ref])
+
+        :read_only ->
+          body_to_block(body_asts)
+      end
+
+    self_param =
+      case kind do
+        :init -> []
+        _ -> [self_ref]
+      end
+
+    param_refs =
+      Enum.map(param_atoms, fn name ->
+        {name |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    defp_ast =
+      {:defp, [],
+       [
+         {fn_name, [], self_param ++ param_refs},
+         [do: body_block]
+       ]}
+
+    {defp_ast,
+     %{
+       inner_ctx
+       | scopes: saved_scopes,
+         return_mode: saved_return_mode
+     }}
+  end
+
+  # Does this method body bind `self` (i.e. contains a `self.x = ...`
+  # or `self.x[...] = ...` form)? Mutation detection drives the
+  # caller-side rebind: `obj.method(args)` on a mutating method
+  # becomes `obj = __cls_<C>_<method>(obj, args)`, on a read-only
+  # method stays as a value expression.
+  defp method_mutates_self?(body) do
+    Enum.any?(body, &walk_for_self_mutation/1)
+  end
+
+  defp walk_for_self_mutation(node) do
+    Pylixir.AST.Walk.walk_scope(node, false, fn n, acc -> acc or self_mutating?(n) end)
+  end
+
+  defp self_mutating?(%{
+         "_type" => "Assign",
+         "targets" => targets
+       }) do
+    Enum.any?(targets, &assign_target_touches_self?/1)
+  end
+
+  defp self_mutating?(%{
+         "_type" => "AugAssign",
+         "target" => target
+       }) do
+    assign_target_touches_self?(target)
+  end
+
+  defp self_mutating?(_), do: false
+
+  defp assign_target_touches_self?(%{
+         "_type" => "Attribute",
+         "value" => %{"_type" => "Name", "id" => "self"}
+       }),
+       do: true
+
+  defp assign_target_touches_self?(%{
+         "_type" => "Subscript",
+         "value" => %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => "self"}}
+       }),
+       do: true
+
+  defp assign_target_touches_self?(_), do: false
+
+  @doc false
+  def init_fn_name(class_name) do
+    # Elixir function names must start lowercase (a leading capital
+    # is parsed as an alias). Python classes are PascalCase by
+    # convention, so prefix with `__cls_` (Pylixir-reserved namespace
+    # — the leading underscore avoids collision with user `defp`s
+    # and the `__cls_` prefix is unique enough to make grep useful).
+    String.to_atom("__cls_" <> class_name <> "__init__")
+  end
+
+  @doc false
+  def method_fn_name(class_name, method_name) do
+    String.to_atom("__cls_" <> class_name <> "_" <> method_name)
+  end
 
   defp convert_module_attrs([], context), do: {[], context}
 

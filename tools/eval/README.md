@@ -77,11 +77,21 @@ mix eval.probe Call/4                  # short form: bucket / sample-N
 
 ### Triage rules of thumb
 
-- **Hints in `unsupported--ClassDef` / `unsupported--Attribute` on
-  `.<class-attr>` / `.union()` / `.query()` / `.add_edge()` on custom
-  receivers are out of scope.** Custom Python classes aren't lowered;
-  any method call on a class instance ends up in the `Call` bucket but
-  is doomed by the upstream `ClassDef` rejection. Skip these.
+- **Most failure buckets are unimplemented features, not "out of scope"** —
+  if a Python construct is common in competitive code, adding support
+  for it is a valid loop target. Past loops added `while/else`,
+  `re.DOTALL`/`flags=`, `itertools.groupby`, `functools.cmp_to_key`,
+  and a minimal Python data-class lowering (single class with
+  `__init__`, read-only + mutating methods, subscript-assign on self
+  attrs, nested-class hoisting). Each was one to several loops.
+- **`compile_error--*` buckets are still the prize.** A bucket there
+  means the transpiler accepted the source but emitted broken Elixir
+  — i.e. a silent bug. Fix these even when they're tiny.
+- **Genuinely out of scope** for the first-pass class lowering:
+  inheritance (`class B(A):`), decorators (`@dataclass`, `@property`),
+  metaclasses, `@classmethod` / `@staticmethod`, instance attribute
+  access from outside the class on non-instance values. These raise
+  with precise hints from `Pylixir.ClassAnalysis`.
 - **`compile_error--*` buckets are the prize, not the noise.** A bucket
   there means the transpiler accepted the source but emitted broken
   Elixir — i.e. a silent bug. Fix these even when they're tiny.

@@ -305,6 +305,44 @@ defmodule Pylixir.TranspileTest do
       end
     end
 
+    test "class instantiation and method calls transpile" do
+      # The minimal data-class lowering: `Foo(args)` returns a map,
+      # `obj.attr` reads via Map.fetch!, methods become defps. Covered
+      # end-to-end by `test/fixtures/python/159_class_basic.py`;
+      # repeated here as a transpile-only smoke check so the failure
+      # mode is "the class lowering broke" rather than "the runtime
+      # behaviour regressed".
+      if python_available?() do
+        out =
+          Pylixir.transpile("""
+          class Point:
+              def __init__(self, x, y):
+                  self.x = x
+                  self.y = y
+              def magnitude_sq(self):
+                  return self.x * self.x + self.y * self.y
+          p = Point(3, 4)
+          print(p.magnitude_sq())
+          """)
+
+        assert out =~ "__cls_Point__init__"
+        assert out =~ "__cls_Point_magnitude_sq"
+        assert out =~ "Map.fetch!"
+      end
+    end
+
+    test "class inheritance still rejected loudly" do
+      if python_available?() do
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile("class B(A):\n    pass\n")
+          end
+
+        assert err.node_type == "ClassDef"
+        assert err.hint =~ "inherits"
+      end
+    end
+
     test "def with a local rebinding (`name = ...`) of the module name is not rejected" do
       # Python's local-by-default: `name = ...` inside a def creates a
       # local that shadows the module-level. Subscript mutations of
