@@ -226,4 +226,105 @@ defmodule Pylixir.TranspileTest do
       end
     end
   end
+
+  describe "module-level dict mutated inside top-level def" do
+    # Regression: `walk_scope` doesn't descend into FunctionDef bodies,
+    # so a `memo[x] = ...` inside `def f(...)` was invisible to the
+    # promotability check. `memo = {1: 1}` got promoted to `@var_memo`
+    # (immutable), the converter rewrote the subscript-assign to
+    # `@var_memo = py_setitem(...)` (runtime no-op), and any
+    # post-assign `memo[x]` read emitted bare `memo` — undefined
+    # variable. Five samples in the 5000-sample eval landed in the
+    # `compile_error--compile_quoted_raised` bucket from this.
+    # ModuleAnalysis now rejects the pattern at transpile time.
+
+    test "subscript-assign of a module dict inside a def raises Module hint" do
+      if python_available?() do
+        src = """
+        memo = {1: 1}
+
+        def f(x):
+            if x in memo:
+                return memo[x]
+            memo[x] = x * 2
+            return memo[x]
+
+        print(f(2))
+        """
+
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile(src)
+          end
+
+        assert err.node_type == "Module"
+        assert err.hint =~ "memo"
+        assert err.hint =~ "Refactor"
+      end
+    end
+
+    test "method-call mutation (.append) of a module list inside a def is also rejected" do
+      if python_available?() do
+        src = """
+        items = []
+
+        def push(x):
+            items.append(x)
+
+        push(1)
+        print(items)
+        """
+
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile(src)
+          end
+
+        assert err.node_type == "Module"
+        assert err.hint =~ "items"
+      end
+    end
+
+    test "module dict that is only READ inside a def still works" do
+      # The rejection must not over-fire: read-only access from a def
+      # is a legitimate, common pattern (lookup tables, constants).
+      if python_available?() do
+        out =
+          Pylixir.transpile("""
+          table = {"a": 1, "b": 2}
+
+          def lookup(k):
+              return table[k]
+
+          print(lookup("a"))
+          print(lookup("b"))
+          """)
+
+        assert out =~ "@var_table"
+        assert out =~ "def lookup"
+      end
+    end
+
+    test "def with a local rebinding (`name = ...`) of the module name is not rejected" do
+      # Python's local-by-default: `name = ...` inside a def creates a
+      # local that shadows the module-level. Subscript mutations of
+      # that local don't reach the global, so the global remains
+      # promotable.
+      if python_available?() do
+        out =
+          Pylixir.transpile("""
+          memo = {1: 1}
+
+          def f():
+              memo = {}
+              memo[2] = 4
+              return memo[2]
+
+          print(f())
+          """)
+
+        assert out =~ "@var_memo"
+      end
+    end
+  end
 end

@@ -85,6 +85,7 @@ defmodule Pylixir.ModuleAnalysis do
   def analyze(body) when is_list(body) do
     {module_doc, body} = extract_module_docstring(body)
     promotable = mutation_free_literal_names(body)
+    reject_mutated_in_top_defs!(body, promotable)
     {attrs, fns, stmts} = partition(body, promotable)
 
     # Elixir warns (treated as a compile error in our test harness)
@@ -542,6 +543,76 @@ defmodule Pylixir.ModuleAnalysis do
   defp mutated_anywhere?(body, name) do
     Enum.any?(body, fn node ->
       Walk.walk_scope(node, false, fn n, acc -> acc or mutates_name?(n, name) end)
+    end)
+  end
+
+  # `Walk.walk_scope` deliberately stops at FunctionDef boundaries —
+  # which means `memo[x] = ...` inside `def f(): ...` is invisible to
+  # `mutated_anywhere?`. A name like `memo` then gets promoted to
+  # `@var_memo` (immutable Elixir module attribute), the converter
+  # rewrites the subscript-assign to `@var_memo = py_setitem(...)`,
+  # and any read of `memo` AFTER the rebind emits bare `memo` (the
+  # subscript-assign tags `memo` as a local in the surrounding
+  # context). That bare reference fails to compile with
+  # "undefined variable `memo`". Even when the read-after-assign
+  # doesn't occur, the @-attr "rebind" is a runtime no-op so the
+  # mutation is silently dropped — the memoization breaks invisibly.
+  #
+  # Reject the pattern at transpile time so the user refactors to
+  # pass state explicitly through return values (the only shape
+  # Pylixir's immutable lowering can model correctly).
+  defp reject_mutated_in_top_defs!(body, promotable) do
+    promotable
+    |> Enum.find(fn name -> mutated_inside_top_def?(body, name) end)
+    |> case do
+      nil ->
+        :ok
+
+      name ->
+        raise Pylixir.UnsupportedNodeError,
+          node_type: "Module",
+          hint:
+            "module-level `#{name} = ...` is mutated inside a top-level `def` " <>
+              "(e.g. `#{name}[x] = ...` or `#{name}.append(...)`). Pylixir lowers " <>
+              "module-level literals to immutable Elixir module attributes, so " <>
+              "the mutation can't persist. Refactor to pass `#{name}` explicitly " <>
+              "through return values, or thread it as a function argument."
+    end
+  end
+
+  defp mutated_inside_top_def?(body, name) do
+    Enum.any?(body, fn
+      %{"_type" => type, "body" => def_body}
+      when type in ["FunctionDef", "AsyncFunctionDef"] ->
+        not def_rebinds_name?(def_body, name) and def_mutates_name?(def_body, name)
+
+      _ ->
+        false
+    end)
+  end
+
+  # A `name = ...` (bare Name LHS) anywhere in the def body shadows
+  # the module-level name — Python's local-by-default rule. Subscript
+  # mutations of that local don't reach the global, so we don't reject
+  # the global's promotion in that case.
+  defp def_rebinds_name?(def_body, name) do
+    Enum.any?(def_body, fn n ->
+      Walk.walk_scope(n, false, fn node, acc -> acc or assigns_local_name?(node, name) end)
+    end)
+  end
+
+  defp assigns_local_name?(%{"_type" => "Assign", "targets" => targets}, name) do
+    Enum.any?(targets, fn
+      %{"_type" => "Name", "id" => id} -> id == name
+      _ -> false
+    end)
+  end
+
+  defp assigns_local_name?(_, _), do: false
+
+  defp def_mutates_name?(def_body, name) do
+    Enum.any?(def_body, fn n ->
+      Walk.walk_scope(n, false, fn node, acc -> acc or mutates_name?(node, name) end)
     end)
   end
 
