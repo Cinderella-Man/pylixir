@@ -39,15 +39,22 @@ defmodule Eval.Compile do
         end
       end)
 
-    # Every call creates a unique TranslatedCode_<N> module. Without
-    # purging, after enough samples the BEAM's export-staged-index
-    # fills up and the runtime crashes with:
+    # `Code.compile_quoted` loads the module as "current". To actually
+    # reclaim its export-table slots we have to BOTH (a) demote it to
+    # "old" via `:code.delete/1` and THEN (b) free the old version via
+    # `:code.purge/1` — the docs require this exact order.
+    #
+    # Earlier attempts had purge BEFORE delete: `purge` returned false
+    # (no old version yet, since the compile just loaded current) and
+    # `delete` then moved current → old with no follow-up purge, so
+    # each call left an undeletable "old" copy. With unique aliases
+    # per call (chosen to avoid races between concurrent workers),
+    # nothing ever purged those olds, and the BEAM crashed at ~3525
+    # samples with:
     #   "no more index entries in export_staged_index (max=524288)"
-    # observed at ~5000 samples × N internal helpers. Purge + delete
-    # immediately so each iteration leaves no residue.
     module = Module.concat(Elixir, unique_alias)
-    :code.purge(module)
     :code.delete(module)
+    :code.purge(module)
 
     case compile_outcome do
       :ok -> {:ok, diagnostics}
