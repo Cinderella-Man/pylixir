@@ -41,15 +41,32 @@ defmodule Pylixir.ModuleAnalysis do
           module_attrs: [{String.t(), map()}],
           function_defs: [map()],
           runtime_statements: [map()],
-          known_functions: MapSet.t(String.t())
+          known_functions: MapSet.t(String.t()),
+          module_doc: nil | String.t()
         }
 
   defstruct module_attrs: [],
             function_defs: [],
             runtime_statements: [],
-            known_functions: MapSet.new()
+            known_functions: MapSet.new(),
+            module_doc: nil
 
   @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse)
+
+  # Python convention (PEP 257): a module's first statement, if a bare
+  # string Constant followed by *other statements*, is the docstring.
+  # Extract it so the Converter can emit `@moduledoc` and drop it from
+  # the body so Elixir doesn't warn about an unused literal in py_main.
+  # A 1-statement module that's just a string isn't a docstring — it's
+  # the actual return value (`Pylixir.transpile("\"hi\"")`).
+  defp extract_module_docstring([
+         %{"_type" => "Expr", "value" => %{"_type" => "Constant", "value" => v}}
+         | [_ | _] = rest
+       ])
+       when is_binary(v),
+       do: {v, rest}
+
+  defp extract_module_docstring(body), do: {nil, body}
 
   @doc """
   Analyse a Python `Module.body` list. Returns a fully-populated
@@ -57,8 +74,15 @@ defmodule Pylixir.ModuleAnalysis do
   """
   @spec analyze([map()]) :: t()
   def analyze(body) when is_list(body) do
+    {module_doc, body} = extract_module_docstring(body)
     promotable = mutation_free_literal_names(body)
     {attrs, fns, stmts} = partition(body, promotable)
+
+    # Elixir warns (treated as a compile error in our test harness)
+    # when a module attribute is set but never used. Drop any promoted
+    # attr whose name isn't referenced anywhere — those flow back into
+    # runtime_statements as plain Assigns at their original position.
+    {attrs, demoted_attr_names} = drop_unused_attrs(attrs, body)
 
     # A top-level `defp` lives at module scope and can't see bindings
     # introduced inside `py_main` (where mutable top-level state lives).
@@ -67,8 +91,9 @@ defmodule Pylixir.ModuleAnalysis do
     # nested-FunctionDef path will emit it as a `name = fn ... end`
     # lambda closure that does close over the surrounding scope.
     mutable_module_names = mutable_top_level_names(body, attrs)
-    {fns, demoted} = demote_closures(fns, mutable_module_names)
-    stmts = merge_in_original_order(body, stmts, demoted)
+    {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
+
+    stmts = merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
 
     known = MapSet.new(fns, & &1["name"])
 
@@ -76,7 +101,8 @@ defmodule Pylixir.ModuleAnalysis do
       module_attrs: attrs,
       function_defs: fns,
       runtime_statements: stmts,
-      known_functions: known
+      known_functions: known,
+      module_doc: module_doc
     }
   end
 
@@ -292,28 +318,43 @@ defmodule Pylixir.ModuleAnalysis do
 
   defp refs_free_name?(_leaf, _names, _locals), do: false
 
-  # Walk `body` in original order, replacing each demoted FunctionDef
-  # at its original index back into `stmts`. Preserves Python execution
-  # order so a `def foo(): ...` followed by `foo(x)` still works.
-  defp merge_in_original_order(body, stmts, demoted) do
-    demoted_set = MapSet.new(demoted, & &1["name"])
+  # Walk `body` in original order, replacing demoted FunctionDefs and
+  # demoted (unused-attr) Assigns back into `stmts`. Preserves Python
+  # execution order so `def foo(): ...` followed by `foo(x)` still
+  # works, and `stable = True` flows through py_main as a no-op binding.
+  defp merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names) do
+    demoted_fn_set = MapSet.new(demoted_fns, & &1["name"])
+    # Whatever's currently in `stmts` already lives there — use a set
+    # to keep that lookup O(1) below.
+    stmts_set = MapSet.new(stmts)
 
     {merged, _} =
       Enum.reduce(body, {[], stmts}, fn node, {acc, remaining_stmts} ->
         cond do
           match?(%{"_type" => "FunctionDef"}, node) and
-              MapSet.member?(demoted_set, node["name"]) ->
+              MapSet.member?(demoted_fn_set, node["name"]) ->
             {[node | acc], remaining_stmts}
 
           match?(%{"_type" => "FunctionDef"}, node) ->
             {acc, remaining_stmts}
 
-          # Top-level promotable literal Assign — skip; it became a module attr.
-          (name = literal_assign_name(node)) && name != nil ->
+          # Demoted-attr Assign — was promoted to @var_X but the name
+          # is never read, so restore it as a runtime statement.
+          (name = literal_assign_name(node)) && MapSet.member?(demoted_attr_names, name) ->
+            {[node | acc], remaining_stmts}
+
+          # Literal Assign that's already in stmts (mutation kept it
+          # out of the attr set) — pop from remaining_stmts so we don't
+          # double-include.
+          (_name = literal_assign_name(node)) && MapSet.member?(stmts_set, node) ->
             case remaining_stmts do
               [^node | rest] -> {[node | acc], rest}
-              _ -> {acc, remaining_stmts}
+              _ -> {[node | acc], remaining_stmts}
             end
+
+          # Literal Assign that was promoted (in attrs, not in stmts).
+          (name = literal_assign_name(node)) && name != nil ->
+            {acc, remaining_stmts}
 
           true ->
             case remaining_stmts do
@@ -325,6 +366,45 @@ defmodule Pylixir.ModuleAnalysis do
 
     Enum.reverse(merged)
   end
+
+  defp drop_unused_attrs(attrs, body) do
+    referenced = referenced_names(body, MapSet.new())
+
+    Enum.reduce(attrs, {[], MapSet.new()}, fn {name, _value} = entry, {kept, demoted} ->
+      if MapSet.member?(referenced, name) do
+        {[entry | kept], demoted}
+      else
+        {kept, MapSet.put(demoted, name)}
+      end
+    end)
+    |> then(fn {kept, demoted} -> {Enum.reverse(kept), demoted} end)
+  end
+
+  # Collect every Name `id` that appears in a Load context. Names in
+  # Store/Del context (Assign targets, augassign targets, for-loop
+  # targets) don't count as reads. Without this, an unused
+  # `STABLE = True` still looks "referenced" because its own target
+  # is a Name, and the attr would never demote.
+  defp referenced_names(nodes, acc) when is_list(nodes),
+    do: Enum.reduce(nodes, acc, &referenced_names/2)
+
+  defp referenced_names(%{"_type" => "Name", "id" => id} = node, acc) do
+    case node["ctx"] do
+      %{"_type" => "Load"} -> MapSet.put(acc, id)
+      # Older Python or missing ctx — be conservative and count it as
+      # a read so we never wrongly drop an attr that's actually used.
+      nil -> MapSet.put(acc, id)
+      _ -> acc
+    end
+  end
+
+  defp referenced_names(%{"_type" => _} = node, acc) do
+    node
+    |> Map.delete("_type")
+    |> Enum.reduce(acc, fn {_k, v}, a -> referenced_names(v, a) end)
+  end
+
+  defp referenced_names(_leaf, acc), do: acc
 
   # --- Pass 1 — mutation-free literal names ------------------------------
 

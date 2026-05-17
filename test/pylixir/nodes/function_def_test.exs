@@ -40,7 +40,7 @@ defmodule Pylixir.Nodes.FunctionDefTest do
   defp module_with(stmts), do: %{"_type" => "Module", "body" => stmts}
 
   describe "def_position guard" do
-    test "at :module_top — emits a defp" do
+    test "at :module_top — emits a `def` (public)" do
       ctx = Context.new()
 
       {ast, _} =
@@ -49,7 +49,10 @@ defmodule Pylixir.Nodes.FunctionDefTest do
           ctx
         )
 
-      assert match?({:defp, [], [_, _]}, ast)
+      # Switched from `defp` to `def` so `@doc` attaches cleanly and
+      # `apply(__MODULE__, :name, args)` (used by the star-unpack-call
+      # path) can reach the function. No semantic change otherwise.
+      assert match?({:def, [], [_, _]}, ast)
     end
 
     test "at :nested_fn — emits a fn binding (T21)" do
@@ -111,7 +114,7 @@ defmodule Pylixir.Nodes.FunctionDefTest do
     end
 
     test "type_params silently ignored (PEP 695)" do
-      assert {{:defp, _, _}, _} =
+      assert {{:def, _, _}, _} =
                Converter.convert(
                  function_def("f", arguments([]), [],
                    type_params: [%{"_type" => "TypeVar", "name" => "T"}]
@@ -127,7 +130,7 @@ defmodule Pylixir.Nodes.FunctionDefTest do
 
       {ast, _} = Converter.convert(function_def("f", args, [name("y")]), Context.new())
 
-      {:defp, [], [{:f, [], params}, _]} = ast
+      {:def, [], [{:f, [], params}, _]} = ast
       assert length(params) == 2
       # Last param has the default syntax {:\\, [], [ref, default_ast]}
       assert match?({:\\, [], [_, 0]}, List.last(params))

@@ -69,10 +69,17 @@ defmodule Pylixir.NamingTest do
   end
 
   describe "reserved_prefix?/1 — Pylixir's own namespace" do
-    test "var_* identifiers are reserved (rewrite-prefix collision)" do
-      assert Naming.reserved_prefix?("var_foo")
-      assert Naming.reserved_prefix?("var_")
-      assert Naming.reserved_prefix?("var_anything_at_all")
+    test "py_* identifiers remain reserved (runtime-helper namespace)" do
+      assert Naming.reserved_prefix?("py_foo")
+      assert Naming.reserved_prefix?("py_")
+    end
+
+    test "var_* identifiers are no longer reserved — rewritten with usr_ prefix" do
+      # `var_type` is legal Python; we now emit `usr_var_type` to avoid
+      # colliding with Python `type` → `var_type`.
+      refute Naming.reserved_prefix?("var_type")
+      assert Naming.rewrite("var_type") == "usr_var_type"
+      assert Naming.rewrite("var_anything") == "usr_var_anything"
     end
 
     test "py_* identifiers are reserved (helper/wrapper collision)" do

@@ -239,15 +239,14 @@ defmodule Pylixir.Nodes.LiteralsTest do
       end
     end
 
-    test "format spec raises with a clear hint" do
+    test "format spec is now lowered via py_format_value (no longer raises)" do
       python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
 
       case System.cmd(python, ["--version"], stderr_to_stdout: true) do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
-            assert_raise Pylixir.UnsupportedNodeError, ~r/format/, fn ->
-              Pylixir.transpile("x = 3.14\nf\"{x:.2f}\"\n")
-            end
+            out_src = Pylixir.transpile("x = 3.14\nf\"{x:.2f}\"\n")
+            assert out_src =~ "py_format_value"
           end
 
         _ ->

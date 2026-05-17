@@ -77,16 +77,23 @@ defmodule Pylixir.Naming do
   translation time.
   """
   @spec reserved_prefix?(String.t()) :: boolean()
-  def reserved_prefix?("var_" <> _), do: true
   def reserved_prefix?("py_" <> _), do: true
   def reserved_prefix?(_), do: false
 
   @doc """
-  Apply the `var_` prefix to `id` iff `reserved?/1` is true; otherwise
-  return `id` unchanged.
+  Apply the `var_` prefix to `id` iff `reserved?/1` is true. User
+  identifiers that themselves start with `var_` (a Python-legal name
+  like `var_type`) get an extra `usr_` prefix so the emitted
+  `var_var_type` doesn't collide with the rewrite of Python's
+  `type` → `var_type`. Identifiers starting with `py_` are still
+  outright rejected — that's our reserved runtime-helper namespace.
   """
   @spec rewrite(String.t()) :: String.t()
   def rewrite(id) when is_binary(id) do
-    if reserved?(id), do: "var_" <> id, else: id
+    cond do
+      reserved?(id) -> "var_" <> id
+      String.starts_with?(id, "var_") -> "usr_" <> id
+      true -> id
+    end
   end
 end

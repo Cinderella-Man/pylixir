@@ -104,10 +104,13 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
   end
 
   describe "RFC §4.4 — f-strings, t-strings, sets, walrus, MatMult" do
-    test "f-string with a format spec still raises (specs not yet supported)" do
-      # Bare f-strings now lower to `<>` concats; only the format-spec
-      # case (`f"{x:.2f}"`) is still unsupported, with a clearer hint.
-      assert_raises_unsupported(~s|x = 3.14\nf"{x:.2f}"\n|, "FormattedValue")
+    test "f-string with a constant format spec lowers via py_format_value" do
+      out = Pylixir.transpile(~s|x = 3.14\nf"{x:.2f}"\n|)
+      assert out =~ "py_format_value"
+    end
+
+    test "f-string with a nested-interpolation format spec still raises" do
+      assert_raises_unsupported(~s|w = 5\nx = 3.14\nf"{x:.{w}f}"\n|, "FormattedValue")
     end
 
     # Set literals are now supported — `{1, 2, 3}` lowers to
@@ -185,10 +188,9 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
       end
     end
 
-    test "Python identifier `var_foo` raises (T07 inverse-collision)" do
-      assert_raise UnsupportedNodeError, ~r/var_foo/, fn ->
-        Converter.convert(%{"_type" => "Name", "id" => "var_foo"}, Context.new())
-      end
+    test "Python identifier `var_foo` is rewritten to `usr_var_foo` (no longer raises)" do
+      {ast, _} = Converter.convert(%{"_type" => "Name", "id" => "var_foo"}, Context.new())
+      assert ast == {:usr_var_foo, [], nil}
     end
 
     test "Python identifier `py_add` raises (T07 inverse-collision)" do

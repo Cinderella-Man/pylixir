@@ -44,7 +44,8 @@ defmodule Pylixir.Context do
           while_helpers: [Macro.t()],
           return_mode: return_mode(),
           recursive_lambdas: MapSet.t(String.t()),
-          recursive_self_binding: nil | String.t()
+          recursive_self_binding: nil | String.t(),
+          stdlib_aliases: %{optional(String.t()) => {String.t(), String.t()}}
         }
 
   @enforce_keys [:scopes]
@@ -59,7 +60,8 @@ defmodule Pylixir.Context do
             while_helpers: [],
             return_mode: nil,
             recursive_lambdas: MapSet.new(),
-            recursive_self_binding: nil
+            recursive_self_binding: nil,
+            stdlib_aliases: %{}
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

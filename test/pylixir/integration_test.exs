@@ -265,6 +265,38 @@ defmodule Pylixir.IntegrationTest do
       end
     end
 
+    test "module docstring is promoted to @moduledoc" do
+      source = """
+      \"\"\"This module computes something.\"\"\"
+      x = 1
+      print(x)
+      """
+
+      if python_available?() do
+        elixir_source = Pylixir.transpile(source)
+        assert elixir_source =~ "@moduledoc"
+        assert elixir_source =~ "This module computes something."
+      end
+    end
+
+    test "top-level def docstring is promoted to @doc on the public def" do
+      source = """
+      def add(a, b):
+          \"\"\"Return the sum of a and b.\"\"\"
+          return a + b
+
+      print(add(2, 3))
+      """
+
+      if python_available?() do
+        elixir_source = Pylixir.transpile(source)
+        assert elixir_source =~ "@doc"
+        assert elixir_source =~ "Return the sum of a and b."
+        # The function is emitted as `def` (not `defp`) so @doc attaches.
+        assert elixir_source =~ ~r/def\s+add\(a,\s*b\)/
+      end
+    end
+
     test "DATA = [1, 2, 3] (mutation-free) is promoted, value is the literal" do
       source = """
       DATA = [10, 20, 30]
@@ -578,16 +610,15 @@ else:
   end
 
   describe "Unsupported nodes raise" do
-    test "f-string with format spec still raises (bare interpolation now works)" do
+    test "f-string with constant format spec lowers via py_format_value" do
       if python_available?() do
         # Bare interpolation transpiles cleanly now — lowered to `<>` concats.
         out = Pylixir.transpile(~s(name = "world"\nf"hello, {name}"\n))
         assert is_binary(out)
 
-        # Format specs (`f"{x:.2f}"`) still raise.
-        assert_raise Pylixir.UnsupportedNodeError, fn ->
-          Pylixir.transpile(~s(x = 3.14\nf"{x:.2f}"\n))
-        end
+        # Format specs (`f"{x:.2f}"`) now route through py_format_value.
+        spec_out = Pylixir.transpile(~s(x = 3.14\nf"{x:.2f}"\n))
+        assert spec_out =~ "py_format_value"
       end
     end
 

@@ -55,8 +55,11 @@ defmodule Pylixir.Converter do
 
     helpers = HelpersCodegen.helpers_ast()
 
+    moduledoc = moduledoc_ast(analysis.module_doc)
+
     body_block =
-      helpers ++ attr_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
+      moduledoc ++
+        helpers ++ attr_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
 
     defmodule_ast =
       {:defmodule, [],
@@ -1480,6 +1483,21 @@ defmodule Pylixir.Converter do
         {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
 
         cond do
+          # `from <mod> import <name>` was lowered to a capture of a
+          # fixed arity. If the user calls it with a different arity,
+          # bypass the in-scope lambda and dispatch through the stdlib
+          # — that callback knows all arities the helper supports.
+          Map.has_key?(context.stdlib_aliases, id) ->
+            {mod, name} = context.stdlib_aliases[id]
+            impl = Stdlib.impl(mod)
+
+            Lowering.dispatch(
+              impl.call([name], arg_asts, kwargs, node),
+              "`#{id}/#{length(arg_asts)}` (alias for #{mod}.#{name}) is not a supported call shape",
+              node,
+              context
+            )
+
           id == context.recursive_self_binding ->
             no_kwargs!(kwargs, id, node)
             self_ref = {:self, [], nil}
@@ -1540,17 +1558,19 @@ defmodule Pylixir.Converter do
         ref = {atom, [], nil}
         {{{:., [], [{:__aliases__, [], [:Kernel]}, :apply]}, [], [ref, arg_list]}, context}
 
+      MapSet.member?(context.known_functions, id) ->
+        # Top-level `def f(...)` — reachable via `apply(__MODULE__, :f, args)`.
+        # (Top-level Pylixir functions are public `def`s since the
+        # @doc-propagation switch.)
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        mod = {:__MODULE__, [], nil}
+        {{{:., [], [{:__aliases__, [], [:Kernel]}, :apply]}, [], [mod, atom, arg_list]}, context}
+
       true ->
-        # Top-level `defp` would need `apply(__MODULE__, ...)` which
-        # doesn't reach private functions. Emit a clear hint pointing
-        # the user at the lambda-via-`from <stdlib> import` workaround
-        # or refactoring to take a list directly.
         raise UnsupportedNodeError,
           node_type: "Starred",
           hint:
-            "`#{id}(*args)` is only supported when `#{id}` is in scope as a lambda (or is the builtin `zip`). " <>
-              "Top-level `def`s lower to `defp` and can't be reached via `apply` — refactor `#{id}` to take a list, " <>
-              "or bind it as `#{id}_fn = lambda *a: #{id}(*a)` and call `#{id}_fn(*args)`.",
+            "`#{id}(*args)` is only supported when `#{id}` is in scope as a lambda, a top-level def, or the builtin `zip`",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
@@ -1752,18 +1772,26 @@ defmodule Pylixir.Converter do
     do: {v, context}
 
   defp joined_str_part(%{"_type" => "FormattedValue"} = node, context) do
-    if Map.get(node, "format_spec") not in [nil, %{"value" => nil}, %{}],
-      do:
-        raise(UnsupportedNodeError,
+    {value_ast, context} = convert(Map.fetch!(node, "value"), context)
+    spec = extract_format_spec(Map.get(node, "format_spec"))
+
+    case spec do
+      :none ->
+        {{:py_str, [], [value_ast]}, context}
+
+      {:literal, text} ->
+        # Dispatch to the runtime helper that interprets the spec at
+        # runtime (Pylixir doesn't know `value`'s type statically).
+        {{:py_format_value, [], [value_ast, text]}, context}
+
+      :unsupported ->
+        raise UnsupportedNodeError,
           node_type: "FormattedValue",
           hint:
-            "f-string format specs (`f\"{x:.2f}\"`) aren't supported yet — use `\"{:.2f}\".format(x)` instead",
+            "f-string format specs with nested interpolation aren't supported — use a constant spec like `:.2f` or `\"{:.2f}\".format(x)`",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
-        )
-
-    {value_ast, context} = convert(Map.fetch!(node, "value"), context)
-    {{:py_str, [], [value_ast]}, context}
+    end
   end
 
   defp joined_str_part(other, _context) do
@@ -1772,6 +1800,23 @@ defmodule Pylixir.Converter do
       hint:
         "unexpected JoinedStr child `#{Map.get(other, "_type")}` — expected Constant or FormattedValue"
   end
+
+  # Format spec is itself a JoinedStr. If it's a single Constant string
+  # (the common `:.2f` / `:02d` case), return its text; if it has
+  # interpolations (`{width}`), fail.
+  defp extract_format_spec(nil), do: :none
+  defp extract_format_spec(%{"value" => nil}), do: :none
+
+  defp extract_format_spec(%{"_type" => "JoinedStr", "values" => values}) do
+    case values do
+      [] -> :none
+      [%{"_type" => "Constant", "value" => v}] when is_binary(v) -> {:literal, v}
+      _ -> :unsupported
+    end
+  end
+
+  defp extract_format_spec(m) when is_map(m) and map_size(m) == 0, do: :none
+  defp extract_format_spec(_), do: :unsupported
 
   # --- Literal-container rejections --------------------------------------
 
@@ -1827,6 +1872,12 @@ defmodule Pylixir.Converter do
       end
 
     context = bind_name(context, alias)
+    # Remember the stdlib origin so call sites can route through the
+    # stdlib's call/4 callback when the user passes more args than the
+    # captured arity. Lets `permutations(a, 3)` work after
+    # `from itertools import permutations` despite our capture being
+    # `&py_permutations/1`.
+    context = %{context | stdlib_aliases: Map.put(context.stdlib_aliases, alias, {mod, name})}
     {{:=, [], [alias_ref, rhs]}, context}
   end
 
@@ -1979,6 +2030,12 @@ defmodule Pylixir.Converter do
 
     {Enum.reverse(asts), context}
   end
+
+  # `@moduledoc "..."` from a Python module-level docstring. Returns
+  # an empty list when no docstring was extracted so callers can splice
+  # unconditionally.
+  defp moduledoc_ast(nil), do: []
+  defp moduledoc_ast(doc) when is_binary(doc), do: [{:@, [], [{:moduledoc, [], [doc]}]}]
 
   defp py_main_def([]) do
     {:def, [], [{:py_main, [], nil}, [do: nil]]}

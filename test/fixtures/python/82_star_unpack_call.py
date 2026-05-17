@@ -27,6 +27,13 @@ print(is_triplet_sorted(*triplet))     # True
 triplet2 = (3, 1, 2)
 print(is_triplet_sorted(*triplet2))    # False
 
-# Star-unpack on a lambda directly bound to a name.
-sum3 = lambda a, b, c: a + b + c
+# Star-unpack on a top-level `def` — works now that defs are public
+# `def`s (apply/3 reaches them).
+def sum3(a, b, c):
+    return a + b + c
+
 print(sum3(*[10, 20, 30]))             # 60
+
+# Lambda binding also works (the original lambda path).
+sum3l = lambda a, b, c: a + b + c
+print(sum3l(*[1, 2, 3]))               # 6

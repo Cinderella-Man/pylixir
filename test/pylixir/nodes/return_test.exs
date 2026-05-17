@@ -65,7 +65,7 @@ defmodule Pylixir.Nodes.ReturnTest do
       # Scoped: `f`'s body must be the bare constant — no Return-wrap.
       # (A bare "throw" check would now catch py_main's exit-catch
       # wrapper, which is unrelated to Return.)
-      assert source =~ ~r/defp\s+f\(\)\s+do\s+1\s+end/
+      assert source =~ ~r/def\s+f\(\)\s+do\s+1\s+end/
       refute source =~ ":pylixir_return"
     end
 

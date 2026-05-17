@@ -110,7 +110,7 @@ defmodule Pylixir.Nodes.Functions do
         return_mode: return_mode
     }
 
-    {body_asts, context} = Converter.convert_each(body, context)
+    {body_asts, context} = Converter.convert_each(strip_docstring(body), context)
 
     context = %{
       context
@@ -181,7 +181,8 @@ defmodule Pylixir.Nodes.Functions do
         return_mode: return_mode
     }
 
-    {body_asts, context} = Converter.convert_each(body, context)
+    {doc, stripped_body} = extract_docstring(body)
+    {body_asts, context} = Converter.convert_each(stripped_body, context)
 
     context = %{
       context
@@ -199,8 +200,20 @@ defmodule Pylixir.Nodes.Functions do
     body_block = maybe_wrap_return_catch(body_block, return_mode)
 
     fn_name_atom = py_name |> Naming.rewrite() |> String.to_atom()
-    defp_ast = {:defp, [], [{fn_name_atom, [], param_asts}, [do: body_block]]}
-    {defp_ast, context}
+    # Top-level Python `def f` → Elixir `def f` (not `defp`). Two
+    # reasons: `@doc` only attaches cleanly to public functions (defp
+    # warns "always discarded"), and `apply(__MODULE__, :f, args)`
+    # in the star-unpack-call path needs `f` to be reachable.
+    def_ast = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_block]]}
+
+    case doc do
+      nil ->
+        {def_ast, context}
+
+      text when is_binary(text) ->
+        doc_attr = {:@, [], [{:doc, [], [text]}]}
+        {{:__block__, [], [doc_attr, def_ast]}, context}
+    end
   end
 
   # --- Return-mode + parameter plumbing (shared) -------------------------
@@ -225,6 +238,29 @@ defmodule Pylixir.Nodes.Functions do
        do: true
 
   defp safe_to_strip_decorator?(_), do: false
+
+  # Python's convention (PEP 257): a function body's first statement
+  # that is just a string Constant is the docstring. Elixir warns
+  # about unused literals, so drop the leading docstring before
+  # lowering. For top-level `def`s the Converter promotes it to
+  # `@doc` (via `extract_docstring/1`); for closures/lambdas there's
+  # no equivalent and we just strip.
+  defp strip_docstring([%{"_type" => "Expr", "value" => %{"_type" => "Constant", "value" => v}} | rest])
+       when is_binary(v),
+       do: rest
+
+  defp strip_docstring(body), do: body
+
+  # Same shape as strip_docstring/1 but returns the docstring text so
+  # `emit_function_def` can attach it as `@doc` before the emitted
+  # `def`. `{nil, body}` when the body has no leading docstring.
+  defp extract_docstring([
+         %{"_type" => "Expr", "value" => %{"_type" => "Constant", "value" => v}} | rest
+       ])
+       when is_binary(v),
+       do: {v, rest}
+
+  defp extract_docstring(body), do: {nil, body}
 
   defp self_referential?(body, name) do
     Enum.any?(body, fn stmt ->

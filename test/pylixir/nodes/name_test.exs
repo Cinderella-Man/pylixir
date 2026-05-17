@@ -84,20 +84,14 @@ defmodule Pylixir.Nodes.NameTest do
   end
 
   describe "reserved-prefix rejection (inverse-collision protection)" do
-    test "Python identifier `var_foo` raises with a helpful hint" do
-      err =
-        assert_raise UnsupportedNodeError, fn ->
-          Converter.convert(
-            name("var_foo", %{"lineno" => 5, "col_offset" => 2}),
-            Context.new()
-          )
-        end
+    test "Python identifier `var_foo` is rewritten to `usr_var_foo` (no longer raises)" do
+      {ast, _} =
+        Converter.convert(
+          name("var_foo", %{"lineno" => 5, "col_offset" => 2}),
+          Context.new()
+        )
 
-      assert err.node_type == "Name"
-      assert err.hint =~ "var_foo"
-      assert err.hint =~ "reserved"
-      assert err.lineno == 5
-      assert err.col_offset == 2
+      assert ast == {:usr_var_foo, [], nil}
     end
 
     test "Python identifier `py_add` raises" do
