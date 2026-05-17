@@ -39,6 +39,16 @@ defmodule Eval.Compile do
         end
       end)
 
+    # Every call creates a unique TranslatedCode_<N> module. Without
+    # purging, after enough samples the BEAM's export-staged-index
+    # fills up and the runtime crashes with:
+    #   "no more index entries in export_staged_index (max=524288)"
+    # observed at ~5000 samples × N internal helpers. Purge + delete
+    # immediately so each iteration leaves no residue.
+    module = Module.concat(Elixir, unique_alias)
+    :code.purge(module)
+    :code.delete(module)
+
     case compile_outcome do
       :ok -> {:ok, diagnostics}
       {:raised, e} -> {:error, e}

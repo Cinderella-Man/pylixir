@@ -40,7 +40,7 @@ defmodule Eval do
 
   @spec run(opts()) :: accumulator()
   def run(opts \\ []) do
-    stream_opts = Keyword.take(opts, [:limit, :dataset, :split, :field, :name])
+    stream_opts = Keyword.take(opts, [:limit, :offset, :dataset, :split, :field, :name, :cache])
     enumerable = opts[:samples] || Eval.Stream.stream(stream_opts)
     process(enumerable, opts)
   end

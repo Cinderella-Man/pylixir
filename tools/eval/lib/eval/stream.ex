@@ -35,6 +35,9 @@ defmodule Eval.Stream do
     * `:offset` — skip N samples before yielding.
     * `:field` — explicit source column; overrides auto-detect.
     * `:name` — optional HF dataset config name.
+    * `:cache` — path to a local JSONL cache. When the file exists,
+      samples are served from it (no HF download). When absent, the
+      script streams from HF and writes the cache as it goes.
     * `:python` — interpreter override (default `python3` or `$PYLIXIR_PYTHON`).
   """
   @spec stream(keyword()) :: Enumerable.t()
@@ -73,7 +76,8 @@ defmodule Eval.Stream do
         {"--limit", opts[:limit]},
         {"--offset", opts[:offset]},
         {"--field", opts[:field]},
-        {"--name", opts[:name]}
+        {"--name", opts[:name]},
+        {"--cache", opts[:cache]}
       ],
       fn
         {_flag, nil} -> []

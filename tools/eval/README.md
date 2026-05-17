@@ -32,6 +32,27 @@ Outputs land under `reports/run-<ISO8601>/`:
 * `summary.json` — machine-readable counts (for diffing runs).
 * `failures/<bucket-slug>/<n>.py` — first samples per failure bucket.
 
+## Companion tasks
+
+* `mix eval.probe path/to/file.py [--show]` — one-shot probe pipeline.
+  Runs the Python file through CPython (expected stdout), transpiles
+  with Pylixir, compiles the generated Elixir, invokes `py_main/0`
+  with captured stdout, and diffs against CPython's output. Exits
+  non-zero with a single-line diagnostic on transpile/compile/runtime
+  failure. `--show` prints the generated Elixir between the compile
+  and run stages.
+
+* `mix eval.hints <report-dir> [<bucket-slug>]` — histogram the
+  `hint:` lines inside a report's `failures/<bucket>/*.py` samples.
+  Surfaces which fine-grained hints dominate, with the shortest
+  sample path per hint (cleanest starting point for `mix eval.probe`).
+  Pass a bucket slug to scope to one bucket; omit it for an all-bucket
+  joint sort.
+
+  Typical loop: `mix eval.run --limit 200` →
+  `mix eval.hints <new-run> unsupported--Call` → copy a top sample
+  into `/tmp/probe.py` → `mix eval.probe /tmp/probe.py --show`.
+
 ## Flags
 
 * `--limit N` — cap samples processed (default: 100; use a high number for a full pass).
