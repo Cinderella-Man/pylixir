@@ -107,6 +107,18 @@ defmodule Pylixir.RuntimeHelpers do
   def py_pop_any(%MapSet{} = s), do: MapSet.to_list(s) |> hd()
   def py_pop_any(list) when is_list(list), do: List.last(list)
 
+  # `d.pop(key)` / `coll.pop(idx)` in expression context — value-only
+  # (no rebind, since the receiver isn't a bare Name target). For
+  # dict: Map.get; for list: Enum.at. The mutation is lost; use the
+  # `x = d.pop(k)` Assign form to keep it.
+  def py_pop_value(map, key) when is_map(map) and not is_struct(map), do: Map.get(map, key)
+  def py_pop_value(list, idx) when is_list(list), do: Enum.at(list, idx)
+
+  def py_pop_value_default(map, key, default) when is_map(map) and not is_struct(map),
+    do: Map.get(map, key, default)
+
+  def py_pop_value_default(list, idx, _default) when is_list(list), do: Enum.at(list, idx)
+
   # Python's `list.pop()` / `dict.pop(key[, default])` capture-return form.
   # Returned tuple is `{popped_value, new_collection}` — caller destructures.
   # Polymorphic on list (index-based) vs map (key-based); branches at runtime
@@ -295,6 +307,68 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_str_count(s, ""), do: String.length(s) + 1
   def py_str_count(s, sub), do: length(String.split(s, sub)) - 1
+
+  # Python's `str.title()` — capitalise the first letter of every run
+  # of alphabetic characters; lowercase the rest. Non-alpha chars
+  # reset the "first letter" state.
+  def py_str_title(s) when is_binary(s) do
+    s
+    |> String.graphemes()
+    |> Enum.map_reduce(true, fn ch, at_word_start? ->
+      alpha? = Regex.match?(~r/^[[:alpha:]]$/u, ch)
+
+      cond do
+        not alpha? -> {ch, true}
+        at_word_start? -> {String.upcase(ch), false}
+        true -> {String.downcase(ch), false}
+      end
+    end)
+    |> elem(0)
+    |> Enum.join()
+  end
+
+  # Python's `str.capitalize()` — first char to upper, everything else
+  # to lower. Empty string is unchanged.
+  def py_str_capitalize(""), do: ""
+  def py_str_capitalize(s) when is_binary(s) do
+    {first, rest} = String.split_at(s, 1)
+    String.upcase(first) <> String.downcase(rest)
+  end
+
+  # Python's `str.swapcase()` — flip case of every char.
+  def py_str_swapcase(s) when is_binary(s) do
+    s
+    |> String.graphemes()
+    |> Enum.map(fn ch ->
+      cond do
+        ch == String.upcase(ch) and ch != String.downcase(ch) -> String.downcase(ch)
+        ch == String.downcase(ch) and ch != String.upcase(ch) -> String.upcase(ch)
+        true -> ch
+      end
+    end)
+    |> Enum.join()
+  end
+
+  # Python's `str.partition(sep)` / `str.rpartition(sep)` — split into
+  # `{before, sep, after}` at the first/last occurrence of `sep`.
+  # Not found: partition → `{string, "", ""}`, rpartition → `{"", "", string}`.
+  def py_str_partition(s, sep) when is_binary(s) and is_binary(sep) do
+    case :binary.split(s, sep) do
+      [before, after_] -> {before, sep, after_}
+      [^s] -> {s, "", ""}
+    end
+  end
+
+  def py_str_rpartition(s, sep) when is_binary(s) and is_binary(sep) do
+    case :binary.split(s, sep, [:global]) do
+      [^s] ->
+        {"", "", s}
+
+      parts ->
+        {init, [last]} = Enum.split(parts, -1)
+        {Enum.join(init, sep), sep, last}
+    end
+  end
 
   # Python's `str.splitlines()` — split on \r\n / \r / \n; trailing
   # newline doesn't create an empty trailing entry. Empty input → [].

@@ -61,8 +61,11 @@ defmodule Pylixir.RuntimeHelpers.Format do
     if diff <= 0 do
       s
     else
-      left = div(diff, 2)
-      right = diff - left
+      # Python's str.center puts the extra pad-char on the LEFT when
+      # `diff` is odd (e.g. `"ab".center(7, "-") == "---ab--"`), not
+      # the right. Computing right first gets the math right.
+      right = div(diff, 2)
+      left = diff - right
       String.duplicate(fill, left) <> s <> String.duplicate(fill, right)
     end
   end

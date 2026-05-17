@@ -42,9 +42,11 @@ defmodule Pylixir.Nodes.AttributeMethods do
   alias Pylixir.UnsupportedNodeError
 
   @dict_methods ~w(keys values items get)
-  @string_methods ~w(lower upper strip lstrip rstrip startswith endswith
+  @string_methods ~w(lower upper title capitalize swapcase casefold
+                     strip lstrip rstrip startswith endswith
                      split replace find count index zfill isdigit isalpha isalnum
-                     join splitlines read readline)
+                     join splitlines read readline
+                     ljust rjust center partition rpartition)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -83,12 +85,17 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   # --- Set methods (Python set / frozenset → Elixir MapSet) -------------
 
-  # `(expr).pop()` — expression-receiver form, no rebind possible
-  # (e.g. `(s1 - s2).pop()` or `seen.pop()` inside another expression).
-  # Lowers to `py_pop_any/1` (set: arbitrary element; list: last).
-  # Bare-Name `s.pop()` is handled earlier as a capture-return rebind
-  # (Converter's `single_target_assign`) — this clause is the fallback.
+  # `(expr).pop(…)` — expression-receiver form, no rebind possible
+  # (e.g. `(s1 - s2).pop()`, or `d.pop(k)` inside `print(d.pop(k))`).
+  # Lowers to value-only helpers — the rebind happens only when the
+  # form is the Assign RHS (handled in `Pylixir.Nodes.Assign`).
   defp do_dispatch("pop", target, [], _kw, _node), do: {:py_pop_any, [], [target]}
+
+  defp do_dispatch("pop", target, [key], _kw, _node),
+    do: {:py_pop_value, [], [target, key]}
+
+  defp do_dispatch("pop", target, [key, default], _kw, _node),
+    do: {:py_pop_value_default, [], [target, key, default]}
 
   defp do_dispatch("union", target, [other], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}
@@ -184,6 +191,53 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("upper", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :upcase]}, [], [target]}
+
+  # Python's `str.title()` — capitalises first letter of every "word"
+  # (run of alpha chars). `str.capitalize()` — only the first char of
+  # the whole string. `str.swapcase()` — flip case per char.
+  # `str.casefold()` — like lower but more aggressive for Unicode
+  # (Elixir's String.downcase/2 :default mode is the closest match).
+  defp do_dispatch("title", target, [], _kw, _node), do: {:py_str_title, [], [target]}
+
+  defp do_dispatch("capitalize", target, [], _kw, _node),
+    do: {:py_str_capitalize, [], [target]}
+
+  defp do_dispatch("swapcase", target, [], _kw, _node), do: {:py_str_swapcase, [], [target]}
+
+  defp do_dispatch("casefold", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :downcase]}, [], [target]}
+
+  # Python's `str.ljust(width[, fill])` / `str.rjust(width[, fill])` /
+  # `str.center(width[, fill])` — pad to `width` with optional fill
+  # char (default space). Returns unchanged when `width <= len(s)`.
+  # `center` reuses `py_center_pad/3` (also used by the f-string
+  # format-spec parser).
+  defp do_dispatch("ljust", target, [width], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :pad_trailing]}, [], [target, width]}
+
+  defp do_dispatch("ljust", target, [width, fill], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :pad_trailing]}, [], [target, width, fill]}
+
+  defp do_dispatch("rjust", target, [width], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :pad_leading]}, [], [target, width]}
+
+  defp do_dispatch("rjust", target, [width, fill], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :pad_leading]}, [], [target, width, fill]}
+
+  defp do_dispatch("center", target, [width], _kw, _node),
+    do: {:py_center_pad, [], [target, width, " "]}
+
+  defp do_dispatch("center", target, [width, fill], _kw, _node),
+    do: {:py_center_pad, [], [target, width, fill]}
+
+  # Python's `str.partition(sep)` — split into `(before, sep, after)`.
+  # When `sep` isn't found: `(string, "", "")`. `rpartition` is the
+  # right-anchored variant: not found gives `("", "", string)`.
+  defp do_dispatch("partition", target, [sep], _kw, _node),
+    do: {:py_str_partition, [], [target, sep]}
+
+  defp do_dispatch("rpartition", target, [sep], _kw, _node),
+    do: {:py_str_rpartition, [], [target, sep]}
 
   defp do_dispatch("strip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target]}

@@ -41,7 +41,7 @@ defmodule Pylixir.LoopAnalysis do
   # LoopAnalysis tracks something Mutations doesn't rewrite (or vice
   # versa); the helpers-linkage spirit applies to behavioural pairs
   # like this, but we don't have a programmatic check yet.
-  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse)
+  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault)
 
   @type t :: %__MODULE__{
           assigned_vars: MapSet.t(String.t()),

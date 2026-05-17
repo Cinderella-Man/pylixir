@@ -51,7 +51,7 @@ defmodule Pylixir.ModuleAnalysis do
             known_functions: MapSet.new(),
             module_doc: nil
 
-  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse)
+  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault)
 
   # Python convention (PEP 257): a module's first statement, if a bare
   # string Constant followed by *other statements*, is the docstring.

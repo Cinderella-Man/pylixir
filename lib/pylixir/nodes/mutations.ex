@@ -21,7 +21,7 @@ defmodule Pylixir.Nodes.Mutations do
 
   alias Pylixir.{Converter, Naming, UnsupportedNodeError}
 
-  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update)
+  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update setdefault)
 
   @doc """
   Classify a Python `Expr.value` node. Returns `:none`, a `{:name, …}`
@@ -195,6 +195,13 @@ defmodule Pylixir.Nodes.Mutations do
   # O(1) deque-popleft semantically (FunctionClauseError on empty
   # mirrors Python's IndexError closely enough for our purposes).
   defp mutation_rhs("popleft", target, [], _kw, _node), do: {:tl, [], [target]}
+
+  # Statement-context `d.setdefault(k, default)` — set `d[k] = default`
+  # iff k isn't already a key, return value discarded. (The capture-
+  # return form `x = d.setdefault(k, default)` would also need to bind
+  # `x` and isn't yet handled at the Assign level.)
+  defp mutation_rhs("setdefault", target, [k, default], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:Map]}, :put_new]}, [], [target, k, default]}
 
   defp mutation_rhs("add", target, [x], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :put]}, [], [target, x]}
