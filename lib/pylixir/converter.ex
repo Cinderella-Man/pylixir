@@ -271,6 +271,13 @@ defmodule Pylixir.Converter do
       %{"_type" => "Attribute", "value" => target, "attr" => attr} ->
         emit_attribute_call(target, attr, node, context)
 
+      # Chained-call shape: `f(x)(y)`, `make()(arg)`, `(lambda x: x+1)(5)`.
+      # The func is itself a Call/Lambda/Subscript that returns a callable.
+      # Emit `(callable_ast).(args)` — Elixir's anonymous-call invocation.
+      # No-kwargs only (consistent with the in-scope lambda call path).
+      %{"_type" => type} when type in ["Call", "Lambda", "Subscript", "IfExp"] ->
+        emit_dynamic_call(node, context)
+
       _ ->
         raise UnsupportedNodeError,
           node_type: "Call",
@@ -588,11 +595,20 @@ defmodule Pylixir.Converter do
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
 
+      # A local binding (lambda/comp/for-target/Assign) shadows a
+      # module attribute. Check `name_in_scope?` BEFORE module_attrs:
+      # `x = 99; any(x > 3 for x in xs)` would otherwise resolve the
+      # comp's `x` reference to `@var_x` (== 99), giving the wrong
+      # answer for every element.
+      name_in_scope?(context, id) ->
+        atom = id |> Naming.rewrite() |> String.to_atom()
+        {{atom, [], nil}, context}
+
       MapSet.member?(context.module_attrs, id) ->
         attr_name = String.to_atom("var_" <> id)
         {{:@, [], [{attr_name, [], nil}]}, context}
 
-      not name_in_scope?(context, id) and Builtins.unary_capturable?(id) ->
+      Builtins.unary_capturable?(id) ->
         {Builtins.unary_capture(id), context}
 
       true ->
@@ -988,6 +1004,29 @@ defmodule Pylixir.Converter do
     end
   end
 
+  # Chained-call shape: `f(x)(y)`, `(lambda x: ...)(arg)`, etc.
+  # The `func` is itself an expression (Call/Lambda/Subscript/IfExp)
+  # that returns a callable. Emit `(callable_ast).(args)` — Elixir's
+  # anonymous-call invocation. Kwargs unsupported: Python's calling
+  # convention here matches the in-scope-lambda call path, which also
+  # doesn't accept kwargs.
+  defp emit_dynamic_call(node, context) do
+    {callable_ast, context} = convert(node["func"], context)
+    {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
+
+    case Map.get(node, "keywords", []) do
+      [] ->
+        {{{:., [], [callable_ast]}, [], arg_asts}, context}
+
+      _ ->
+        raise UnsupportedNodeError,
+          node_type: "Call",
+          hint: "chained call with kwargs (`f(x)(y, k=v)`) is not supported",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
   defp emit_attribute_call(target, attr, node, context) do
     # Stdlib root? `target` is the chain *before* the method name; the
     # full path is that prefix plus the method `attr`. Examples:
@@ -1077,13 +1116,15 @@ defmodule Pylixir.Converter do
   # compiler-variable prefix).
   def convert_loop_target(%{"_type" => "Name", "id" => id}, context)
       when is_binary(id) and id != "" do
-    if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
-      {{:_, [], nil}, [], context}
-    else
-      context = bind_name(context, id)
-      atom = id |> Naming.rewrite() |> String.to_atom()
-      {{atom, [], nil}, [id], context}
-    end
+    context = bind_name(context, id)
+    atom = id |> Naming.rewrite() |> String.to_atom()
+    # All-underscore Python names rewrite to `_us`/`_us2`/... — valid
+    # Elixir bindings that suppress the unused-variable warning via
+    # the `_` prefix. They're still excluded from the threading
+    # set in `LoopAnalysis.discard_name?` so they don't leak into
+    # state tuples.
+    names = if all_underscores?(id), do: [], else: [id]
+    {{atom, [], nil}, names, context}
   end
 
   def convert_loop_target(%{"_type" => "Tuple", "elts" => elts}, context) do
@@ -1105,19 +1146,19 @@ defmodule Pylixir.Converter do
         "for-loop target shape `#{Map.get(target, "_type")}` is not supported (use a Name or Tuple of Names)"
   end
 
+  defp all_underscores?(id),
+    do: id |> String.to_charlist() |> Enum.all?(&(&1 == ?_))
+
   # Per-element helper for tuple-target recursion. Allows nested
   # tuples of Names — `for (a, b), c in pairs:` / `for (r, c), v in
   # bonuses.items():` etc. Each Name is treated like the single-Name
   # case (discard-rules, scope binding); each nested Tuple recurses.
   defp convert_loop_target_elt(%{"_type" => "Name", "id" => id}, context)
        when is_binary(id) and id != "" do
-    if Enum.all?(String.to_charlist(id), &(&1 == ?_)) do
-      {{:_, [], nil}, [], context}
-    else
-      context = bind_name(context, id)
-      atom = id |> Naming.rewrite() |> String.to_atom()
-      {{atom, [], nil}, [id], context}
-    end
+    context = bind_name(context, id)
+    atom = id |> Naming.rewrite() |> String.to_atom()
+    names = if all_underscores?(id), do: [], else: [id]
+    {{atom, [], nil}, names, context}
   end
 
   defp convert_loop_target_elt(%{"_type" => "Tuple", "elts" => inner_elts}, context) do

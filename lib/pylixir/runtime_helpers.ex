@@ -178,15 +178,178 @@ defmodule Pylixir.RuntimeHelpers do
   # runtime: integers → Integer.mod/2; binary left → raise with a hint
   # naming the unsupported feature rather than letting an opaque
   # FunctionClauseError leak through.
-  def py_mod(a, _b) when is_binary(a),
-    do:
-      raise(ArgumentError,
-        message:
-          "Python %-string formatting (`'%s' % name`) is not supported; use string concatenation"
-      )
+  # Python's `'fmt' % args` — string %-formatting. `args` is a tuple
+  # of values to substitute or a single value for the 1-arg shape.
+  # Common conversion specifiers: %d %s %f %x %X %o %c %%. Supports
+  # `-` left-align, `0` zero-pad, `+` always-sign, width, precision.
+  def py_mod(a, args) when is_binary(a) do
+    arg_list =
+      cond do
+        is_tuple(args) -> Tuple.to_list(args)
+        true -> [args]
+      end
+
+    py_str_percent_format(a, arg_list, [])
+  end
 
   def py_mod(a, b) when is_integer(a) and is_integer(b), do: Integer.mod(a, b)
   def py_mod(a, b) when is_number(a) and is_number(b), do: a - b * :math.floor(a / b)
+
+  # Walk the template, consuming `%spec` placeholders and appending
+  # them to `out`. `args` is consumed left-to-right as we hit
+  # placeholders. Recursive on the remainder string.
+  def py_str_percent_format("", _args, out), do: out |> Enum.reverse() |> IO.iodata_to_binary()
+
+  def py_str_percent_format("%%" <> rest, args, out),
+    do: py_str_percent_format(rest, args, ["%" | out])
+
+  def py_str_percent_format("%" <> rest, args, out) do
+    {spec, rest} = parse_percent_spec(rest, "")
+    [arg | tail_args] = args
+    formatted = format_percent_value(spec, arg)
+    py_str_percent_format(rest, tail_args, [formatted | out])
+  end
+
+  def py_str_percent_format(<<ch::utf8, rest::binary>>, args, out),
+    do: py_str_percent_format(rest, args, [<<ch::utf8>> | out])
+
+  # Parse a `%`-spec into `{spec_string, remainder}`. Spec syntax is
+  # `[flags][width][.precision]type` — accumulate until we hit a
+  # type char (a-zA-Z) which terminates the spec.
+  def parse_percent_spec(<<ch::utf8, rest::binary>>, acc) do
+    if (ch >= ?a and ch <= ?z) or (ch >= ?A and ch <= ?Z) do
+      {acc <> <<ch::utf8>>, rest}
+    else
+      parse_percent_spec(rest, acc <> <<ch::utf8>>)
+    end
+  end
+
+  def parse_percent_spec("", acc), do: {acc, ""}
+
+  # Format a single value per Python's %-spec semantics. `spec` is
+  # the post-`%` characters (e.g. `"05d"`, `".2f"`, `"x"`). Returns
+  # the formatted string.
+  def format_percent_value(spec, value) do
+    {flags, rest} = parse_percent_flags(spec, %{left: false, zero: false, plus: false, space: false})
+    {width, rest} = parse_percent_int(rest, 0)
+    {precision, rest} = parse_percent_precision(rest)
+    type = rest
+
+    formatted = format_percent_typed(type, value, precision)
+    formatted = apply_percent_sign(formatted, value, flags, type)
+    apply_percent_pad(formatted, width, flags)
+  end
+
+  def parse_percent_flags(<<?-, rest::binary>>, flags),
+    do: parse_percent_flags(rest, %{flags | left: true})
+
+  def parse_percent_flags(<<?0, rest::binary>>, flags),
+    do: parse_percent_flags(rest, %{flags | zero: true})
+
+  def parse_percent_flags(<<?+, rest::binary>>, flags),
+    do: parse_percent_flags(rest, %{flags | plus: true})
+
+  def parse_percent_flags(<<?\s, rest::binary>>, flags),
+    do: parse_percent_flags(rest, %{flags | space: true})
+
+  def parse_percent_flags(rest, flags), do: {flags, rest}
+
+  def parse_percent_int(<<ch, rest::binary>>, acc) when ch >= ?0 and ch <= ?9,
+    do: parse_percent_int(rest, acc * 10 + (ch - ?0))
+
+  def parse_percent_int(rest, acc), do: {acc, rest}
+
+  def parse_percent_precision(<<?., rest::binary>>) do
+    {p, rest} = parse_percent_int(rest, 0)
+    {p, rest}
+  end
+
+  def parse_percent_precision(rest), do: {nil, rest}
+
+  # Per-type conversion. Precision applies to %f (decimal digits) and
+  # %s (max string length). Width/flags are applied later.
+  def format_percent_typed("d", v, _p) when is_integer(v), do: Integer.to_string(abs(v))
+  def format_percent_typed("d", v, _p) when is_float(v), do: Integer.to_string(abs(trunc(v)))
+  def format_percent_typed("i", v, p), do: format_percent_typed("d", v, p)
+  def format_percent_typed("s", v, nil), do: py_str(v)
+
+  def format_percent_typed("s", v, p) when is_integer(p),
+    do: v |> py_str() |> String.slice(0, p)
+
+  def format_percent_typed("f", v, nil) do
+    v_f = if is_integer(v), do: v * 1.0, else: v
+    :erlang.float_to_binary(v_f, decimals: 6)
+  end
+
+  def format_percent_typed("f", v, p) when is_integer(p) do
+    v_f = if is_integer(v), do: v * 1.0, else: v
+    :erlang.float_to_binary(v_f, decimals: p)
+  end
+
+  def format_percent_typed("e", v, p) do
+    v_f = if is_integer(v), do: v * 1.0, else: v
+    digits = if is_integer(p), do: p, else: 6
+    :erlang.float_to_binary(v_f, scientific: digits)
+  end
+
+  def format_percent_typed("x", v, _p) when is_integer(v),
+    do: v |> abs() |> Integer.to_string(16) |> String.downcase()
+
+  def format_percent_typed("X", v, _p) when is_integer(v),
+    do: v |> abs() |> Integer.to_string(16)
+
+  def format_percent_typed("o", v, _p) when is_integer(v),
+    do: v |> abs() |> Integer.to_string(8)
+
+  def format_percent_typed("b", v, _p) when is_integer(v),
+    do: v |> abs() |> Integer.to_string(2)
+
+  def format_percent_typed("c", v, _p) when is_integer(v),
+    do: <<v::utf8>>
+
+  def format_percent_typed("c", v, _p) when is_binary(v), do: v
+  def format_percent_typed("r", v, _p), do: py_repr(v)
+
+  # Unknown specifier — fall back to py_str so we don't crash on a
+  # spec we haven't enumerated yet. (Python would raise; we choose
+  # graceful degradation over a hard error in transpiled code.)
+  def format_percent_typed(_, v, _p), do: py_str(v)
+
+  # Re-attach the sign for numeric conversions. Negative values
+  # already lost their sign in `format_percent_typed` (we used
+  # `abs/1`), so we re-add it here based on the original value.
+  def apply_percent_sign(s, v, flags, type)
+      when type in ["d", "i", "f", "e"] and is_number(v) do
+    cond do
+      v < 0 -> "-" <> s
+      flags.plus -> "+" <> s
+      flags.space -> " " <> s
+      true -> s
+    end
+  end
+
+  def apply_percent_sign(s, _v, _flags, _type), do: s
+
+  # Width padding: left-align with spaces (`-`), zero-pad numerics
+  # (`0`), otherwise space-pad on the left.
+  def apply_percent_pad(s, width, flags) when width > 0 do
+    diff = width - String.length(s)
+
+    cond do
+      diff <= 0 -> s
+      flags.left -> s <> String.duplicate(" ", diff)
+      flags.zero -> apply_zero_pad(s, diff)
+      true -> String.duplicate(" ", diff) <> s
+    end
+  end
+
+  def apply_percent_pad(s, _width, _flags), do: s
+
+  # Zero-pad keeps the sign on the LEFT (`"-005"` not `"-005"` → `"-005"`,
+  # vs. the naive `"00-5"` we'd get from blind prepend).
+  def apply_zero_pad("-" <> rest, diff), do: "-" <> String.duplicate("0", diff) <> rest
+  def apply_zero_pad("+" <> rest, diff), do: "+" <> String.duplicate("0", diff) <> rest
+  def apply_zero_pad(s, diff), do: String.duplicate("0", diff) <> s
 
   # === Collection access ===
   def py_len(x) when is_list(x), do: length(x)
@@ -464,6 +627,90 @@ defmodule Pylixir.RuntimeHelpers do
     case py_str_rfind(sliced, sub) do
       -1 -> -1
       idx -> idx + start
+    end
+  end
+
+  # Python's `s.expandtabs(tabsize)` — replace each `\t` with enough
+  # spaces to reach the next tab-stop column. Column tracking resets
+  # at each newline. Default tabsize matches Python's (8).
+  def py_str_expandtabs(s, tabsize) when is_binary(s) and is_integer(tabsize) and tabsize > 0,
+    do: py_str_expandtabs_loop(String.graphemes(s), tabsize, 0, [])
+
+  def py_str_expandtabs(s, _tabsize) when is_binary(s), do: s
+
+  def py_str_expandtabs_loop([], _tabsize, _col, out),
+    do: out |> Enum.reverse() |> IO.iodata_to_binary()
+
+  def py_str_expandtabs_loop(["\t" | rest], tabsize, col, out) do
+    spaces = tabsize - rem(col, tabsize)
+    py_str_expandtabs_loop(rest, tabsize, col + spaces, [String.duplicate(" ", spaces) | out])
+  end
+
+  def py_str_expandtabs_loop(["\n" | rest], tabsize, _col, out),
+    do: py_str_expandtabs_loop(rest, tabsize, 0, ["\n" | out])
+
+  def py_str_expandtabs_loop([g | rest], tabsize, col, out),
+    do: py_str_expandtabs_loop(rest, tabsize, col + 1, [g | out])
+
+  # Python's `str.maketrans(from, to)` — returns a dict mapping each
+  # grapheme of `from` to the corresponding grapheme of `to`. Both
+  # must be the same length; Python raises ValueError otherwise.
+  # The returned dict is used by `py_str_translate/2`.
+  def py_str_maketrans(from_s, to_s) when is_binary(from_s) and is_binary(to_s) do
+    from_chars = String.graphemes(from_s)
+    to_chars = String.graphemes(to_s)
+
+    if length(from_chars) != length(to_chars) do
+      raise ArgumentError, "the first two maketrans arguments must have equal length"
+    end
+
+    Enum.zip(from_chars, to_chars) |> Map.new()
+  end
+
+  # Python's `s.translate(table)` — replace each grapheme via the
+  # table. Missing keys leave the grapheme unchanged. Table may map
+  # either graphemes (from our `py_str_maketrans`) or codepoint-ints
+  # (Python's `dict.fromkeys(map(ord, "abc"), None)` idiom) — we
+  # accept both shapes.
+  def py_str_translate(s, table) when is_binary(s) and is_map(table) do
+    s
+    |> String.graphemes()
+    |> Enum.map_join("", fn g ->
+      cond do
+        Map.has_key?(table, g) -> Map.fetch!(table, g) || ""
+        true ->
+          # Codepoint-int lookup for Python-style ord-keyed tables.
+          [cp | _] = String.to_charlist(g)
+          case Map.fetch(table, cp) do
+            {:ok, nil} -> ""
+            {:ok, v} when is_integer(v) -> <<v::utf8>>
+            {:ok, v} when is_binary(v) -> v
+            :error -> g
+          end
+      end
+    end)
+  end
+
+  # Python's `s.replace(old, new, count)` with bounded count. Walks
+  # left-to-right replacing the first `count` occurrences. count<=0
+  # returns the string unchanged (Python's behavior). Negative count
+  # (-1) means "replace all" — defer to global String.replace.
+  def py_str_replace_n(s, old, new, count)
+      when is_binary(s) and is_binary(old) and is_binary(new) and is_integer(count) do
+    cond do
+      count == 0 -> s
+      count < 0 -> String.replace(s, old, new)
+      old == "" -> s
+      true -> py_str_replace_n_loop(s, old, new, count, "")
+    end
+  end
+
+  def py_str_replace_n_loop(s, _old, _new, 0, acc), do: acc <> s
+
+  def py_str_replace_n_loop(s, old, new, count, acc) do
+    case :binary.split(s, old) do
+      [whole] -> acc <> whole
+      [before, after_part] -> py_str_replace_n_loop(after_part, old, new, count - 1, acc <> before <> new)
     end
   end
 
@@ -747,6 +994,55 @@ defmodule Pylixir.RuntimeHelpers do
     with_h = Enum.map(py_combinations_inner(t, r - 1), &[h | &1])
     without_h = py_combinations_inner(t, r)
     with_h ++ without_h
+  end
+
+  # `itertools.chain(*iters)` — concatenate every iterable to a flat
+  # list. Each iter is coerced via `py_iter_to_list` so tuples /
+  # strings / ranges all work uniformly.
+  def py_itertools_chain(iters) when is_list(iters),
+    do: Enum.flat_map(iters, &py_iter_to_list/1)
+
+  # `itertools.chain.from_iterable(iter_of_iters)` — same shape but
+  # the args come as a single nested iterable.
+  def py_itertools_chain_from_iterable(iters),
+    do: iters |> py_iter_to_list() |> Enum.flat_map(&py_iter_to_list/1)
+
+  # `itertools.accumulate(iter)` — running sums. Yields the running
+  # accumulator at each step, including the first element unchanged.
+  # Uses `py_add` so mixed-type accumulation (e.g. bool+int) matches
+  # Python.
+  def py_itertools_accumulate(iter) do
+    case py_iter_to_list(iter) do
+      [] ->
+        []
+
+      [first | rest] ->
+        {_, acc} =
+          Enum.reduce(rest, {first, [first]}, fn x, {prev, out} ->
+            sum = py_add(prev, x)
+            {sum, [sum | out]}
+          end)
+
+        Enum.reverse(acc)
+    end
+  end
+
+  # `itertools.accumulate(iter, func)` — same shape but combine via
+  # `func(prev, curr)` instead of py_add. `func` is a 2-arity fn.
+  def py_itertools_accumulate_with(iter, func) when is_function(func, 2) do
+    case py_iter_to_list(iter) do
+      [] ->
+        []
+
+      [first | rest] ->
+        {_, acc} =
+          Enum.reduce(rest, {first, [first]}, fn x, {prev, out} ->
+            combined = func.(prev, x)
+            {combined, [combined | out]}
+          end)
+
+        Enum.reverse(acc)
+    end
   end
 
   # Python's `itertools.combinations_with_replacement(iter, r)` —

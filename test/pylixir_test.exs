@@ -233,10 +233,14 @@ defmodule PylixirTest do
 
         elixir_src = Pylixir.transpile(python_src)
 
-        # Pin the discard semantics: bare `_` patterns in the
-        # for-loops, no `_ = if ...` state-tuple wrapper.
-        assert elixir_src =~ ~r/fn _ ->/
-        refute elixir_src =~ ~r/_ =\s+if /
+        # Pin the discard semantics: Python `_` lowers to the `_us`
+        # underscore-prefixed Elixir identifier (was bare `_`, but
+        # bare `_` isn't usable as a value when the body reads `_` —
+        # see fixture 135). The `_` prefix still suppresses Elixir's
+        # unused-variable warning for the no-read case, and `_us` is
+        # excluded from state-tuple threading via `discard_name?`.
+        assert elixir_src =~ ~r/fn _us ->/
+        refute elixir_src =~ ~r/_us =\s+if /
 
         {_, _value, stdout, diagnostics} = TranspileHelpers.run_source(elixir_src)
         errors = Enum.filter(diagnostics, &(&1[:severity] == :error))

@@ -51,7 +51,8 @@ defmodule Pylixir.ModuleAnalysis do
             known_functions: MapSet.new(),
             module_doc: nil
 
-  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault)
+  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault
+                       intersection_update difference_update symmetric_difference_update)
 
   # Python convention (PEP 257): a module's first statement, if a bare
   # string Constant followed by *other statements*, is the docstring.
@@ -73,6 +74,14 @@ defmodule Pylixir.ModuleAnalysis do
   `%Pylixir.ModuleAnalysis{}`.
   """
   @spec analyze([map()]) :: t()
+  # `referenced_names` walks the AST passing a `shadowed` MapSet
+  # through Lambda/Comp/FunctionDef bodies. Dialyzer flags every
+  # MapSet.union/member? call as an opacity violation because the
+  # MapSet shape transits an `any()`-typed third arg — a known
+  # false-positive pattern (same shape as the `analyze` suppression
+  # in `Pylixir.LoopAnalysis`).
+  @dialyzer {:nowarn_function, referenced_names: 3}
+
   def analyze(body) when is_list(body) do
     {module_doc, body} = extract_module_docstring(body)
     promotable = mutation_free_literal_names(body)
@@ -385,26 +394,104 @@ defmodule Pylixir.ModuleAnalysis do
   # targets) don't count as reads. Without this, an unused
   # `STABLE = True` still looks "referenced" because its own target
   # is a Name, and the attr would never demote.
+  #
+  # Reads INSIDE a binding scope (lambda/comp/FunctionDef) that
+  # rebinds the same name are *shadowed* — they refer to the local,
+  # not the outer module attribute. We pass a `shadowed` set down on
+  # entering each binding scope and skip Name reads matching it.
+  # Without this, `x = 99; any(x > 3 for x in xs)` would count the
+  # comp's `x` as a read of the outer x and keep `@var_x` promoted
+  # → unused-attribute warning at compile time.
   defp referenced_names(nodes, acc) when is_list(nodes),
-    do: Enum.reduce(nodes, acc, &referenced_names/2)
+    do: Enum.reduce(nodes, acc, &referenced_names(&1, &2, MapSet.new()))
 
-  defp referenced_names(%{"_type" => "Name", "id" => id} = node, acc) do
-    case node["ctx"] do
-      %{"_type" => "Load"} -> MapSet.put(acc, id)
-      # Older Python or missing ctx — be conservative and count it as
-      # a read so we never wrongly drop an attr that's actually used.
-      nil -> MapSet.put(acc, id)
-      _ -> acc
+  defp referenced_names(node, acc), do: referenced_names(node, acc, MapSet.new())
+
+  defp referenced_names(nodes, acc, shadowed) when is_list(nodes),
+    do: Enum.reduce(nodes, acc, &referenced_names(&1, &2, shadowed))
+
+  defp referenced_names(%{"_type" => "Name", "id" => id} = node, acc, shadowed) do
+    if MapSet.member?(shadowed, id) do
+      acc
+    else
+      case node["ctx"] do
+        %{"_type" => "Load"} -> MapSet.put(acc, id)
+        nil -> MapSet.put(acc, id)
+        _ -> acc
+      end
     end
   end
 
-  defp referenced_names(%{"_type" => _} = node, acc) do
-    node
-    |> Map.delete("_type")
-    |> Enum.reduce(acc, fn {_k, v}, a -> referenced_names(v, a) end)
+  # Lambda — params shadow the surrounding scope inside the body.
+  defp referenced_names(%{"_type" => "Lambda", "args" => args, "body" => body}, acc, shadowed) do
+    inner = MapSet.union(shadowed, lambda_arg_names(args))
+    referenced_names(body, acc, inner)
   end
 
-  defp referenced_names(_leaf, acc), do: acc
+  # FunctionDef — params + the function's name shadow the outer scope.
+  # The `name` itself is the function's binding, but the *body* may
+  # see it for recursion. Either way, treat params as shadowing reads
+  # inside the body.
+  defp referenced_names(%{"_type" => "FunctionDef", "args" => args, "body" => body}, acc, shadowed) do
+    inner = MapSet.union(shadowed, lambda_arg_names(args))
+    referenced_names(body, acc, inner)
+  end
+
+  # Comprehensions — for-targets across all generators shadow inside
+  # the elt + ifs + later generators' iter/ifs. We approximate by
+  # treating *all* generator targets as shadowed for elt/ifs/iter
+  # (the first generator's iter actually evaluates in the enclosing
+  # scope, but a shadow there would just miss promoting an attr that
+  # the iter reads — the iter still gets the right *runtime* value
+  # because Converter is scope-aware. Erring on "shadowed" here only
+  # risks an over-aggressive demotion, which the previous-attr-not-
+  # used post-check would have done anyway).
+  defp referenced_names(%{"_type" => type, "elt" => elt, "generators" => gens}, acc, shadowed)
+       when type in ["ListComp", "SetComp", "GeneratorExp"] do
+    inner = MapSet.union(shadowed, comp_target_names(gens))
+    acc = referenced_names(elt, acc, inner)
+    referenced_names(gens, acc, inner)
+  end
+
+  defp referenced_names(%{"_type" => "DictComp", "key" => k, "value" => v, "generators" => gens}, acc, shadowed) do
+    inner = MapSet.union(shadowed, comp_target_names(gens))
+    acc = referenced_names(k, acc, inner)
+    acc = referenced_names(v, acc, inner)
+    referenced_names(gens, acc, inner)
+  end
+
+  defp referenced_names(%{"_type" => _} = node, acc, shadowed) do
+    node
+    |> Map.delete("_type")
+    |> Enum.reduce(acc, fn {_k, v}, a -> referenced_names(v, a, shadowed) end)
+  end
+
+  defp referenced_names(_leaf, acc, _shadowed), do: acc
+
+  defp lambda_arg_names(%{"args" => args} = arg_node) do
+    posonly = Map.get(arg_node, "posonlyargs", [])
+    kwonly = Map.get(arg_node, "kwonlyargs", [])
+    vararg = Map.get(arg_node, "vararg")
+    kwarg = Map.get(arg_node, "kwarg")
+
+    extras =
+      [vararg, kwarg]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&Map.get(&1, "arg"))
+
+    (posonly ++ args ++ kwonly)
+    |> Enum.map(&Map.get(&1, "arg"))
+    |> Kernel.++(extras)
+    |> MapSet.new()
+  end
+
+  defp lambda_arg_names(_), do: MapSet.new()
+
+  defp comp_target_names(generators) do
+    generators
+    |> Enum.flat_map(fn %{"target" => target} -> target_names(target) end)
+    |> MapSet.new()
+  end
 
   # --- Pass 1 — mutation-free literal names ------------------------------
 

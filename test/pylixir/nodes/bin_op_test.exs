@@ -152,12 +152,13 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert value == 6
     end
 
-    test "Mod with string left operand raises with the Python %-formatting hint" do
-      assert_raise ArgumentError, ~r/%-string formatting/, fn ->
+    test "Mod with string left operand applies Python %-formatting" do
+      {_, value, _, _} =
         TranspileHelpers.transpile_and_run(
           module_with(binop("Mod", const("hello %s"), const("world")))
         )
-      end
+
+      assert value == "hello world"
     end
   end
 

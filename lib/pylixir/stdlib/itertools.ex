@@ -37,6 +37,44 @@ defmodule Pylixir.Stdlib.Itertools do
   def call(["permutations"], [iter, r], _kwargs, _node),
     do: {:ok, {:py_permutations, [], [iter, r]}}
 
+  # `itertools.chain(*iters)` — concatenate iterables. Equivalent to
+  # flat-mapping `py_iter_to_list` over the arg list, then concatenating.
+  # The Pylixir call site already collects positional args into a list.
+  def call(["chain"], iters, _kwargs, _node) when is_list(iters),
+    do: {:ok, {:py_itertools_chain, [], [iters]}}
+
+  # `itertools.chain.from_iterable(iter_of_iters)` — same as chain but
+  # the args come as one nested iterable. The dispatch chain is
+  # `chain.from_iterable(x)`: attribute `chain`, method `from_iterable`.
+  # Lower to the same runtime helper, wrapping the single arg as
+  # already-nested.
+  def call(["chain", "from_iterable"], [iters], _kwargs, _node),
+    do: {:ok, {:py_itertools_chain_from_iterable, [], [iters]}}
+
+  # `itertools.accumulate(iter[, func])` — running totals (default `+`)
+  # or running fold via `func`. Yields the running accumulator at each
+  # step, INCLUDING the first elem.
+  def call(["accumulate"], [iter], _kwargs, _node),
+    do: {:ok, {:py_itertools_accumulate, [], [iter]}}
+
+  def call(["accumulate"], [iter, func], _kwargs, _node),
+    do: {:ok, {:py_itertools_accumulate_with, [], [iter, func]}}
+
+  # `itertools.repeat(elem[, times])` — yield `elem` forever, or
+  # `times` times if given. We only support the bounded form
+  # (unbounded would require lazy streams that don't compose with
+  # the rest of Pylixir's eager-list lowering).
+  def call(["repeat"], [elem, times], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:List]}, :duplicate]}, [], [elem, times]}}
+
+  # `itertools.takewhile(pred, iter)` / `dropwhile(pred, iter)` — Enum
+  # provides exact equivalents.
+  def call(["takewhile"], [pred, iter], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :take_while]}, [], [iter, pred]}}
+
+  def call(["dropwhile"], [pred, iter], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :drop_while]}, [], [iter, pred]}}
+
   # `itertools.product(*iters[, repeat=N])` — Cartesian product. Python
   # docs: equivalent to nested for-loops in a generator expression. Lower
   # to a runtime helper that takes a list-of-iterables; the converter
@@ -55,6 +93,60 @@ defmodule Pylixir.Stdlib.Itertools do
 
   def import_binding("combinations_with_replacement"),
     do: {:ok, Pylixir.Stdlib.capture(:py_combinations_with_replacement, 2)}
+
+  def import_binding("chain"),
+    do:
+      {:ok,
+       {:fn, [],
+        [
+          {:->, [],
+           [
+             [{:iters, [], nil}],
+             {:py_itertools_chain, [], [{:iters, [], nil}]}
+           ]}
+        ]}}
+
+  def import_binding("accumulate"),
+    do: {:ok, Pylixir.Stdlib.capture(:py_itertools_accumulate, 1)}
+
+  def import_binding("takewhile"),
+    do:
+      {:ok,
+       {:fn, [],
+        [
+          {:->, [],
+           [
+             [{:pred, [], nil}, {:iter, [], nil}],
+             {{:., [], [{:__aliases__, [], [:Enum]}, :take_while]}, [],
+              [{:iter, [], nil}, {:pred, [], nil}]}
+           ]}
+        ]}}
+
+  def import_binding("dropwhile"),
+    do:
+      {:ok,
+       {:fn, [],
+        [
+          {:->, [],
+           [
+             [{:pred, [], nil}, {:iter, [], nil}],
+             {{:., [], [{:__aliases__, [], [:Enum]}, :drop_while]}, [],
+              [{:iter, [], nil}, {:pred, [], nil}]}
+           ]}
+        ]}}
+
+  def import_binding("repeat"),
+    do:
+      {:ok,
+       {:fn, [],
+        [
+          {:->, [],
+           [
+             [{:elem, [], nil}, {:times, [], nil}],
+             {{:., [], [{:__aliases__, [], [:List]}, :duplicate]}, [],
+              [{:elem, [], nil}, {:times, [], nil}]}
+           ]}
+        ]}}
   # `permutations` is variadic (1 or 2 args). Bind the 1-arg form;
   # 2-arg calls go through stdlib_aliases-rewrite at the call site.
   def import_binding("permutations"), do: {:ok, Pylixir.Stdlib.capture(:py_permutations, 1)}

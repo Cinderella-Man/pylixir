@@ -170,13 +170,11 @@ defmodule Pylixir.RuntimeHelpersTest do
       assert_in_delta H.py_mod(7.5, 2.0), 1.5, 1.0e-9
     end
 
-    test "string left operand raises with the Python %-formatting hint" do
-      err =
-        assert_raise ArgumentError, fn ->
-          H.py_mod("hello %s", "world")
-        end
-
-      assert err.message =~ "%-string formatting"
+    test "string left operand applies Python %-formatting" do
+      assert H.py_mod("hello %s", "world") == "hello world"
+      assert H.py_mod("%d + %d = %d", {2, 3, 5}) == "2 + 3 = 5"
+      assert H.py_mod("%05d", 42) == "00042"
+      assert H.py_mod("%.2f", 3.14159) == "3.14"
     end
   end
 

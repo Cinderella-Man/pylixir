@@ -21,7 +21,8 @@ defmodule Pylixir.Nodes.Mutations do
 
   alias Pylixir.{Converter, Naming, UnsupportedNodeError}
 
-  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update setdefault)
+  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update setdefault
+              intersection_update difference_update symmetric_difference_update)
 
   @doc """
   Classify a Python `Expr.value` node. Returns `:none`, a `{:name, …}`
@@ -228,6 +229,23 @@ defmodule Pylixir.Nodes.Mutations do
          ]
        ]
      ]}
+  end
+
+  # Set in-place updates — `s.intersection_update(other)`,
+  # `s.difference_update(other)`, `s.symmetric_difference_update(other)`.
+  # All three lower to the matching MapSet op (Pylixir's set backing).
+  defp mutation_rhs("intersection_update", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :intersection]}, [], [target, other]}
+
+  defp mutation_rhs("difference_update", target, [other], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [target, other]}
+
+  defp mutation_rhs("symmetric_difference_update", target, [other], _kw, _node) do
+    # MapSet has no native symmetric_difference; compose via two
+    # differences + union (same as the AttributeMethods set arm).
+    diff_ab = {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [target, other]}
+    diff_ba = {{:., [], [{:__aliases__, [], [:MapSet]}, :difference]}, [], [other, target]}
+    {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [diff_ab, diff_ba]}
   end
 
   defp mutation_rhs(method, _target, args, _kw, node) do

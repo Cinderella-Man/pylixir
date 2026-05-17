@@ -49,7 +49,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
                      join splitlines read readline
                      ljust rjust center partition rpartition
                      removeprefix removesuffix encode decode
-                     format format_map)
+                     format format_map expandtabs translate maketrans)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -66,7 +66,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # exact equivalents. Same ducktyping caveat: non-MapSet targets
   # crash at runtime.
   @set_methods ~w(union intersection difference symmetric_difference
-                  issubset issuperset isdisjoint pop)
+                  issubset issuperset isdisjoint pop popleft)
 
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
@@ -99,6 +99,15 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("pop", target, [key, default], _kw, _node),
     do: {:py_pop_value_default, [], [target, key, default]}
+
+  # `coll.popleft()` in expression context (`prev = pos[i].popleft()`,
+  # `print(d.popleft())`) — returns the first element of the deque
+  # (Pylixir's deque backing is a plain Elixir list, so this is just
+  # `hd/1`). The rebind happens only when the receiver is a bare Name
+  # in Assign RHS (see `Pylixir.Nodes.Assign`); the expression form
+  # here drops the mutation, same trade-off as `.pop()` expression-
+  # context.
+  defp do_dispatch("popleft", target, [], _kw, _node), do: {:hd, [], [target]}
 
   defp do_dispatch("union", target, [other], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}
@@ -287,6 +296,30 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("encode", target, _args, _kw, _node), do: target
   defp do_dispatch("decode", target, _args, _kw, _node), do: target
 
+  # `str.expandtabs([tabsize])` — replace each `\t` with spaces to
+  # reach the next tab-stop column. Default tabsize is 8 (Python's
+  # default). Behaviour: column tracking resets after each newline,
+  # and a tab at column c expands to `tabsize - (c % tabsize)` spaces.
+  defp do_dispatch("expandtabs", target, [], _kw, _node),
+    do: {:py_str_expandtabs, [], [target, 8]}
+
+  defp do_dispatch("expandtabs", target, [tabsize], _kw, _node),
+    do: {:py_str_expandtabs, [], [target, tabsize]}
+
+  # `str.maketrans(from, to)` — Python's classmethod that returns a
+  # translation table (a dict {ord(from_i): ord(to_i)}). Since we
+  # lower `s.translate(tbl)` to a runtime helper that walks `tbl`
+  # at lookup time, we just emit the dict shape — the helper accepts
+  # both Python's ord-keyed maps and the simpler char-keyed shape.
+  defp do_dispatch("maketrans", _target, [from_s, to_s], _kw, _node),
+    do: {:py_str_maketrans, [], [from_s, to_s]}
+
+  # `s.translate(table)` — replace each grapheme via the table's
+  # lookup. Table is the dict from `maketrans`. Missing keys leave
+  # the grapheme unchanged.
+  defp do_dispatch("translate", target, [table], _kw, _node),
+    do: {:py_str_translate, [], [target, table]}
+
   # 0-arg form: trim whitespace via Elixir's `String.trim*`.
   defp do_dispatch("strip", target, [], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :trim]}, [], [target]}
@@ -367,15 +400,14 @@ defmodule Pylixir.Nodes.AttributeMethods do
       {{:., [], [{:__aliases__, [], [:String]}, :replace]}, [],
        [target, old, new, [global: false]]}
 
-  defp do_dispatch("replace", _target, [_old, _new, count], _kw, node)
-       when is_integer(count) and count > 1 do
-    raise UnsupportedNodeError,
-      node_type: "Call",
-      hint:
-        "str.replace(old, new, count) with count>1 is not supported (RFC §6.23); use count=1 or omit",
-      lineno: Map.get(node, "lineno"),
-      col_offset: Map.get(node, "col_offset")
-  end
+  # `s.replace(old, new, count)` for any count other than the literal
+  # `1` (already handled above with the global:false flag). Routes to
+  # a runtime helper that walks left-to-right replacing the first
+  # `count` occurrences. Handles count >= 2, count == 0 (no-op),
+  # negative count (Python's "no limit"), and any non-literal count
+  # expression where the codegen can't decide at compile time.
+  defp do_dispatch("replace", target, [old, new, count], _kw, _node),
+    do: {:py_str_replace_n, [], [target, old, new, count]}
 
   # `str.find(sub[, start[, end]])` — returns the leftmost index of
   # `sub` in the slice `s[start:end]` (translated to absolute), or -1.

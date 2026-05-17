@@ -24,7 +24,7 @@ defmodule Pylixir.Builtins do
   @t25b ~w(sum min max abs map filter)
   @t26_conversions ~w(int float str bool list tuple set frozenset dict)
   @t26_type_checks ~w(isinstance)
-  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow format)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow format repr)
 
   # `collections.deque` is technically not a builtin — it's imported
   # via `from collections import deque`. But the import is a no-op in
@@ -292,6 +292,12 @@ defmodule Pylixir.Builtins do
 
   def emit("any", [xs], _kw), do: {:ok, enum_truthy_call(:any?, xs)}
   def emit("all", [xs], _kw), do: {:ok, enum_truthy_call(:all?, xs)}
+
+  # Python's builtin `repr(value)` — already implemented as
+  # `py_repr/1` for str/list/tuple/dict containers (used by f-string
+  # `!r` and the existing py_repr_* helpers). The standalone builtin
+  # just calls the same helper.
+  def emit("repr", [v], _kw), do: {:ok, {:py_repr, [], [v]}}
 
   # Python's builtin `format(value[, spec])` — same surface as
   # `"{:spec}".format(value)` but on a single value. With no spec it's

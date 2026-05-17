@@ -91,9 +91,26 @@ defmodule Pylixir.Naming do
   @spec rewrite(String.t()) :: String.t()
   def rewrite(id) when is_binary(id) do
     cond do
+      # Python's throwaway names (`_`, `__`, `___`, …) — Python treats
+      # these as regular variables (`for _ in xs: print(_)` is legal),
+      # but Elixir's bare `_` is pattern-only and can't be used in
+      # expressions. Rewrite to an underscore-prefixed valid identifier
+      # (`_us`, `_us2`, ...) — readable as "underscore", silences
+      # Elixir's unused-variable warning via the `_` prefix convention,
+      # AND is usable as an expression. The for-loop / pattern site
+      # binds the same name; reads inside the body resolve through it.
+      all_underscores?(id) -> all_us_rewrite(id)
       reserved?(id) -> "var_" <> id
       String.starts_with?(id, "var_") -> "usr_" <> id
       true -> id
     end
   end
+
+  defp all_underscores?(<<>>), do: false
+
+  defp all_underscores?(id) when is_binary(id),
+    do: id |> String.to_charlist() |> Enum.all?(&(&1 == ?_))
+
+  defp all_us_rewrite("_"), do: "_us"
+  defp all_us_rewrite(id), do: "_us" <> Integer.to_string(byte_size(id))
 end
