@@ -1,68 +1,72 @@
 # pylixir-eval
 
-Maintainer-only harness that runs Pylixir against large Python datasets
-(starting with [`microsoft/rStar-Coder`](https://huggingface.co/datasets/microsoft/rStar-Coder))
-to surface what node types and patterns the transpiler currently can't handle.
+Maintainer-only harness for running Pylixir against large Python datasets
+([`microsoft/rStar-Coder`](https://huggingface.co/datasets/microsoft/rStar-Coder)
+by default) to surface what the transpiler can't handle yet.
 
-This project lives as a **sibling Mix project** under `tools/eval/` rather
-than in `lib/` so the published `pylixir` Hex package stays minimal
-(no streaming, no HTTP, no dataset deps).
+Sibling Mix project so the published `pylixir` Hex package stays free of
+streaming / HTTP / dataset deps.
 
-## Prerequisites
+## Setup
 
-* Pylixir's normal prereqs (Elixir 1.19+, OTP 26+, Python 3.14+).
-* Hugging Face `datasets` library for streaming:
-
-  ```bash
-  pip install datasets
-  ```
-
-## Usage
-
-From this directory:
+One-time, from this directory:
 
 ```bash
+pip install datasets   # HF streaming
 mix deps.get
-mix eval.run --limit 50 --name synthetic_sft
 ```
 
-Outputs land under `reports/run-<ISO8601>/`:
+Needs Elixir 1.19+, OTP 26+, Python 3.14+.
 
-* `summary.md` — human-readable per-run summary.
+## The loop
+
+Three tasks, used in a cycle:
+
+```bash
+# 1. Run against the dataset — first run streams from HF and caches to
+#    cache/<dataset>--<name>--<split>.jsonl; subsequent runs serve from
+#    cache (and extend it if --limit exceeds the cached count).
+mix eval.run --limit 1000 --name synthetic_sft
+
+# 2. Survey the failures by hint frequency. Top hint = highest-impact
+#    fix. Each row shows the shortest sample path — the cleanest repro.
+mix eval.hints reports/run-<TIMESTAMP>            # all buckets
+mix eval.hints reports/run-<TIMESTAMP> unsupported--Call   # one bucket
+
+# 3. Probe a sample end-to-end (or a hand-rolled /tmp/probe.py).
+#    Runs CPython for expected stdout, transpiles + compiles +
+#    invokes py_main, diffs. Exits non-zero with a one-line cause on
+#    any failure stage. --show prints the generated Elixir too.
+mix eval.probe path/to/sample.py [--show]
+```
+
+When the histogram dries up to only out-of-scope buckets (`ClassDef`,
+`Yield`, class-attribute reads) and there are no further cheap wins,
+that's itself the signal — switch to manual probing of common idioms
+to surface silent bugs.
+
+## Reports
+
+`reports/run-<ISO8601>/` contains:
+
+* `summary.md` — human-readable bucket counts.
 * `summary.json` — machine-readable counts (for diffing runs).
-* `failures/<bucket-slug>/<n>.py` — first samples per failure bucket.
+* `failures/<bucket-slug>/N.py` — first 10 samples per failing bucket,
+  with a comment-prefixed metadata header (`# sample id:`,
+  `# bucket:`, `# metadata:` including `hint:`) above the raw Python.
 
-## Companion tasks
+## Flags (`mix eval.run`)
 
-* `mix eval.probe path/to/file.py [--show]` — one-shot probe pipeline.
-  Runs the Python file through CPython (expected stdout), transpiles
-  with Pylixir, compiles the generated Elixir, invokes `py_main/0`
-  with captured stdout, and diffs against CPython's output. Exits
-  non-zero with a single-line diagnostic on transpile/compile/runtime
-  failure. `--show` prints the generated Elixir between the compile
-  and run stages.
-
-* `mix eval.hints <report-dir> [<bucket-slug>]` — histogram the
-  `hint:` lines inside a report's `failures/<bucket>/*.py` samples.
-  Surfaces which fine-grained hints dominate, with the shortest
-  sample path per hint (cleanest starting point for `mix eval.probe`).
-  Pass a bucket slug to scope to one bucket; omit it for an all-bucket
-  joint sort.
-
-  Typical loop: `mix eval.run --limit 200` →
-  `mix eval.hints <new-run> unsupported--Call` → copy a top sample
-  into `/tmp/probe.py` → `mix eval.probe /tmp/probe.py --show`.
-
-## Flags
-
-* `--limit N` — cap samples processed (default: 100; use a high number for a full pass).
-* `--concurrency K` — `Task.async_stream` concurrency (default: schedulers × 2).
-* `--split NAME` — HF dataset split (default: `train`).
-* `--samples-per-bucket K` — how many failing samples to copy per bucket (default: 10).
-* `--out DIR` — override the report directory.
-
-## Why a separate Mix project?
-
-Pylixir's public surface is `Pylixir.to_source/1` and `Pylixir.transpile/1`.
-Everything in this directory is dataset fetch, batching, bucketing, and
-reporting — none of it belongs in a Hex package consumed by library users.
+| flag | default | what |
+| --- | --- | --- |
+| `--limit N` | unbounded | stop after N samples emitted |
+| `--skip N` | 0 | skip the first N samples before emitting |
+| `--concurrency K` | schedulers × 2 | `Task.async_stream` parallelism |
+| `--samples-per-bucket K` | 10 | how many samples to copy per failing bucket |
+| `--dataset NAME` | `microsoft/rStar-Coder` | HF dataset |
+| `--name CONFIG` | (none) | HF `name=` kwarg (dataset config) |
+| `--split NAME` | `train` | dataset split |
+| `--field NAME` | auto | explicit source column override |
+| `--cache PATH` | auto-derived | override cache file location |
+| `--no-cache` | off | bypass cache (always stream fresh from HF) |
+| `--out DIR` | `reports/run-<ts>` | report directory override |
