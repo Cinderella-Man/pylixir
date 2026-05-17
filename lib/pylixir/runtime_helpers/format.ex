@@ -182,6 +182,63 @@ defmodule Pylixir.RuntimeHelpers.Format do
     end
   end
 
+  # Python's `str.format_map(mapping)` — like `.format(**mapping)` but
+  # the mapping is a runtime value. We parse the template at runtime
+  # (no compile-time placeholder resolution like `.format(...)` gets).
+  # Supports `{name}` and `{name:spec}`; positional / auto-numbered
+  # placeholders are *not* supported (Python's docs say format_map is
+  # specifically for named lookups). Missing keys raise KeyError to
+  # mirror Python.
+  def py_str_format_map(template, mapping) when is_binary(template) and is_map(mapping) do
+    template
+    |> parse_template_runtime("", [])
+    |> Enum.map(fn
+      {:text, t} -> t
+      {:placeholder, name, nil} -> py_str(format_map_fetch!(mapping, name))
+      {:placeholder, name, spec} -> py_format_value(format_map_fetch!(mapping, name), spec)
+    end)
+    |> Enum.join()
+  end
+
+  def format_map_fetch!(mapping, name) do
+    case Map.fetch(mapping, name) do
+      {:ok, v} -> v
+      :error -> raise KeyError, key: name
+    end
+  end
+
+  def parse_template_runtime("", acc_text, acc),
+    do: Enum.reverse(format_map_prepend_text(acc_text, acc))
+
+  def parse_template_runtime("{{" <> rest, acc_text, acc),
+    do: parse_template_runtime(rest, acc_text <> "{", acc)
+
+  def parse_template_runtime("}}" <> rest, acc_text, acc),
+    do: parse_template_runtime(rest, acc_text <> "}", acc)
+
+  def parse_template_runtime("{" <> rest, acc_text, acc) do
+    case String.split(rest, "}", parts: 2) do
+      [body, after_brace] ->
+        {name, spec} =
+          case String.split(body, ":", parts: 2) do
+            [n] -> {n, nil}
+            [n, s] -> {n, s}
+          end
+
+        acc = format_map_prepend_text(acc_text, acc)
+        parse_template_runtime(after_brace, "", [{:placeholder, name, spec} | acc])
+
+      _ ->
+        raise ArgumentError, "unbalanced `{` in format_map template"
+    end
+  end
+
+  def parse_template_runtime(<<ch::utf8, rest::binary>>, acc_text, acc),
+    do: parse_template_runtime(rest, acc_text <> <<ch::utf8>>, acc)
+
+  def format_map_prepend_text("", acc), do: acc
+  def format_map_prepend_text(text, acc), do: [{:text, text} | acc]
+
   # --- HELPERS END ---
 
   # Standalone-module test surface: forward py_str to the core

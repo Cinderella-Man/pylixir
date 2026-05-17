@@ -74,7 +74,77 @@ defmodule Pylixir.LoopAnalysis do
   end
 
   defp names_referenced_in(%{"_type" => "Name", "id" => id}), do: MapSet.new([id])
+
+  # Comprehensions are scope boundaries for `walk_scope` — it visits
+  # the comp node but doesn't descend. That's correct for *assigned*
+  # names (the comp's `for x` target is comp-local and must NOT leak
+  # to the surrounding loop's accumulator). But it's wrong for
+  # *referenced* names: a comp like `[B[i] for i in range(n)]` inside
+  # a while body still reads `B` and `n` from outer scope, and a while
+  # rewrite must thread those into the helper signature. Walk the comp
+  # manually and subtract its for-target bindings.
+  defp names_referenced_in(%{"_type" => type, "elt" => elt, "generators" => generators})
+       when type in ["ListComp", "SetComp", "GeneratorExp"],
+       do: comp_referenced(generators, [elt])
+
+  defp names_referenced_in(%{
+         "_type" => "DictComp",
+         "key" => key,
+         "value" => value,
+         "generators" => generators
+       }),
+       do: comp_referenced(generators, [key, value])
+
   defp names_referenced_in(_), do: MapSet.new()
+
+  # Collect Names read from the comp's expressions + each generator's
+  # iter (which evaluates in the *enclosing* scope), minus all names
+  # bound by `for`-targets across the generators. Generator `ifs`
+  # filters DO see the comp-bound names, so they're left as-is —
+  # subtracting bound names from the final set is the right shape.
+  defp comp_referenced(generators, exprs) do
+    bound =
+      generators
+      |> Enum.flat_map(fn %{"target" => target} -> target_names(target) end)
+      |> MapSet.new()
+
+    read =
+      generators
+      |> Enum.reduce(MapSet.new(), fn gen, acc ->
+        iter_reads = collect_names(Map.get(gen, "iter"))
+        filter_reads = Map.get(gen, "ifs", []) |> Enum.reduce(MapSet.new(), &MapSet.union(&2, collect_names(&1)))
+        acc |> MapSet.union(iter_reads) |> MapSet.union(filter_reads)
+      end)
+      |> MapSet.union(Enum.reduce(exprs, MapSet.new(), &MapSet.union(&2, collect_names(&1))))
+
+    MapSet.difference(read, bound)
+  end
+
+  # Read-only Name harvest, recursive (no scope barriers — the caller
+  # has already handled scope by subtracting bound names). Skips
+  # nodes we know don't contain Name reads we care about.
+  defp collect_names(%{"_type" => "Name", "id" => id}), do: MapSet.new([id])
+
+  defp collect_names(%{"_type" => type} = node)
+       when type in ["ListComp", "SetComp", "GeneratorExp"] do
+    elt = Map.get(node, "elt")
+    gens = Map.get(node, "generators", [])
+    comp_referenced(gens, [elt])
+  end
+
+  defp collect_names(%{"_type" => "DictComp"} = node),
+    do: comp_referenced(Map.get(node, "generators", []), [Map.get(node, "key"), Map.get(node, "value")])
+
+  defp collect_names(%{} = node) do
+    node
+    |> Map.delete("_type")
+    |> Enum.reduce(MapSet.new(), fn {_k, v}, acc -> MapSet.union(acc, collect_names(v)) end)
+  end
+
+  defp collect_names(list) when is_list(list),
+    do: Enum.reduce(list, MapSet.new(), &MapSet.union(&2, collect_names(&1)))
+
+  defp collect_names(_), do: MapSet.new()
 
   defp names_assigned_in(%{"_type" => "Assign", "targets" => targets, "value" => value}) do
     target_set = targets |> Enum.flat_map(&target_names/1) |> MapSet.new()

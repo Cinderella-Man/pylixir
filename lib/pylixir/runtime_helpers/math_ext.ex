@@ -44,6 +44,87 @@ defmodule Pylixir.RuntimeHelpers.MathExt do
     :math.sqrt(sum)
   end
 
+  # Python's `math.prod(iter, start=1)` — product of all elements.
+  # `start` defaults to 1 (so an empty iter returns 1, matching Python).
+  # No type-coercion: int*int stays int, float*anything goes float —
+  # mirrors Python's `*` semantics.
+  def py_math_prod(iter, start) when is_list(iter),
+    do: Enum.reduce(iter, start, fn x, acc -> acc * x end)
+
+  def py_math_prod(iter, start) when is_tuple(iter),
+    do: py_math_prod(Tuple.to_list(iter), start)
+
+  def py_math_prod(iter, start),
+    do: py_math_prod(Enum.to_list(iter), start)
+
+  # Python's variadic `math.gcd(*ints)` for arity ≥ 3. Folds pairwise
+  # via Integer.gcd; matches Python (gcd reaches 1 → result is 1 from
+  # there on, so the reduce can't get more efficient by early-exit
+  # without a custom loop — not worth it for typical input sizes).
+  def py_math_gcd(ints) when is_list(ints),
+    do: Enum.reduce(ints, 0, fn x, acc -> Integer.gcd(acc, x) end)
+
+  # Python's variadic `math.lcm(*ints)`. lcm() == 1, lcm(a) == abs(a),
+  # lcm(0, ...) == 0, otherwise fold pairwise via `a*b div gcd(a,b)`.
+  # Caller wraps args in a list literal so this works at any arity.
+  def py_math_lcm([]), do: 1
+  def py_math_lcm([a]) when is_integer(a), do: abs(a)
+  def py_math_lcm([a, b | rest]), do: py_math_lcm([py_lcm_pair(a, b) | rest])
+
+  def py_lcm_pair(0, _), do: 0
+  def py_lcm_pair(_, 0), do: 0
+  def py_lcm_pair(a, b) when is_integer(a) and is_integer(b),
+    do: div(abs(a * b), Integer.gcd(a, b))
+
+  # Python's `math.dist(p, q)` — Euclidean distance between two
+  # equal-length iterables of coords. sqrt(sum((pi - qi)^2)). Returns
+  # float; matches Python's float-only output even for int coords.
+  def py_math_dist(p, q) do
+    p_list = py_dist_to_list(p)
+    q_list = py_dist_to_list(q)
+
+    sum =
+      Enum.zip(p_list, q_list)
+      |> Enum.reduce(0.0, fn {a, b}, acc ->
+        d = a - b
+        acc + d * d
+      end)
+
+    :math.sqrt(sum)
+  end
+
+  def py_dist_to_list(t) when is_tuple(t), do: Tuple.to_list(t)
+  def py_dist_to_list(l) when is_list(l), do: l
+  def py_dist_to_list(other), do: Enum.to_list(other)
+
+  # Python's `math.modf(x)` — `(fractional_part, integer_part)` both
+  # as floats. `trunc/1` matches Python's behaviour (toward zero); the
+  # `* 1.0` coercions lift integers and ensure both elements are
+  # floats even when the input is integer.
+  def py_math_modf(x) when is_number(x) do
+    x_f = x * 1.0
+    i_part = trunc(x_f) * 1.0
+    f_part = x_f - i_part
+    {f_part, i_part}
+  end
+
+  # Python's `math.frexp(x)` — returns `(mantissa, exponent)` with
+  # `0.5 <= |mantissa| < 1` (or `(0.0, 0)` for zero). Implemented by
+  # unpacking the IEEE-754 binary64 representation: take the sign and
+  # fraction bits, rewrite the biased exponent to 1022 so the implicit
+  # `1.frac` value lands in `[0.5, 1.0)`, and return the original
+  # exponent shifted by 1022. Subnormals (exp_raw == 0) and infinities
+  # /NaN aren't special-cased — math code that hits them is rare and
+  # Python's behaviour there is mostly platform-defined anyway.
+  def py_math_frexp(x) when x == 0, do: {0.0, 0}
+
+  def py_math_frexp(x) when is_number(x) do
+    x_f = x * 1.0
+    <<sign::1, exp_raw::11, frac::52>> = <<x_f::float-64>>
+    <<m::float-64>> = <<sign::1, 1022::11, frac::52>>
+    {m, exp_raw - 1022}
+  end
+
   # Python's 3-arg `pow(base, exp, mod)` — modular exponentiation.
   # Uses Erlang's :crypto.mod_pow (square-and-multiply, suitable for
   # large exponents used in number-theoretic code like modular inverses

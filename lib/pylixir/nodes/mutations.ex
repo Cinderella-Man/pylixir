@@ -134,16 +134,18 @@ defmodule Pylixir.Nodes.Mutations do
     do: {:++, [], [target, [x]]}
 
   defp mutation_rhs("sort", target, [], kw, _node) do
-    base =
-      case Map.get(kw, "key") do
-        nil -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [target]}
-        f -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [target, f]}
-      end
+    # Python's sort is stable; `reverse=True` is stable-descending
+    # (equal-key elements keep insertion order). Composing Enum.reverse
+    # with a stable ascending sort flips that. Use the :desc sorter so
+    # the comparator runs in descending mode and stability is preserved.
+    key = Map.get(kw, "key")
+    desc? = Map.get(kw, "reverse") == true
 
-    case Map.get(kw, "reverse") do
-      nil -> base
-      true -> {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}
-      _ -> base
+    case {key, desc?} do
+      {nil, false} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [target]}
+      {nil, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [target, :desc]}
+      {f, false} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [target, f]}
+      {f, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [target, f, :desc]}
     end
   end
 

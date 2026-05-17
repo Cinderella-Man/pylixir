@@ -44,9 +44,19 @@ defmodule Pylixir.Stdlib.Math do
     do: {:ok, {{:., [], [:math, String.to_atom(attr)]}, [], [a, b]}}
 
   # Integer-arithmetic helpers — not in Erlang's :math, but in
-  # Elixir's stdlib.
+  # Elixir's stdlib. `math.gcd` was binary in 3.4 and variadic
+  # (0..N args) in 3.9+; fold pairwise. The 1-arg / 0-arg cases
+  # match Python: gcd() == 0, gcd(a) == abs(a).
+  def call(["gcd"], [], _kwargs, _node), do: {:ok, 0}
+
+  def call(["gcd"], [a], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:Kernel]}, :abs]}, [], [a]}}
+
   def call(["gcd"], [a, b], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Integer]}, :gcd]}, [], [a, b]}}
+
+  def call(["gcd"], args, _kwargs, _node) when length(args) > 2,
+    do: {:ok, {:py_math_gcd, [], [args]}}
 
   # `math.isqrt(n)` — floor of integer square root. Erlang's :math.sqrt
   # is a float op, so we trunc; precision loss for n > 2^53 is the
@@ -112,6 +122,34 @@ defmodule Pylixir.Stdlib.Math do
         [do: abs_x, else: {:-, [], [abs_x]}]
       ]}}
   end
+
+  # `math.prod(iterable[, start])` — product of all elements. Defaults
+  # to `start=1`, matching Python. Empty iterable returns `start`.
+  def call(["prod"], [iter], _kwargs, _node),
+    do: {:ok, {:py_math_prod, [], [iter, 1]}}
+
+  def call(["prod"], [iter, start], _kwargs, _node),
+    do: {:ok, {:py_math_prod, [], [iter, start]}}
+
+  # `math.lcm(*ints)` — least common multiple. Variadic in 3.9+;
+  # zero args → 1, one arg → abs(a). Routes through a list-taking
+  # helper; the call site wraps args in a list literal.
+  def call(["lcm"], args, _kwargs, _node) when is_list(args),
+    do: {:ok, {:py_math_lcm, [], [args]}}
+
+  # `math.dist(p, q)` — Euclidean distance between two iterables of
+  # equal length. Lowers to sqrt(sum((pi - qi)^2)). Routes via helper
+  # so we accept any iterable, not just lists.
+  def call(["dist"], [p, q], _kwargs, _node),
+    do: {:ok, {:py_math_dist, [], [p, q]}}
+
+  # `math.modf(x)` — returns `(fractional_part, integer_part)` both as
+  # floats. `math.frexp(x)` — returns `(mantissa, exponent)` such that
+  # `x == mantissa * 2 ** exponent` with `0.5 <= abs(m) < 1`. Both lower
+  # to runtime helpers; the IEEE-bit-manipulation in py_math_frexp is
+  # too gnarly to inline at the call site.
+  def call(["modf"], [x], _kwargs, _node), do: {:ok, {:py_math_modf, [], [x]}}
+  def call(["frexp"], [x], _kwargs, _node), do: {:ok, {:py_math_frexp, [], [x]}}
 
   def call([attr], args, _kwargs, _node) when attr in @unary or attr in @binary,
     do:

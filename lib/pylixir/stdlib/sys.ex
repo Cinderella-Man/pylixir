@@ -38,6 +38,9 @@ defmodule Pylixir.Stdlib.Sys do
   def attribute(["stdout"], _node),
     do: {:error, "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}
 
+  def attribute(["stderr"], _node),
+    do: {:error, "bare `sys.stderr` is not supported — use `sys.stderr.write(s)`"}
+
   # Python lets you bind the method as a value (`f = sys.stdin.read`)
   # and call it later (`f()`). Emit a zero-arg lambda so the
   # subsequent call site (`f()` → `f.()`, the in-scope anonymous-call
@@ -65,6 +68,20 @@ defmodule Pylixir.Stdlib.Sys do
 
   def call(["stdout", "write"], [s], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [s]}}
+
+  # `sys.stdout.flush()` / `sys.stderr.flush()` — BEAM's IO writes are
+  # line-buffered to the group leader and there's no user-facing flush
+  # primitive, so these are no-ops that match Python's "flush happens"
+  # contract for the common interactive-output use case. Returns nil so
+  # statement-context use compiles cleanly.
+  def call(["stdout", "flush"], [], _kwargs, _node), do: {:ok, nil}
+  def call(["stderr", "flush"], [], _kwargs, _node), do: {:ok, nil}
+
+  # `sys.stderr.write(s)` — write to stderr. The BEAM has `:stderr` as
+  # an IO device alias; route through IO.write/2 with that device so the
+  # output actually lands on fd 2.
+  def call(["stderr", "write"], [s], _kwargs, _node),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [:stderr, s]}}
 
   # `sys.setrecursionlimit(n)` — Python sets the interpreter's
   # recursion limit. Elixir/BEAM has no equivalent (stack depth is

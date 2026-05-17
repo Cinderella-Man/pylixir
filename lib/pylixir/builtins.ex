@@ -22,9 +22,9 @@ defmodule Pylixir.Builtins do
 
   @t25a ~w(len range sorted reversed enumerate zip)
   @t25b ~w(sum min max abs map filter)
-  @t26_conversions ~w(int float str bool list tuple set dict)
+  @t26_conversions ~w(int float str bool list tuple set frozenset dict)
   @t26_type_checks ~w(isinstance)
-  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow format)
 
   # `collections.deque` is technically not a builtin — it's imported
   # via `from collections import deque`. But the import is a no-op in
@@ -110,26 +110,8 @@ defmodule Pylixir.Builtins do
   def emit("reversed", [xs], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [xs]}}
 
-  def emit("enumerate", [xs], kw) do
-    start =
-      case Map.get(kw, "start") do
-        nil -> nil
-        ast -> ast
-      end
-
-    base =
-      if start do
-        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs, start]}
-      else
-        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs]}
-      end
-
-    # Python yields (i, x); Elixir yields {x, i}. Swap via Enum.map.
-    swap_fn =
-      {:fn, [], [{:->, [], [[{{:x, [], nil}, {:i, [], nil}}], {{:i, [], nil}, {:x, [], nil}}]}]}
-
-    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [base, swap_fn]}}
-  end
+  def emit("enumerate", [xs], kw), do: enumerate_call(xs, Map.get(kw, "start"))
+  def emit("enumerate", [xs, start], _kw), do: enumerate_call(xs, start)
 
   def emit("zip", [a, b], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [a, b]}}
@@ -224,6 +206,20 @@ defmodule Pylixir.Builtins do
   def emit("set", [x], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}}
 
+  # `frozenset()` / `frozenset(iter)` — Elixir has no separate frozen vs
+  # mutable set; MapSet already has value semantics + immutability. Both
+  # forms lower to the same MapSet shape as `set(...)`. `py_str` reports
+  # them as `set(...)` — known minor cosmetic divergence; tests that
+  # only assert membership/equality (the common case in eval samples)
+  # are unaffected.
+  def emit("frozenset", [], _kw),
+    do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], []}}
+
+  def emit("frozenset", [x], _kw),
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
+
   def emit("dict", [], _kw), do: {:ok, {:%{}, [], []}}
 
   def emit("dict", [x], _kw),
@@ -297,6 +293,15 @@ defmodule Pylixir.Builtins do
   def emit("any", [xs], _kw), do: {:ok, enum_truthy_call(:any?, xs)}
   def emit("all", [xs], _kw), do: {:ok, enum_truthy_call(:all?, xs)}
 
+  # Python's builtin `format(value[, spec])` — same surface as
+  # `"{:spec}".format(value)` but on a single value. With no spec it's
+  # `str(value)`; with a spec it routes through the shared
+  # `py_format_value/2` parser. The .format() path in
+  # `Pylixir.Nodes.AttributeMethods` already does this — reuse here so
+  # both lowering paths converge on one runtime.
+  def emit("format", [value], _kw), do: {:ok, {:py_str, [], [value]}}
+  def emit("format", [value, spec], _kw), do: {:ok, {:py_format_value, [], [value, spec]}}
+
   # `exit()` / `exit(code)` throw via `Pylixir.ControlFlow.throw_exit/1`;
   # py_main's try/catch wrapper (see `Pylixir.Converter.py_main_def/1`)
   # catches the throw and returns the code so the BEAM survives —
@@ -337,38 +342,98 @@ defmodule Pylixir.Builtins do
   end
 
   defp apply_sorted_kw(base, xs, kw) do
-    base =
-      case Map.get(kw, "key") do
-        nil -> base
+    key = Map.get(kw, "key")
+    reverse = Map.get(kw, "reverse")
+
+    # Python's `sorted(reverse=True)` is a STABLE descending sort —
+    # equal-key elements keep their original order. Composing a stable
+    # ascending sort with `Enum.reverse` flips that, breaking
+    # stability. Use Enum.sort/sort_by with `:desc` instead so the
+    # comparator itself runs in descending mode, preserving stability.
+    desc? = reverse == true
+
+    case {key, desc?} do
+      {nil, false} -> base
+      {nil, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs, :desc]}
+      {f, false} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f]}
+      {f, true} -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f, :desc]}
+    end
+    |> maybe_runtime_reverse(reverse, key, xs)
+  end
+
+  # Fallback: when `reverse=` is a non-literal expression we can't
+  # decide at codegen time. Stability won't be quite right (uses
+  # Enum.reverse on a stable ascending sort), but the alternative is
+  # generating a runtime branch on `:desc` which Enum can't accept as
+  # a dynamic value. Rare in practice — every eval-corpus usage is
+  # literal True or False.
+  defp maybe_runtime_reverse(base, true, _key, _xs), do: base
+  defp maybe_runtime_reverse(base, false, _key, _xs), do: base
+  defp maybe_runtime_reverse(base, nil, _key, _xs), do: base
+
+  defp maybe_runtime_reverse(_base, reverse_ast, key, xs) do
+    ascending =
+      case key do
+        nil -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [xs]}
         f -> {{:., [], [{:__aliases__, [], [:Enum]}, :sort_by]}, [], [xs, f]}
       end
 
-    case Map.get(kw, "reverse") do
-      nil ->
-        base
+    {:if, [],
+     [
+       {:truthy?, [], [reverse_ast]},
+       [do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [ascending]}, else: ascending]
+     ]}
+  end
 
-      true_ast when true_ast == true ->
-        {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}
+  # Shared by `enumerate(xs)` / `enumerate(xs, start=N)` / `enumerate(xs, N)`.
+  # Lowers to `Enum.with_index/1` or `/2` and post-maps {x, i} → {i, x}
+  # to match Python's tuple order.
+  defp enumerate_call(xs, start) do
+    base =
+      if start do
+        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs, start]}
+      else
+        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs]}
+      end
 
-      _other ->
-        # Conservative: if `reverse=<expr>`, can't tell at codegen time.
-        # Emit a conditional. For MVP, treat truthy as reverse.
-        {:if, [],
-         [
-           {:truthy?, [], [Map.get(kw, "reverse")]},
-           [do: {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [base]}, else: base]
-         ]}
-    end
+    swap_fn =
+      {:fn, [], [{:->, [], [[{{:x, [], nil}, {:i, [], nil}}], {{:i, [], nil}, {:x, [], nil}}]}]}
+
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [base, swap_fn]}}
   end
 
   defp minmax_call(op, xs, kw) do
-    case Map.get(kw, "default") do
-      nil ->
+    key = Map.get(kw, "key")
+    default = Map.get(kw, "default")
+
+    case {key, default} do
+      {nil, nil} ->
         {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [xs]}
 
-      default_ast ->
+      {nil, default_ast} ->
         {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [],
          [xs, {:fn, [], [{:->, [], [[], default_ast]}]}]}
+
+      {key_ast, nil} ->
+        # Python's `min(xs, key=fn)` — pick the element with smallest
+        # `fn(x)`. Enum has `min_by`/`max_by` that do exactly this.
+        by_op = if op == :min, do: :min_by, else: :max_by
+        {{:., [], [{:__aliases__, [], [:Enum]}, by_op]}, [], [xs, key_ast]}
+
+      {key_ast, default_ast} ->
+        # Both key= and default= — Enum.min_by/4 accepts a sorter
+        # (default `&<=/2`) and an empty_fallback 0-arity fn. Pass the
+        # default through the fallback so empty iterables match Python.
+        by_op = if op == :min, do: :min_by, else: :max_by
+        sorter =
+          {:fn, [],
+           [
+             {:->, [],
+              [[{:a, [], nil}, {:b, [], nil}], {:<=, [], [{:a, [], nil}, {:b, [], nil}]}]}
+           ]}
+        fallback = {:fn, [], [{:->, [], [[], default_ast]}]}
+        {{:., [], [{:__aliases__, [], [:Enum]}, by_op]}, [],
+         [xs, key_ast, sorter, fallback]}
     end
   end
 

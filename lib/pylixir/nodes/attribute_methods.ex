@@ -41,14 +41,15 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   alias Pylixir.UnsupportedNodeError
 
-  @dict_methods ~w(keys values items get)
+  @dict_methods ~w(keys values items get fromkeys popitem clear)
   @string_methods ~w(lower upper title capitalize swapcase casefold
                      strip lstrip rstrip startswith endswith
-                     split replace find rfind count index zfill isdigit isalpha isalnum
+                     split rsplit replace find rfind count index zfill isdigit isalpha isalnum
                      islower isupper isspace isdecimal isnumeric isascii
                      join splitlines read readline
                      ljust rjust center partition rpartition
-                     removeprefix removesuffix encode decode)
+                     removeprefix removesuffix encode decode
+                     format format_map)
   # Methods that are no-ops under Elixir's immutability — Python's
   # `xs.copy()` returns a shallow copy so subsequent mutations on the
   # copy don't affect the original; Elixir's containers are already
@@ -154,6 +155,14 @@ defmodule Pylixir.Nodes.AttributeMethods do
     end
   end
 
+  # `template.format_map(mapping)` — like `format(**mapping)` but the
+  # mapping is a runtime value (not unpacked kwargs). We can't resolve
+  # placeholders at compile time, so route to a runtime helper that
+  # parses the template + substitutes. Template can be any string
+  # expression here (not restricted to literal); helper handles all.
+  defp do_dispatch("format_map", template, [mapping], _kw, _node),
+    do: {:py_str_format_map, [], [template, mapping]}
+
   defp do_dispatch("format", _target, _args, _kw, node) do
     raise UnsupportedNodeError,
       node_type: "Call",
@@ -179,6 +188,31 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("get", target, [k, default], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:Map]}, :get]}, [], [target, k, default]}
+
+  # `d.fromkeys(keys[, default])` — usually called as `dict.fromkeys(...)`
+  # rather than on an instance, but we handle both shapes. The target
+  # is ignored (Python's dict.fromkeys is essentially classmethod).
+  defp do_dispatch("fromkeys", _target, [keys], _kw, _node),
+    do: {:py_dict_fromkeys, [], [keys, nil]}
+
+  defp do_dispatch("fromkeys", _target, [keys, default], _kw, _node),
+    do: {:py_dict_fromkeys, [], [keys, default]}
+
+  # `d.popitem()` in expression context — returns an arbitrary `{k, v}`
+  # tuple from the dict (Python LIFO since 3.7; Pylixir picks the first
+  # via `Map.to_list/1 |> hd/1`). The mutation is lost — same tradeoff
+  # as the other expression-context pop variants. Assign-RHS rebind
+  # form not yet implemented.
+  defp do_dispatch("popitem", target, [], _kw, _node), do: {:py_dict_popitem, [], [target]}
+
+  # `d.clear()` in expression context — returns `nil` (Python's None)
+  # and loses the mutation. The bare statement form `d.clear()` rebinds
+  # d to `%{}` via `Pylixir.Nodes.Mutations`. Wrap as `(_ = target;
+  # nil)` so the lowered AST still references `target` — preserves any
+  # side effects in the receiver and silences the unused-attribute
+  # warning when the receiver is a hoistable literal.
+  defp do_dispatch("clear", target, [], _kw, _node),
+    do: {:__block__, [], [{:=, [], [{:_, [], nil}, target]}, nil]}
 
   # --- T29a string methods: case / whitespace / prefix-suffix / join ----
 
@@ -309,6 +343,21 @@ defmodule Pylixir.Nodes.AttributeMethods do
     do:
       {{:., [], [{:__aliases__, [], [:String]}, :split]}, [],
        [target, sep, [parts: {:+, [], [maxsplit, 1]}]]}
+
+  # `s.rsplit(sep[, maxsplit])` — split from the RIGHT. With no
+  # maxsplit (or -1) it's equivalent to `split`, so route there. With
+  # an explicit `maxsplit` we need true right-anchored splitting: an
+  # Elixir String.split with `parts:` is left-anchored, so we route to
+  # `py_str_rsplit/3` which reverses + splits + reverses-back to keep
+  # the leftmost segment as the prefix-merged chunk.
+  defp do_dispatch("rsplit", target, [], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target]}
+
+  defp do_dispatch("rsplit", target, [sep], _kw, _node),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :split]}, [], [target, sep]}
+
+  defp do_dispatch("rsplit", target, [sep, maxsplit], _kw, _node),
+    do: {:py_str_rsplit, [], [target, sep, maxsplit]}
 
   defp do_dispatch("replace", target, [old, new], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:String]}, :replace]}, [], [target, old, new]}

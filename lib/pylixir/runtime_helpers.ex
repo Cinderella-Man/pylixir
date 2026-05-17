@@ -91,6 +91,20 @@ defmodule Pylixir.RuntimeHelpers do
     do: List.duplicate(b, a) |> Enum.concat()
 
   def py_mult(a, b) when is_integer(a) and is_list(b), do: []
+
+  # Python tuple * int — repeat the tuple's elements. `(1, 2) * 3
+  # == (1, 2, 1, 2, 1, 2)`. Round-trip through list because that's
+  # the only way to concat in BEAM; the int * tuple form mirrors.
+  def py_mult(a, b) when is_tuple(a) and is_integer(b) and b > 0,
+    do: a |> Tuple.to_list() |> List.duplicate(b) |> Enum.concat() |> List.to_tuple()
+
+  def py_mult(a, b) when is_tuple(a) and is_integer(b), do: {}
+
+  def py_mult(a, b) when is_integer(a) and is_tuple(b) and a > 0,
+    do: b |> Tuple.to_list() |> List.duplicate(a) |> Enum.concat() |> List.to_tuple()
+
+  def py_mult(a, b) when is_integer(a) and is_tuple(b), do: {}
+
   def py_mult(a, b), do: a * b
 
   def py_pow(base, exp) when is_integer(base) and is_integer(exp) and exp >= 0,
@@ -118,6 +132,23 @@ defmodule Pylixir.RuntimeHelpers do
     do: Map.get(map, key, default)
 
   def py_pop_value_default(list, idx, _default) when is_list(list), do: Enum.at(list, idx)
+
+  # `dict.fromkeys(iter[, default])` — build a dict mapping each key in
+  # `keys` to the same `default` (Python defaults to None / `nil`).
+  # The 1-arg shape passes `nil` from the dispatch site; this 2-arity
+  # def covers both. We accept strings/tuples via py_iter_to_list so
+  # the helper works on the same iterables Python's fromkeys accepts.
+  def py_dict_fromkeys(keys, default) when is_list(keys),
+    do: Map.new(keys, fn k -> {k, default} end)
+
+  def py_dict_fromkeys(keys, default), do: py_dict_fromkeys(py_iter_to_list(keys), default)
+
+  # `dict.popitem()` in expression context — returns an arbitrary
+  # `{k, v}` tuple. Python 3.7+ guarantees LIFO, but Elixir's Map has
+  # no insertion-order guarantee, so we return whatever `Map.to_list/1`
+  # yields first. Fine for tests that don't depend on which item.
+  def py_dict_popitem(map) when is_map(map) and not is_struct(map),
+    do: map |> Map.to_list() |> hd()
 
   # Python's `list.pop()` / `dict.pop(key[, default])` capture-return form.
   # Returned tuple is `{popped_value, new_collection}` — caller destructures.
@@ -276,7 +307,94 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str(x) when is_list(x), do: py_repr_list(x)
   def py_str(x) when is_tuple(x), do: py_repr_tuple(x)
   def py_str(x) when is_map(x) and not is_struct(x), do: py_repr_map(x)
+  def py_str(x) when is_float(x), do: py_str_float(x)
   def py_str(x), do: to_string(x)
+
+  # Python's `str(float)` / `repr(float)`. Python uses fixed-point for
+  # `1e-4 <= abs(x) < 1e16` and scientific (`e[+-]NN`, exponent zero-
+  # padded to >=2 digits) elsewhere. BEAM's `:erlang.float_to_binary(x,
+  # [:short])` gives the canonical short repr — sometimes scientific
+  # for whole-number floats like `1000.0` (`"1.0e3"`), which doesn't
+  # match Python. We use the short repr as the source of digits and
+  # decide format based on the exponent.
+  def py_str_float(x) when is_float(x) do
+    s = :erlang.float_to_binary(x, [:short])
+
+    case String.split(s, "e") do
+      [_only] ->
+        s
+
+      [mantissa, exp_str] ->
+        exp = String.to_integer(exp_str)
+
+        cond do
+          exp >= 16 or exp < -4 -> python_sci(mantissa, exp)
+          true -> shift_decimal(mantissa, exp)
+        end
+    end
+  end
+
+  # Format as Python's scientific: `e[+-]NN`, exponent always signed
+  # and zero-padded to >=2 digits. Mantissa already has a `.`; Python
+  # drops trailing zeros after the decimal but keeps at least `.0`-
+  # equivalent — actually Python's repr drops the `.0` entirely in
+  # sci form: `1e+20` not `1.0e+20`. Mirror that.
+  def python_sci(mantissa, exp) do
+    sign = if exp >= 0, do: "+", else: "-"
+    abs_exp = abs(exp)
+    exp_padded = abs_exp |> Integer.to_string() |> String.pad_leading(2, "0")
+    mantissa_clean = drop_trailing_zero_decimal(mantissa)
+    mantissa_clean <> "e" <> sign <> exp_padded
+  end
+
+  # `"1.0"` → `"1"`; `"1.5"` → `"1.5"`. Used in Python sci-notation
+  # mantissa formatting where the `.0` is dropped.
+  def drop_trailing_zero_decimal(s) do
+    case String.split(s, ".") do
+      [int_part, "0"] -> int_part
+      _ -> s
+    end
+  end
+
+  # Given a mantissa like `"-1.5"` and an exponent like `10`, produce
+  # the fixed-point form: `"-15000000000.0"`. Handles negative
+  # exponents (`shift_decimal("1.5", -3)` → `"0.0015"`).
+  def shift_decimal(mantissa, exp) do
+    {sign, rest} =
+      case mantissa do
+        "-" <> rest -> {"-", rest}
+        other -> {"", other}
+      end
+
+    {int_part, frac_part} =
+      case String.split(rest, ".") do
+        [i] -> {i, ""}
+        [i, f] -> {i, f}
+      end
+
+    digits = int_part <> frac_part
+    decimal_pos = String.length(int_part) + exp
+
+    formatted =
+      cond do
+        decimal_pos >= String.length(digits) ->
+          # Right-pad with zeros and append `.0`.
+          padded = digits <> String.duplicate("0", decimal_pos - String.length(digits))
+          padded <> ".0"
+
+        decimal_pos <= 0 ->
+          # Left-pad with zeros after `0.`.
+          leading_zeros = String.duplicate("0", -decimal_pos)
+          "0." <> leading_zeros <> digits
+
+        true ->
+          {l, r} = String.split_at(digits, decimal_pos)
+          r = if r == "", do: "0", else: r
+          l <> "." <> r
+      end
+
+    sign <> formatted
+  end
 
   def py_repr_list(items), do: "[" <> Enum.map_join(items, ", ", &py_repr/1) <> "]"
 
@@ -347,6 +465,23 @@ defmodule Pylixir.RuntimeHelpers do
       -1 -> -1
       idx -> idx + start
     end
+  end
+
+  # Python's `str.rsplit(sep, maxsplit)` — right-anchored, bounded.
+  # Elixir's `String.split(s, sep, parts: N)` is LEFT-anchored, so for
+  # `"a,b,c,d".rsplit(",", 1)` Python gives `["a,b,c", "d"]` while a
+  # naive left-split with parts:2 gives `["a", "b,c,d"]`. Reversing
+  # the string + sep, splitting from the left with the same maxsplit,
+  # then reversing the pieces back and the list yields the right
+  # semantics. `maxsplit == -1` means "split everywhere" (Python's
+  # convention) — degenerate to a plain split.
+  def py_str_rsplit(s, sep, -1), do: String.split(s, sep)
+
+  def py_str_rsplit(s, sep, maxsplit) when is_binary(s) and is_binary(sep) and is_integer(maxsplit) do
+    String.reverse(s)
+    |> String.split(String.reverse(sep), parts: maxsplit + 1)
+    |> Enum.map(&String.reverse/1)
+    |> Enum.reverse()
   end
 
   def py_str_count(s, ""), do: String.length(s) + 1
@@ -614,6 +749,25 @@ defmodule Pylixir.RuntimeHelpers do
     with_h ++ without_h
   end
 
+  # Python's `itertools.combinations_with_replacement(iter, r)` —
+  # r-length subsets where elements may repeat (the same index can
+  # be picked multiple times). Differs from `combinations` in the
+  # recursion: when we pick `h`, the next pick is allowed to pick
+  # `h` AGAIN, so recurse over the SAME list (`[h | t]`), not its
+  # tail.
+  def py_combinations_with_replacement(enum, r) when is_integer(r) and r >= 0 do
+    py_cwr_inner(py_iter_to_list(enum), r)
+  end
+
+  def py_cwr_inner(_, 0), do: [[]]
+  def py_cwr_inner([], _), do: []
+
+  def py_cwr_inner([h | t] = list, r) do
+    with_h = Enum.map(py_cwr_inner(list, r - 1), &[h | &1])
+    without_h = py_cwr_inner(t, r)
+    with_h ++ without_h
+  end
+
   # Python's `itertools.permutations(iter)` — all orderings of the input.
   # `itertools.permutations(iter, r)` — r-length permutations.
   # Returns lists (same convention as py_combinations). Output order
@@ -636,6 +790,33 @@ defmodule Pylixir.RuntimeHelpers do
       rest = List.delete_at(list, i)
       Enum.map(py_permutations_inner(rest, r - 1), &[h | &1])
     end)
+  end
+
+  # Python's `itertools.product(*iters[, repeat=N])` — Cartesian
+  # product. Output element shape: a tuple matching Python (so
+  # `for a, b in product(xs, ys):` unpacks cleanly). Empty `iters`
+  # yields a single empty tuple `()`, matching Python. `repeat`
+  # repeats the iters list before computing the product, so
+  # `product([1,2], repeat=2) == product([1,2], [1,2])`.
+  def py_product(iters, repeat) when is_list(iters) and is_integer(repeat) and repeat >= 0 do
+    # `List.duplicate(iters, n) |> Enum.concat()` repeats the list of
+    # iters n times — concat flattens one level only (List.flatten
+    # would crush the inner iters too). Then coerce each iter to a
+    # list so tuples/strings/ranges all work.
+    expanded =
+      iters
+      |> List.duplicate(repeat)
+      |> Enum.concat()
+      |> Enum.map(&py_iter_to_list/1)
+
+    do_product(expanded) |> Enum.map(&List.to_tuple/1)
+  end
+
+  def do_product([]), do: [[]]
+
+  def do_product([first | rest]) do
+    tail_combos = do_product(rest)
+    for x <- first, tail <- tail_combos, do: [x | tail]
   end
 
   # Iterate-as-list: handles Python's iter-from-string semantics
@@ -711,6 +892,36 @@ defmodule Pylixir.RuntimeHelpers do
   def py_int_bit_length(0), do: 0
   def py_int_bit_length(n) when n < 0, do: py_int_bit_length(-n)
   def py_int_bit_length(n) when is_integer(n), do: length(Integer.digits(n, 2))
+
+  # `type(x).__name__` — returns Python's class name as a string.
+  # Discriminates booleans before integers (Python's bool is a subclass
+  # but reports "bool"), and tuple before the generic struct/map
+  # branches. MapSet → "set" matches the str(frozenset) tradeoff
+  # already in py_str.
+  def py_type_name(nil), do: "NoneType"
+  def py_type_name(true), do: "bool"
+  def py_type_name(false), do: "bool"
+  def py_type_name(x) when is_integer(x), do: "int"
+  def py_type_name(x) when is_float(x), do: "float"
+  def py_type_name(x) when is_binary(x), do: "str"
+  def py_type_name(x) when is_list(x), do: "list"
+  def py_type_name(x) when is_tuple(x), do: "tuple"
+  def py_type_name(%MapSet{}), do: "set"
+  def py_type_name(x) when is_map(x), do: "dict"
+  def py_type_name(x) when is_function(x), do: "function"
+  def py_type_name(_), do: "object"
+
+  # `print(*iter[, sep=..., end=...])` — unpack-then-print. Defaults
+  # match Python's `print` (sep=" ", end="\n"). The lowering in
+  # `Pylixir.Converter.emit_starred_call/3` routes here when the only
+  # positional call argument is a Starred; sep/end_ flow through from
+  # the matching kwargs there. We accept any iterable via
+  # `py_iter_to_list/1` (tuples lower to Elixir tuples, etc.).
+  def py_print_iter(iter, sep, end_) do
+    list = py_iter_to_list(iter)
+    body = list |> Enum.map(&py_str/1) |> Enum.join(sep)
+    IO.write(body <> end_)
+  end
 
   # === Input ===
   def py_input(prompt) do

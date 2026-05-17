@@ -299,16 +299,28 @@ defmodule Pylixir.Converter do
 
       :no_stdlib ->
         attr = Map.fetch!(node, "attr")
-        target_type = Map.get(node["value"], "_type")
 
-        raise UnsupportedNodeError,
-          node_type: "Attribute",
-          hint:
-            "attribute access on a non-stdlib value (`<#{target_type}>.#{attr}`) is not supported (known stdlib modules: #{Enum.join(Stdlib.names(), ", ")})",
-          lineno: Map.get(node, "lineno"),
-          col_offset: Map.get(node, "col_offset")
+        case detect_type_name_access(node) do
+          {:ok, value_node} ->
+            # `type(x).__name__` — the only "attribute on a runtime value"
+            # shape we support. Lowers to `py_type_name(x)` which returns
+            # Python's class name as a string ("int", "list", ...).
+            {value_ast, context} = convert(value_node, context)
+            {{:py_type_name, [], [value_ast]}, context}
+
+          :no ->
+            target_type = Map.get(node["value"], "_type")
+
+            raise UnsupportedNodeError,
+              node_type: "Attribute",
+              hint:
+                "attribute access on a non-stdlib value (`<#{target_type}>.#{attr}`) is not supported (known stdlib modules: #{Enum.join(Stdlib.names(), ", ")})",
+              lineno: Map.get(node, "lineno"),
+              col_offset: Map.get(node, "col_offset")
+        end
     end
   end
+
 
   def convert(%{"_type" => "Return"} = node, context) do
     case context.return_mode do
@@ -906,6 +918,24 @@ defmodule Pylixir.Converter do
   defp single_starred_args([%{"_type" => "Starred", "value" => v}]), do: {:ok, v}
   defp single_starred_args(_), do: :no
 
+  # Match `type(x).__name__` precisely: Attribute(value=Call(func=Name("type"),
+  # args=[x], no kwargs/star), attr="__name__"). The shape that comes up in
+  # real code; anything else (`type(x).__mro__`, `obj.__class__.__name__`, ...)
+  # still raises so the failure is loud.
+  defp detect_type_name_access(%{
+         "_type" => "Attribute",
+         "attr" => "__name__",
+         "value" => %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => "type"},
+           "args" => [arg],
+           "keywords" => []
+         }
+       }),
+       do: {:ok, arg}
+
+  defp detect_type_name_access(_), do: :no
+
   # `zip(*xs)` is the only builtin that has a list-form lowering matching
   # Python's star-unpack semantics — `Enum.zip(xs)` already iterates a
   # list-of-iters in lockstep, same as `zip(*xs)`. For other in-scope
@@ -914,6 +944,19 @@ defmodule Pylixir.Converter do
   defp emit_starred_call("zip", star_node, _node, context) do
     {arg_ast, context} = convert(star_node, context)
     {{{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [arg_ast]}, context}
+  end
+
+  # `print(*xs[, sep=..., end=...])` — unpack and print. Routes to
+  # `py_print_iter/3` (sep, end_), which py_str's each elem, joins
+  # with sep, and appends end_ via IO.write. Defaults match Python:
+  # sep=" ", end="\n". Mixed positional+star forms aren't handled
+  # here (the call-site requires a single Starred arg).
+  defp emit_starred_call("print", star_node, node, context) do
+    {arg_ast, context} = convert(star_node, context)
+    {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+    sep_ast = Map.get(kwargs, "sep", " ")
+    end_ast = Map.get(kwargs, "end", "\n")
+    {{:py_print_iter, [], [arg_ast, sep_ast, end_ast]}, context}
   end
 
   defp emit_starred_call(id, star_node, node, context) do
