@@ -34,6 +34,7 @@ defmodule Mix.Tasks.Eval.Diag do
     unless File.exists?(file), do: Mix.raise("file not found: #{file}")
 
     Mix.Task.run("app.start")
+    Eval.CompilePool.ensure_started()
 
     source = File.read!(file)
     elixir_src = transpile_or_die(source)

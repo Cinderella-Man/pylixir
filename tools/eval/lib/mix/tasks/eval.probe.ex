@@ -52,6 +52,7 @@ defmodule Mix.Tasks.Eval.Probe do
     unless File.exists?(file), do: Mix.raise("file not found: #{file}")
 
     Mix.Task.run("app.start")
+    Eval.CompilePool.ensure_started()
     # ExUnit.CaptureIO is the cleanest stdout capture available without
     # spawning a sub-OS-process. ExUnit ships with Elixir; we just have
     # to start it once (autorun: false so it doesn't try to run tests).

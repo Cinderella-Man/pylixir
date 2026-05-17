@@ -25,13 +25,17 @@ defmodule Eval.Compile do
 
   @spec check(String.t()) :: result()
   def check(source) when is_binary(source) do
-    unique_alias = :"TranslatedCode_#{:erlang.unique_integer([:positive])}"
+    Eval.CompilePool.with_slot(fn alias_atom ->
+      compile_with_alias(source, alias_atom)
+    end)
+  end
 
+  defp compile_with_alias(source, alias_atom) do
     {compile_outcome, diagnostics} =
       Code.with_diagnostics(fn ->
         try do
           parsed = Code.string_to_quoted!(source)
-          defmodule_ast = parsed |> extract_defmodule() |> rewrite_alias(unique_alias)
+          defmodule_ast = parsed |> extract_defmodule() |> rewrite_alias(alias_atom)
           Code.compile_quoted(defmodule_ast)
           :ok
         rescue
@@ -39,20 +43,18 @@ defmodule Eval.Compile do
         end
       end)
 
-    # `Code.compile_quoted` loads the module as "current". To actually
-    # reclaim its export-table slots we have to BOTH (a) demote it to
-    # "old" via `:code.delete/1` and THEN (b) free the old version via
+    # `Code.compile_quoted` loads the module as "current". To reclaim
+    # its export-table slots we (a) demote it to "old" via
+    # `:code.delete/1` and (b) free the old version via
     # `:code.purge/1` — the docs require this exact order.
     #
-    # Earlier attempts had purge BEFORE delete: `purge` returned false
-    # (no old version yet, since the compile just loaded current) and
-    # `delete` then moved current → old with no follow-up purge, so
-    # each call left an undeletable "old" copy. With unique aliases
-    # per call (chosen to avoid races between concurrent workers),
-    # nothing ever purged those olds, and the BEAM crashed at ~3525
-    # samples with:
-    #   "no more index entries in export_staged_index (max=524288)"
-    module = Module.concat(Elixir, unique_alias)
+    # `Eval.CompilePool` guarantees `alias_atom` is owned by this
+    # process for the duration of this call, so the next compile of
+    # the same alias *replaces* this one cleanly without racing.
+    # That's what keeps `export_staged_index` bounded across long
+    # runs; the earlier `unique_integer`-per-call design grew the
+    # index by ~330 entries per sample and crashed at ~3500.
+    module = Module.concat(Elixir, alias_atom)
     :code.delete(module)
     :code.purge(module)
 

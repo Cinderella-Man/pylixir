@@ -56,6 +56,7 @@ defmodule Mix.Tasks.Eval.Run do
     {opts, _rest} = OptionParser.parse!(argv, strict: @switches)
 
     Mix.Task.run("app.start")
+    Eval.CompilePool.ensure_started()
 
     eval_opts =
       opts
