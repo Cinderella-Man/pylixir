@@ -49,7 +49,7 @@ defmodule Pylixir.ModuleAnalysis do
             runtime_statements: [],
             known_functions: MapSet.new()
 
-  @mutation_methods ~w(append sort update add discard clear pop remove extend insert reverse)
+  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse)
 
   @doc """
   Analyse a Python `Module.body` list. Returns a fully-populated
@@ -357,8 +357,9 @@ defmodule Pylixir.ModuleAnalysis do
     end)
   end
 
-  defp mutates_name?(%{"_type" => "Assign", "targets" => targets}, name) do
-    Enum.any?(targets, &target_mentions?(&1, name))
+  defp mutates_name?(%{"_type" => "Assign", "targets" => targets, "value" => value}, name) do
+    Enum.any?(targets, &target_mentions?(&1, name)) or
+      capture_return_mutates?(value, name)
   end
 
   defp mutates_name?(%{"_type" => "AugAssign", "target" => target}, name) do
@@ -443,6 +444,27 @@ defmodule Pylixir.ModuleAnalysis do
        do: target_name == name
 
   defp mutates_name?(_, _), do: false
+
+  # `x = coll.pop()` / `a, b = coll.pop()` — Converter's `single_target_assign`
+  # rebinds `coll` via `{popped, coll} = py_pop_*(coll, ...)`. Mirror the
+  # mutation tracking so a top-level `coll = [...]` won't be promoted to
+  # `@var_coll` (module attrs can't be re-bound). Same shape covers
+  # `popleft` (cons-pattern destructure rebinds the tail).
+  defp capture_return_mutates?(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => coll},
+             "attr" => method
+           }
+         },
+         name
+       )
+       when method in ["pop", "popleft"],
+       do: coll == name
+
+  defp capture_return_mutates?(_, _), do: false
 
   defp aug_target_root_name(%{"_type" => "Name", "id" => id}), do: id
 

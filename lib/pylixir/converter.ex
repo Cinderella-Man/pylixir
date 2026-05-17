@@ -554,6 +554,13 @@ defmodule Pylixir.Converter do
     {{:=, [], [heap_ref, {:py_heapify, [], [heap_ref]}]}, context}
   end
 
+  # `.pop()` family RHS — picks the right runtime helper based on arity.
+  # 0 args → last element / KeyError on dict (we use py_pop_last for lists);
+  # 1 arg  → index for lists, key for dicts; 2 args → key + default for dicts.
+  defp pop_call_rhs(coll_ref, []), do: {:py_pop_last, [], [coll_ref]}
+  defp pop_call_rhs(coll_ref, [a]), do: {:py_pop_at, [], [coll_ref, a]}
+  defp pop_call_rhs(coll_ref, [a, b]), do: {:py_pop_at_default, [], [coll_ref, a, b]}
+
   # --- Operator emission -------------------------------------------------
 
   defp unary_op_ast(%{"_type" => "UAdd"}, operand_ast, _node), do: operand_ast
@@ -624,6 +631,81 @@ defmodule Pylixir.Converter do
   end
 
   # --- Assign target dispatch -------------------------------------------
+
+  # `x = coll.pop()` / `x = coll.pop(idx_or_key)` / `.pop(key, default)`
+  # — Python's mutating capture-and-return pop. Lowers to a
+  # `{popped, coll} = py_pop_<…>(coll, …)` destructure-match so the
+  # collection is rebound in one shot. py_pop_* branch on container
+  # type at runtime: list (index-based) vs dict (key-based).
+  defp single_target_assign(
+         %{"_type" => "Name", "id" => id},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => coll_id},
+             "attr" => "pop"
+           },
+           "args" => args
+         },
+         _node,
+         context
+       )
+       when length(args) <= 2 do
+    {arg_asts, context} = Enum.map_reduce(args, context, &convert/2)
+    context = bind_name(context, id)
+    context = bind_name(context, coll_id)
+    head_atom = id |> Naming.rewrite() |> String.to_atom()
+    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
+    head_ref = {head_atom, [], nil}
+    coll_ref = {coll_atom, [], nil}
+    rhs = pop_call_rhs(coll_ref, arg_asts)
+    {{:=, [], [{head_ref, coll_ref}, rhs]}, context}
+  end
+
+  # Tuple-destructure variant: `a, b = coll.pop()` — the popped value
+  # is itself a tuple, so the head pattern destructures further.
+  defp single_target_assign(
+         %{"_type" => "Tuple", "elts" => elts},
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => coll_id},
+             "attr" => "pop"
+           },
+           "args" => args
+         },
+         _node,
+         context
+       )
+       when length(args) <= 2 do
+    Enum.each(elts, fn
+      %{"_type" => "Name"} ->
+        :ok
+
+      other ->
+        raise UnsupportedNodeError,
+          node_type: "Assign",
+          hint:
+            "tuple-destructure of `.pop()` requires Name elements; got `#{Map.get(other, "_type")}`"
+    end)
+
+    {arg_asts, context} = Enum.map_reduce(args, context, &convert/2)
+    context = bind_tuple_names!(elts, context)
+    context = bind_name(context, coll_id)
+
+    refs =
+      Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
+        {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+      end)
+
+    head_pattern = tuple_pattern(refs)
+    coll_atom = coll_id |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+    rhs = pop_call_rhs(coll_ref, arg_asts)
+    {{:=, [], [{head_pattern, coll_ref}, rhs]}, context}
+  end
 
   # `x = q.popleft()` — Python's deque.popleft returns the leftmost
   # element AND removes it. Pylixir's deque-as-list rep lowers to a

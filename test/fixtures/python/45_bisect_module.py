@@ -13,5 +13,11 @@ print(bisect.bisect_right(sorted_list, 5))  # 3 (rightmost)
 print(bisect.bisect_left(sorted_list, 0))   # 0
 print(bisect.bisect_left(sorted_list, 100)) # 5
 
-# `bisect` is alias for `bisect_left`.
-print(bisect.bisect(sorted_list, 6))        # 3
+# `bisect` is alias for `bisect_right` (Python docs §10.2).
+print(bisect.bisect(sorted_list, 6))        # 3 (6 not present, _left and _right agree)
+print(bisect.bisect(sorted_list, 5))        # 3 (bisect_right past the existing 5)
+
+# 4-arg form: search restricted to `[lo, hi)`.
+ext = [1, 3, 5, 7, 9, 11, 13]
+print(bisect.bisect_left(ext, 7, 2, 5))     # 3 (search inside ext[2:5])
+print(bisect.bisect_right(ext, 7, 2, 5))    # 4

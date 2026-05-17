@@ -21,7 +21,7 @@ defmodule Pylixir.Nodes.Mutations do
 
   alias Pylixir.{Converter, Naming, UnsupportedNodeError}
 
-  @methods ~w(append sort reverse insert extend remove clear pop add discard update)
+  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update)
 
   @doc """
   Classify a Python `Expr.value` node. Returns `:none`, a `{:name, …}`
@@ -189,6 +189,12 @@ defmodule Pylixir.Nodes.Mutations do
     {{:., [], [{:__aliases__, [], [:Kernel]}, :elem]}, [],
      [{{:., [], [{:__aliases__, [], [:List]}, :pop_at]}, [], [target, i]}, 1]}
   end
+
+  # Statement-context `q.popleft()` — drop the head, keep the tail.
+  # Pylixir's deque rep is a plain list, so `tl/1` matches Python's
+  # O(1) deque-popleft semantically (FunctionClauseError on empty
+  # mirrors Python's IndexError closely enough for our purposes).
+  defp mutation_rhs("popleft", target, [], _kw, _node), do: {:tl, [], [target]}
 
   defp mutation_rhs("add", target, [x], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :put]}, [], [target, x]}

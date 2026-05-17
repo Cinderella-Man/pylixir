@@ -29,12 +29,21 @@ defmodule Pylixir.Stdlib.Bisect do
   def call(["bisect_left"], [a, x], _kwargs, _node),
     do: {:ok, {:py_bisect_left, [], [a, x]}}
 
-  # Python's `bisect.bisect` is an alias for `bisect_left`.
+  def call(["bisect_left"], [a, x, lo, hi], _kwargs, _node),
+    do: {:ok, {:py_bisect_left, [], [a, x, lo, hi]}}
+
+  # Python's `bisect.bisect` is an alias for `bisect_right`.
   def call(["bisect"], [a, x], _kwargs, _node),
-    do: {:ok, {:py_bisect_left, [], [a, x]}}
+    do: {:ok, {:py_bisect_right, [], [a, x]}}
+
+  def call(["bisect"], [a, x, lo, hi], _kwargs, _node),
+    do: {:ok, {:py_bisect_right, [], [a, x, lo, hi]}}
 
   def call(["bisect_right"], [a, x], _kwargs, _node),
     do: {:ok, {:py_bisect_right, [], [a, x]}}
+
+  def call(["bisect_right"], [a, x, lo, hi], _kwargs, _node),
+    do: {:ok, {:py_bisect_right, [], [a, x, lo, hi]}}
 
   def call(_path, _args, _kwargs, _node), do: :no_clause
 end

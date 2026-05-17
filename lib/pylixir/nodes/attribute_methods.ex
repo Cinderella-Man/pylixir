@@ -48,7 +48,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # exact equivalents. Same ducktyping caveat: non-MapSet targets
   # crash at runtime.
   @set_methods ~w(union intersection difference symmetric_difference
-                  issubset issuperset isdisjoint)
+                  issubset issuperset isdisjoint pop)
 
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
@@ -69,6 +69,13 @@ defmodule Pylixir.Nodes.AttributeMethods do
     do: {:py_int_bit_length, [], [target]}
 
   # --- Set methods (Python set / frozenset → Elixir MapSet) -------------
+
+  # `(expr).pop()` — expression-receiver form, no rebind possible
+  # (e.g. `(s1 - s2).pop()` or `seen.pop()` inside another expression).
+  # Lowers to `py_pop_any/1` (set: arbitrary element; list: last).
+  # Bare-Name `s.pop()` is handled earlier as a capture-return rebind
+  # (Converter's `single_target_assign`) — this clause is the fallback.
+  defp do_dispatch("pop", target, [], _kw, _node), do: {:py_pop_any, [], [target]}
 
   defp do_dispatch("union", target, [other], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :union]}, [], [target, other]}

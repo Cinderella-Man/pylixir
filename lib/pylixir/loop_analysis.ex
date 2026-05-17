@@ -41,7 +41,7 @@ defmodule Pylixir.LoopAnalysis do
   # LoopAnalysis tracks something Mutations doesn't rewrite (or vice
   # versa); the helpers-linkage spirit applies to behavioural pairs
   # like this, but we don't have a programmatic check yet.
-  @mutation_methods ~w(append sort update add discard clear pop remove extend insert reverse)
+  @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse)
 
   @type t :: %__MODULE__{
           assigned_vars: MapSet.t(String.t()),
@@ -76,8 +76,27 @@ defmodule Pylixir.LoopAnalysis do
   defp names_referenced_in(%{"_type" => "Name", "id" => id}), do: MapSet.new([id])
   defp names_referenced_in(_), do: MapSet.new()
 
-  defp names_assigned_in(%{"_type" => "Assign", "targets" => targets}) do
-    targets |> Enum.flat_map(&target_names/1) |> MapSet.new()
+  defp names_assigned_in(%{"_type" => "Assign", "targets" => targets, "value" => value}) do
+    target_set = targets |> Enum.flat_map(&target_names/1) |> MapSet.new()
+
+    # `x = coll.pop()` rebinds `coll` as a side effect (see Converter's
+    # `single_target_assign` capture-return clauses). Mirror that here so
+    # loop/if state-tuples thread `coll` out.
+    case value do
+      %{
+        "_type" => "Call",
+        "func" => %{
+          "_type" => "Attribute",
+          "value" => %{"_type" => "Name", "id" => coll},
+          "attr" => method
+        }
+      }
+      when method in ["pop", "popleft"] ->
+        MapSet.put(target_set, coll)
+
+      _ ->
+        target_set
+    end
   end
 
   defp names_assigned_in(%{"_type" => "AugAssign", "target" => target}) do

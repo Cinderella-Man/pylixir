@@ -12,12 +12,12 @@ defmodule Pylixir.Stdlib.BisectTest do
                {:ok, {:py_bisect_left, [], [a_ast, x_ast]}}
     end
 
-    test "bisect (no suffix) is an alias for bisect_left" do
+    test "bisect (no suffix) is an alias for bisect_right (per Python docs §10.2)" do
       a_ast = {:a, [], nil}
       x_ast = {:x, [], nil}
 
       assert Bisect.call(["bisect"], [a_ast, x_ast], %{}, %{}) ==
-               {:ok, {:py_bisect_left, [], [a_ast, x_ast]}}
+               {:ok, {:py_bisect_right, [], [a_ast, x_ast]}}
     end
 
     test "bisect_right routes to py_bisect_right helper" do

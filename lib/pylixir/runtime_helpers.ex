@@ -61,6 +61,8 @@ defmodule Pylixir.RuntimeHelpers do
   # RFC §6.11 — booleans coerce to ints in arithmetic.
   def py_sub(a, b) when is_boolean(a), do: py_sub(py_bool_to_int(a), b)
   def py_sub(a, b) when is_boolean(b), do: py_sub(a, py_bool_to_int(b))
+  # Python: `set - set` is set difference. Pylixir's set rep is MapSet.
+  def py_sub(%MapSet{} = a, %MapSet{} = b), do: MapSet.difference(a, b)
   def py_sub(a, b), do: a - b
 
   def py_div(a, b) when is_boolean(a), do: py_div(py_bool_to_int(a), b)
@@ -95,6 +97,32 @@ defmodule Pylixir.RuntimeHelpers do
     do: Integer.pow(base, exp)
 
   def py_pow(base, exp), do: :math.pow(base, exp)
+
+  # Python's `set.pop()` / `(expr).pop()` — pop an arbitrary element
+  # from a set, or the last from a list. Used when the receiver is an
+  # expression (not a bare Name) and there's nothing to rebind, e.g.
+  # `(s1 - s2).pop()`. Returns just the popped value (the remaining
+  # collection is discarded). Python's set pop is documented as
+  # arbitrary order; we pick the first via MapSet.to_list.
+  def py_pop_any(%MapSet{} = s), do: MapSet.to_list(s) |> hd()
+  def py_pop_any(list) when is_list(list), do: List.last(list)
+
+  # Python's `list.pop()` / `dict.pop(key[, default])` capture-return form.
+  # Returned tuple is `{popped_value, new_collection}` — caller destructures.
+  # Polymorphic on list (index-based) vs map (key-based); branches at runtime
+  # because the static converter doesn't know the container type.
+  def py_pop_last(list) when is_list(list), do: List.pop_at(list, -1)
+
+  def py_pop_at(list, idx) when is_list(list), do: List.pop_at(list, idx)
+
+  def py_pop_at(map, key) when is_map(map) and not is_struct(map),
+    do: Map.pop(map, key)
+
+  def py_pop_at_default(map, key, default) when is_map(map) and not is_struct(map),
+    do: Map.pop(map, key, default)
+
+  def py_pop_at_default(list, idx, _default) when is_list(list),
+    do: List.pop_at(list, idx)
 
   # Python's 3-arg `pow(base, exp, mod)` — modular exponentiation.
   # Uses Erlang's :crypto.mod_pow (square-and-multiply, suitable for
@@ -385,6 +413,30 @@ defmodule Pylixir.RuntimeHelpers do
     with_h ++ without_h
   end
 
+  # Python's `itertools.permutations(iter)` — all orderings of the input.
+  # `itertools.permutations(iter, r)` — r-length permutations.
+  # Returns lists (same convention as py_combinations). Output order
+  # matches CPython: lexicographic over the input's positional indices.
+  def py_permutations(enum) do
+    list = if is_list(enum), do: enum, else: Enum.to_list(enum)
+    py_permutations(list, length(list))
+  end
+
+  def py_permutations(enum, r) when is_integer(r) and r >= 0 do
+    list = if is_list(enum), do: enum, else: Enum.to_list(enum)
+    py_permutations_inner(list, r)
+  end
+
+  def py_permutations_inner(_, 0), do: [[]]
+  def py_permutations_inner([], _), do: []
+
+  def py_permutations_inner(list, r) do
+    Enum.flat_map(Enum.with_index(list), fn {h, i} ->
+      rest = List.delete_at(list, i)
+      Enum.map(py_permutations_inner(rest, r - 1), &[h | &1])
+    end)
+  end
+
   # === Bisect (sorted-list insertion-point search) ===
 
   # Mirrors Python's `bisect.bisect_left(a, x)` — index where `x` should
@@ -399,6 +451,18 @@ defmodule Pylixir.RuntimeHelpers do
   # for equal values.
   def py_bisect_right(list, x) when is_list(list) do
     Enum.find_index(list, fn v -> v > x end) || length(list)
+  end
+
+  # 4-arg form: `bisect.bisect_left(a, x, lo, hi)` — search restricted
+  # to `[lo, hi)`. Implemented by slicing then offsetting the result.
+  def py_bisect_left(list, x, lo, hi) when is_list(list) do
+    slice = Enum.slice(list, lo, hi - lo)
+    lo + py_bisect_left(slice, x)
+  end
+
+  def py_bisect_right(list, x, lo, hi) when is_list(list) do
+    slice = Enum.slice(list, lo, hi - lo)
+    lo + py_bisect_right(slice, x)
   end
 
   # === Integer methods ===

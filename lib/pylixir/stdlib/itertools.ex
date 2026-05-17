@@ -23,5 +23,11 @@ defmodule Pylixir.Stdlib.Itertools do
   def call(["combinations"], [iter, r], _kwargs, _node),
     do: {:ok, {:py_combinations, [], [iter, r]}}
 
+  def call(["permutations"], [iter], _kwargs, _node),
+    do: {:ok, {:py_permutations, [], [iter]}}
+
+  def call(["permutations"], [iter, r], _kwargs, _node),
+    do: {:ok, {:py_permutations, [], [iter, r]}}
+
   def call(_path, _args, _kwargs, _node), do: :no_clause
 end
