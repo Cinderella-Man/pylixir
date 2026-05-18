@@ -20,6 +20,7 @@ defmodule Pylixir.Converter do
     LoopAnalysis,
     Lowering,
     ModuleAnalysis,
+    MutableModuleDict,
     Naming,
     Nodes,
     Stdlib,
@@ -766,7 +767,7 @@ defmodule Pylixir.Converter do
     # intrusive than current scope permits).
     body_context =
       case orelse do
-        [] -> apply_isinstance_narrowing(test, context)
+        [] -> TypeInfer.IsinstanceNarrowing.narrow(test, context)
         _ -> context
       end
 
@@ -885,7 +886,7 @@ defmodule Pylixir.Converter do
         # initial `name = {…}` Assign at module-runtime position
         # writes to the same key (see `aug_or_subscript_assign`'s
         # mutable-dict branch).
-        {process_dict_get(id), context}
+        {MutableModuleDict.get_ast(id), context}
 
       MapSet.member?(context.module_attrs, id) ->
         attr_name = String.to_atom("var_" <> id)
@@ -1431,9 +1432,9 @@ defmodule Pylixir.Converter do
         # time`). Read+combine+write through process dict so the
         # mutation persists in any caller's view.
         {value_ast, context} = convert(value, context)
-        old = process_dict_get(id)
+        old = MutableModuleDict.get_ast(id)
         combined = bin_op_ast(op, old, value_ast, node)
-        {process_dict_put_ast(id, combined), context}
+        {MutableModuleDict.put_ast(id, combined), context}
 
       true ->
         synthetic_binop = %{
@@ -2564,52 +2565,10 @@ defmodule Pylixir.Converter do
     String.to_atom("__cls_" <> class_name <> "_" <> method_name)
   end
 
-  # PR 12 — recognize `isinstance(x, T)` and `isinstance(x, (T1, T2, …))`
-  # in If-test position and narrow the lattice type of `x` to the
-  # matched class(es). Returns the (possibly updated) context.
+  # PR 12 isinstance narrowing lives in
+  # `Pylixir.TypeInfer.IsinstanceNarrowing`. The If clause above
+  # delegates via `TypeInfer.IsinstanceNarrowing.narrow/2`.
 
-  defp apply_isinstance_narrowing(
-         %{
-           "_type" => "Call",
-           "func" => %{"_type" => "Name", "id" => "isinstance"},
-           "args" => [%{"_type" => "Name", "id" => var_name}, type_spec]
-         },
-         context
-       ) do
-    case lattice_of_isinstance_spec(type_spec) do
-      :any -> context
-      lattice -> TypeInfer.bind(context, var_name, lattice)
-    end
-  end
-
-  defp apply_isinstance_narrowing(_test, context), do: context
-
-  defp lattice_of_isinstance_spec(%{"_type" => "Name", "id" => name}) do
-    case name do
-      "int" -> {:int}
-      "float" -> {:float}
-      "str" -> {:str}
-      "bool" -> {:bool}
-      "list" -> {:list, :any}
-      "dict" -> {:dict, :any, :any}
-      "set" -> {:set}
-      "frozenset" -> {:set}
-      "tuple" -> {:tuple, :any_arity}
-      _ -> :any
-    end
-  end
-
-  defp lattice_of_isinstance_spec(%{"_type" => "Tuple", "elts" => elts}) do
-    elts
-    |> Enum.map(&lattice_of_isinstance_spec/1)
-    |> Enum.reduce(:bottom, fn t, acc -> TypeInfer.lub(acc, t) end)
-    |> case do
-      :bottom -> :any
-      t -> t
-    end
-  end
-
-  defp lattice_of_isinstance_spec(_), do: :any
 
   defp seed_module_attr_types(attrs, context) do
     Enum.reduce(attrs, context, fn {name, value_node}, ctx ->
@@ -2655,26 +2614,10 @@ defmodule Pylixir.Converter do
   defp moduledoc_ast(nil), do: []
   defp moduledoc_ast(doc) when is_binary(doc), do: [{:@, [], [{:moduledoc, [], [doc]}]}]
 
-  # `Process.put({:pylixir_mod, name}, value)` and
-  # `Process.get({:pylixir_mod, name})` — the lowering shape for
-  # module-level mutable dicts (`memo = {}` + `memo[k] = v` inside a
-  # def). The `:pylixir_mod` tag namespaces the key away from any
-  # process dict slot the user's own code might touch.
-  defp process_dict_get(name) do
-    key = {:{}, [], [:pylixir_mod, name]}
-    {{:., [], [{:__aliases__, [], [:Process]}, :get]}, [], [key]}
-  end
-
-  @doc false
-  @spec process_dict_get_ast(String.t()) :: Macro.t()
-  def process_dict_get_ast(name), do: process_dict_get(name)
-
-  @doc false
-  @spec process_dict_put_ast(String.t(), Macro.t()) :: Macro.t()
-  def process_dict_put_ast(name, value_ast) do
-    key = {:{}, [], [:pylixir_mod, name]}
-    {{:., [], [{:__aliases__, [], [:Process]}, :put]}, [], [key, value_ast]}
-  end
+  # Mutable-module-dict process-dict reads/writes live in
+  # `Pylixir.MutableModuleDict`. Callers across Converter and
+  # `Pylixir.Nodes.Assign` go through `MutableModuleDict.get_ast/1`
+  # and `MutableModuleDict.put_ast/2`.
 
   defp py_main_def([]) do
     {:def, [], [{:py_main, [], nil}, [do: nil]]}

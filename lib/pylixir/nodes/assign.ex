@@ -22,7 +22,7 @@ defmodule Pylixir.Nodes.Assign do
   `Pylixir.Converter` and are called back into here.
   """
 
-  alias Pylixir.{Converter, Naming, TypeInfer, UnsupportedNodeError}
+  alias Pylixir.{Converter, MutableModuleDict, Naming, TypeInfer, UnsupportedNodeError}
   alias Pylixir.AST.Trivial
 
   @spec assign(map(), Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
@@ -346,9 +346,9 @@ defmodule Pylixir.Nodes.Assign do
         # and crash loudly if it ever fires.
         {value_ast, context} = Converter.convert(value, context)
         {slice_ast, context} = Converter.convert(slice, context)
-        get = Pylixir.Converter.process_dict_get_ast(coll_id)
+        get = MutableModuleDict.get_ast(coll_id)
         setitem = {:py_setitem, [], [get, slice_ast, value_ast]}
-        {Pylixir.Converter.process_dict_put_ast(coll_id, setitem), context}
+        {MutableModuleDict.put_ast(coll_id, setitem), context}
 
       true ->
         case slice do
@@ -409,7 +409,7 @@ defmodule Pylixir.Nodes.Assign do
     # Python's `global` semantics for this restricted shape.
     if MapSet.member?(context.mutable_module_dicts, id) do
       {value_ast, context} = Converter.convert(value, context)
-      {Pylixir.Converter.process_dict_put_ast(id, value_ast), context}
+      {MutableModuleDict.put_ast(id, value_ast), context}
     else
       # `x = obj.method(args)` where method is a known mutating class
       # method returns `{value, updated_self}` — destructure into both.

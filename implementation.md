@@ -173,6 +173,12 @@ lib/pylixir/
 │   └── mutations.ex          # statement-context `.append`/`.sort`/…
 ├── lowering.ex               # shared {:ok|:error|:no_clause} dispatch helper
 ├── control_flow.ex           # throw/catch shapes (return/break/continue/exit)
+├── mutable_module_dict.ex    # Process.get/put adapter for module-level mutable bindings
+├── type_infer.ex             # lattice, infer_expr/2, bind/demote, heap-typing
+├── type_infer/
+│   ├── builtin_signatures.ex # return-type tables for Python builtins/methods + HOF arg recovery
+│   ├── signatures.ex         # bounded fixed-point pass producing Context.fn_signatures
+│   └── isinstance_narrowing.ex # `if isinstance(x, T):` → narrowed ctx.types[x]
 ├── ast/
 │   ├── walk.ex               # scope-aware pre-order traversal
 │   ├── trivial.ex            # "safe to duplicate?" predicate
@@ -329,14 +335,26 @@ Elixir — it's `if truthy?(x) do`.
 
 `truthy?/1` is a runtime helper with clauses for every Python-falsy
 shape. `Pylixir.Converter.convert_test/2` wraps every test expression
-in `truthy?(…)`. The optimisation: `Pylixir.AST.BoolReturning` is a
-predicate identifying expressions that *provably* already lower to a
-boolean (currently only `Compare` nodes). When it returns true, the
-wrap is skipped.
+in `truthy?(…)`. Two short-circuits skip the wrap:
 
-False-positives in that predicate would silently miscompile Python's
+1. **AST-shape**: `Pylixir.AST.BoolReturning` recognises `Compare`
+   nodes — they always lower to a boolean regardless of operand types.
+2. **Type-aware** (S1): `Pylixir.TypeInfer.infer_expr/2` reports the
+   inferred lattice type of the test; if it's exactly `{:bool}`, the
+   wrap drops. Catches `BoolOp` of two `is_X?` calls, `isinstance` /
+   `callable` / `hasattr` / `issubclass` (all return `{:bool}` per
+   `TypeInfer.BuiltinSignatures`), and `Name` references bound from a
+   typed expression. Soundness: union types containing `{:bool}` stay
+   wrapped — Python's `0-is-falsy` semantics would diverge.
+
+`Constant`-boolean tests (`while True:`) deliberately keep the wrap
+even though they're trivially `{:bool}` — emitting bare `true` as a
+`cond` clause head triggers Elixir's "this clause in cond will always
+match" warning when paired with the while-emitter's fallback clause.
+
+False-positives in either path would silently miscompile Python's
 semantics; false-negatives are just verbose. Hence the conservative
-ruleset.
+rulesets.
 
 ### 3. Python's single-evaluation semantics
 
@@ -355,6 +373,97 @@ collide.
 
 Same predicate-asymmetry as truthiness: false-positives miscompile;
 false-negatives are merely verbose.
+
+---
+
+## Type inference (`Pylixir.TypeInfer`)
+
+A static type-inference pass threads through conversion to monomorphise
+runtime helpers when types are statically knowable. Three submodules
+under `Pylixir.TypeInfer`; the main module owns the lattice and walker.
+
+### The lattice
+
+```
+:any | :bottom | {:int} | {:int_lit_nonneg} | {:float} | {:bool}
+     | {:str} | {:none} | {:list, t} | {:tuple, [t] | :any_arity}
+     | {:dict, t, t} | {:set} | {:union, MapSet.t(t)}
+```
+
+`{:int_lit_nonneg}` is a refinement subtype of `{:int}` used only by
+the `String.duplicate("x", n) / List.duplicate(xs, n)` specialisations
+— Python's `"x" * -1 == ""` but Elixir's would raise. `lub/2` joins
+types via a numeric-tower-aware rule (int + float → float) with bool
+deliberately *not* folded in (Python's `True + 1 == 2` but Elixir's
+`true + 1` raises).
+
+`:bottom` is the internal "no information yet" identity; the public
+`TypeInfer.demote_bottom/1` converts it to `:any` so consumers never
+see `:bottom`.
+
+### The walker (`infer_expr/2`)
+
+Read-only walk over the Python AST. Returns the inferred lattice
+type of the node. Never mutates `Context`. Routes Call nodes to
+`TypeInfer.BuiltinSignatures.return_type/3` (for builtin-name calls)
+or `BuiltinSignatures.method_return_type/1` (for attribute-method
+calls).
+
+Mutation (`bind`, `bind_pattern`, `demote`) happens at the *conversion
+clause that follows the inference* — e.g. the `Assign` node module
+calls `TypeInfer.bind_pattern/3` after `infer_expr/2` on the RHS. The
+read-only/mutating split keeps the inference walker reasoning local.
+
+### The fixed point (`Pylixir.TypeInfer.Signatures`)
+
+Once before per-statement conversion, `Signatures.infer/3` runs a
+bounded fixed-point pass (≤5 rounds) over top-level user `def`s to
+populate `Context.fn_signatures` with `{param_types, return_type}`.
+External call sites pin param types via `lub`; recursive in-body
+self-calls contribute `:bottom` (excluded from the lub) so iteration
+actually converges. Each round overrides the in-flight function's
+signature to `{params, :bottom}` so its recursive calls return
+`:bottom` (which lubs cleanly with the base-case return type).
+
+### Static knowledge (`Pylixir.TypeInfer.BuiltinSignatures`)
+
+Two hardcoded lookup tables — Python builtin name → return type
+(`len → {:int_lit_nonneg}`, `range → {:list, {:int}}`,
+`isinstance → {:bool}`) and Python method name → return type
+(`.startswith → {:bool}`, `.split → {:list, {:str}}`). Plus
+`function_return_type/2`, which recovers a function-valued AST node's
+return type for HOF stdlib inference (`map(f, xs) →
+{:list, function_return_type(f)}` when `f` is a typed `Name` or a
+`Lambda`).
+
+### Branch narrowing (`Pylixir.TypeInfer.IsinstanceNarrowing`)
+
+`if isinstance(x, T):` narrows `ctx.types[x]` to `T`'s lattice type
+inside the body branch. Recognises bare `Name("int" | "str" | …)`
+specs and `Tuple` specs (lub of per-element types — Python's
+`isinstance(x, (int, str))`). Called from `Pylixir.Converter`'s
+`If` clause.
+
+### Specialisation sites
+
+The inferred types are consumed at emit sites that have both a
+specialised AST shape (when types are known) and a polymorphic
+fallback (when they're `:any`):
+
+- `Pylixir.Converter.bin_op_ast/6` — `int+int → Kernel.+`,
+  `str+str → Kernel.<>`, `list+list → Kernel.++`, etc.
+- `Pylixir.Nodes.Compare.pair_ast/5` — `x in [list]` → `Kernel.in/2`,
+  `x in MapSet` → `MapSet.member?`, etc.
+- `Pylixir.Builtins.emit/4` — typed `len/int/str/bool`, `print` arg
+  formatting, container constructors.
+- `Pylixir.Nodes.FString` — drop `py_str` for `{:str}` segments,
+  emit `Integer.to_string` for `{:int}`.
+- Iter-consumer sites (`for`, `sorted`, `map`, `filter`, …) — drop
+  `py_iter_to_list` wrapping when the iterable is statically a list.
+
+See `docs/02_type-inference-monomorphization.md` for the full design,
+PRs S0–S5 and T6–T8 for the rollout, and `docs/03_helper-preamble-slimming.md`
+for the follow-on slimming work.
 
 ---
 
