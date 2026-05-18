@@ -2126,11 +2126,19 @@ defmodule Pylixir.Converter do
     # Soundness: only exact `{:bool}` elides. Unions even containing
     # `{:bool}` keep the wrap — Python's `0 is falsy` vs Elixir's
     # `only false/nil are falsy` would diverge for bool/int union.
+    #
+    # Constants short-circuit through `truthy?`: emitting bare `true` /
+    # `false` as a `cond` clause-head triggers Elixir's
+    # `this clause in cond will always match` warning (the while-loop
+    # emitter pairs the test with a `true -> fallback` clause, which
+    # becomes a duplicate). Wrapping in `truthy?(true)` keeps the test
+    # opaque to the compile-time clause-matching analysis.
     inferred_type = TypeInfer.infer_expr(test_node, context)
     {test_ast, context} = convert(test_node, context)
 
     wrapped =
       cond do
+        constant_bool_node?(test_node) -> {:truthy?, [], [test_ast]}
         inferred_type == {:bool} -> test_ast
         BoolReturning.bool_returning?(test_node) -> test_ast
         true -> {:truthy?, [], [test_ast]}
@@ -2138,6 +2146,9 @@ defmodule Pylixir.Converter do
 
     {wrapped, context}
   end
+
+  defp constant_bool_node?(%{"_type" => "Constant", "value" => v}) when is_boolean(v), do: true
+  defp constant_bool_node?(_), do: false
 
   @doc false
   def body_to_block([]), do: nil
