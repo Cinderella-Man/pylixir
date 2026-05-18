@@ -86,6 +86,20 @@ defmodule Pylixir.SlimmingTest do
       max_lines: 20,
       stdout:
         "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n"
+    },
+    "11_pow_int_specialised.py" => %{
+      # Three Pow specialisations all need to fire:
+      #   * `pow(2, 10)` and `pow(3, 4)` builtin Calls → Integer.pow
+      #     (via BuiltinSignatures + emit/4 typed gate).
+      #   * `2 ** 5` BinOp → Integer.pow (via bin_op_ast gate).
+      #   * `pow(2, 10, 1000)` 3-arg → return type {:int} so print
+      #     emits Integer.to_string instead of py_str.
+      # With all three: no py_pow, no py_str, no py_repr, no
+      # py_str_percent_format, and the output fits in ~25 lines.
+      must_not_contain: ["py_str", "py_repr", "py_str_percent_format"],
+      must_contain: ["Integer.pow", "Integer.to_string"],
+      max_lines: 25,
+      stdout: "1024\n81\n32\n24\n87\n"
     }
   }
 

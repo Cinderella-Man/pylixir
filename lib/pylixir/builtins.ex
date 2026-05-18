@@ -276,6 +276,22 @@ defmodule Pylixir.Builtins do
     {:ok, {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [TypeInfer.coerce_iter(x, t)]}}
   end
 
+  # `pow(base, exp)` — same gate as `BinOp("Pow")` in
+  # `converter.ex`. Specialises to `Integer.pow/2` when the base is
+  # statically int and the exponent is a `{:int_lit_nonneg}` literal.
+  # Negative dynamic exponents fall through to `py_pow` (Python
+  # returns float for those — only the runtime guard can pick
+  # `:math.pow`).
+  def emit("pow", [base, exp], _kw, [bt, et]) do
+    cond do
+      TypeInfer.is_int?(bt) and et == {:int_lit_nonneg} ->
+        {:ok, {{:., [], [{:__aliases__, [], [:Integer]}, :pow]}, [], [base, exp]}}
+
+      true ->
+        {:ok, {:py_pow, [], [base, exp]}}
+    end
+  end
+
   # `print(...)` with typed args — drop the `py_str` wrap for already-
   # stringy args, and inline `Integer.to_string/1` for known-int args.
   # Bool / float / unknown stays polymorphic because the formatting
@@ -720,9 +736,13 @@ defmodule Pylixir.Builtins do
     {:ok, {fdiv, mod}}
   end
 
-  # Python's `pow(base, exp)` — same as `base ** exp` (delegates to py_pow).
-  # Python's `pow(base, exp, mod)` — modular exponentiation, common in
-  # competitive code for Fermat-based modular inverses.
+  # Python's `pow(base, exp)` — same as `base ** exp`. Delegates to
+  # `py_pow` at runtime; the typed variant (`emit/4` below) specialises
+  # to `Integer.pow/2` when both args are statically int and the
+  # exponent is a nonneg literal — mirrors the `BinOp("Pow")`
+  # specialisation in `converter.ex`. Python's `pow(base, exp, mod)`
+  # is modular exponentiation, common in competitive code for
+  # Fermat-based modular inverses.
   def emit("pow", [base, exp], _kw), do: {:ok, {:py_pow, [], [base, exp]}}
   def emit("pow", [base, exp, mod], _kw), do: {:ok, {:py_pow_mod, [], [base, exp, mod]}}
 

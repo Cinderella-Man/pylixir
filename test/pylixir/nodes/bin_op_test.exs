@@ -39,9 +39,14 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert ast == {:/, [], [10, 4]}
     end
 
-    test "Pow emits py_pow (no specialization yet)" do
+    test "Pow on int base × nonneg-int-literal exponent specializes to Integer.pow" do
+      # Both `2` and `3` infer as `int_lit_nonneg`. The base satisfies
+      # `is_int?`; the exponent matches the strict `int_lit_nonneg`
+      # gate (Q2-B style — guards against negative exponents that
+      # Python returns as float). py_pow is reserved for the
+      # dynamic-or-negative case.
       {ast, _} = Converter.convert(binop("Pow", const(2), const(3)), Context.new())
-      assert ast == {:py_pow, [], [2, 3]}
+      assert ast == {{:., [], [{:__aliases__, [], [:Integer]}, :pow]}, [], [2, 3]}
     end
   end
 

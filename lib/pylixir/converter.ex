@@ -1501,9 +1501,25 @@ defmodule Pylixir.Converter do
     end
   end
 
-  # Remaining ops have no specialization yet; just emit the polymorphic
-  # helper. `lt`/`rt` are accepted for API uniformity.
-  defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node, _lt, _rt), do: {:py_pow, [], [l, r]}
+  # `int ** nonneg-int-literal` → `Integer.pow/2`. Python's `**` with
+  # an integer base returns int for nonneg exponents and a float for
+  # negative ones — we can't pick Integer.pow at compile time without
+  # proving the exponent is nonneg, hence the `{:int_lit_nonneg}`
+  # gate (same `Q2-B` shape Mult uses for `"abc" * 3`). Dynamic
+  # int exponents fall through to `py_pow`'s runtime guard which
+  # picks `:math.pow` for negatives.
+  defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) ->
+        {:py_pow, [], [l, r]}
+
+      TypeInfer.is_int?(lt) and rt == {:int_lit_nonneg} ->
+        {{:., [], [{:__aliases__, [], [:Integer]}, :pow]}, [], [l, r]}
+
+      true ->
+        {:py_pow, [], [l, r]}
+    end
+  end
 
   defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node, lt, rt) do
     cond do

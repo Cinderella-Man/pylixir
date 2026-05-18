@@ -133,9 +133,46 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
       {"filter", _} ->
         {:list, :any}
 
-      # `sum` keeps :any (could be int or float; arg-dependent).
+      # `sum(xs)` — refine the return type when the input element type
+      # is known. Pure-int lists give an int; pure-float lists a float;
+      # everything else stays :any. The element type comes from
+      # `elem_of/1` (returns `:any` for unknown shapes). The win here
+      # is preventing `print(sum(int_list))` from pulling `py_str` /
+      # `py_repr` — once we know `sum` returns `{:int}`, the print
+      # path emits `Integer.to_string/1` inline.
+      {"sum", [xs | _]} ->
+        case TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx)) do
+          {:int} -> {:int}
+          {:int_lit_nonneg} -> {:int}
+          {:float} -> {:float}
+          _ -> :any
+        end
+
       {"sum", _} ->
         :any
+
+      # `pow(base, exp)` — int when both operands are int AND the
+      # exponent is statically nonneg (negatives flip to float in
+      # Python). Mirrors the BinOp("Pow") specialisation.
+      # 3-arg `pow(base, exp, mod)` is modular exponentiation —
+      # always integer when all three are ints.
+      {"pow", [base, exp]} ->
+        bt = TypeInfer.infer_expr(base, ctx)
+        et = TypeInfer.infer_expr(exp, ctx)
+
+        cond do
+          TypeInfer.is_int?(bt) and et == {:int_lit_nonneg} -> {:int}
+          true -> :any
+        end
+
+      {"pow", [base, exp, mod]} ->
+        bt = TypeInfer.infer_expr(base, ctx)
+        et = TypeInfer.infer_expr(exp, ctx)
+        mt = TypeInfer.infer_expr(mod, ctx)
+
+        if TypeInfer.is_int?(bt) and TypeInfer.is_int?(et) and TypeInfer.is_int?(mt),
+          do: {:int},
+          else: :any
 
       {"min", [xs]} ->
         TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))
