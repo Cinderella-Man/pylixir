@@ -119,12 +119,21 @@ defmodule Pylixir.Nodes.Loop do
         _, acc -> acc
       end)
 
+    # `read_only` carries through the extracted `defp while_N` helper's
+    # parameter list any names the body reads but doesn't reassign.
+    # Two source-of-truth checks: bound in surrounding scope (regular
+    # local), OR a demoted top-level def (its closure binding lives in
+    # py_main but the call site we'll emit IS inside that py_main, so
+    # threading the closure ref as a param is safe).
     read_only =
       analysis.referenced_vars
       |> MapSet.union(referenced_in_test)
       |> MapSet.difference(threaded_set)
       |> MapSet.to_list()
-      |> Enum.filter(&Converter.var_bound?(pre_loop_context, &1))
+      |> Enum.filter(fn v ->
+        Converter.var_bound?(pre_loop_context, v) or
+          MapSet.member?(pre_loop_context.demoted_functions, v)
+      end)
       |> Enum.sort()
 
     {payload_ast, _refs} = build_acc_refs(threaded)
@@ -307,12 +316,21 @@ defmodule Pylixir.Nodes.Loop do
         _, acc -> acc
       end)
 
+    # `read_only` carries through the extracted `defp while_N` helper's
+    # parameter list any names the body reads but doesn't reassign.
+    # Two source-of-truth checks: bound in surrounding scope (regular
+    # local), OR a demoted top-level def (its closure binding lives in
+    # py_main but the call site we'll emit IS inside that py_main, so
+    # threading the closure ref as a param is safe).
     read_only =
       analysis.referenced_vars
       |> MapSet.union(referenced_in_test)
       |> MapSet.difference(threaded_set)
       |> MapSet.to_list()
-      |> Enum.filter(&Converter.var_bound?(pre_loop_context, &1))
+      |> Enum.filter(fn v ->
+        Converter.var_bound?(pre_loop_context, v) or
+          MapSet.member?(pre_loop_context.demoted_functions, v)
+      end)
       |> Enum.sort()
 
     {payload_ast, _refs} = build_acc_refs(threaded)
@@ -704,10 +722,22 @@ defmodule Pylixir.Nodes.Loop do
   end
 
   defp initial_ref(var, context) do
-    if Converter.var_bound?(context, var) do
-      {var |> Naming.rewrite() |> String.to_atom(), [], nil}
-    else
-      nil
+    cond do
+      Converter.var_bound?(context, var) ->
+        {var |> Naming.rewrite() |> String.to_atom(), [], nil}
+
+      # Demoted top-level defs are emitted as `name = fn … end` bindings
+      # at module-runtime-statements position in py_main. At conversion
+      # time the binding isn't yet in `scopes` (the def appears AFTER
+      # the call site in source order is common), but the closure WILL
+      # be bound by the time the caller actually invokes us. Threading
+      # the name through as a value is therefore safe and lets the
+      # extracted top-level `defp while_N/<arity>` reach the closure.
+      MapSet.member?(context.demoted_functions, var) ->
+        {var |> Naming.rewrite() |> String.to_atom(), [], nil}
+
+      true ->
+        nil
     end
   end
 

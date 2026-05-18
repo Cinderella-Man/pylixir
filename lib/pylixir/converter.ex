@@ -1490,6 +1490,18 @@ defmodule Pylixir.Converter do
                 col_offset: Map.get(node, "col_offset")
             end
 
+          MapSet.member?(context.demoted_functions, id) ->
+            # `id` is a top-level def that ModuleAnalysis demoted to a
+            # closure (it transitively closes over a mutable module
+            # binding). The closure binding gets emitted as
+            # `id = fn ... end` inside py_main. Bare `id(args)` would
+            # resolve to a never-emitted top-level defp; lower to
+            # `id.(args)` so the lambda is invoked instead.
+            no_kwargs!(kwargs, id, node)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            ref = {atom, [], nil}
+            {{{:., [], [ref]}, [], arg_asts}, context}
+
           true ->
             no_kwargs!(kwargs, id, node)
             atom = id |> Naming.rewrite() |> String.to_atom()

@@ -32,7 +32,8 @@ defmodule Pylixir do
     analysis = ModuleAnalysis.analyze(python_ast["body"] || [])
     context = %{
       Context.new(analysis.known_functions)
-      | known_function_arities: analysis.known_function_arities
+      | known_function_arities: analysis.known_function_arities,
+        demoted_functions: analysis.demoted_function_names
     }
     {elixir_ast, _context} = Converter.convert(python_ast, context, analysis)
     Formatter.format(elixir_ast)

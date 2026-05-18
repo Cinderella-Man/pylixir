@@ -43,6 +43,12 @@ defmodule Pylixir.ModuleAnalysis do
           runtime_statements: [map()],
           known_functions: MapSet.t(String.t()),
           known_function_arities: %{optional(String.t()) => non_neg_integer()},
+          # Names of top-level FunctionDefs that got demoted to closures
+          # because they reference a mutable module-level binding. The
+          # converter's Call-routing needs this so `f(args)` lowers to
+          # `f.(args)` (the closure form) instead of `f(args)` (the
+          # never-emitted top-level defp form).
+          demoted_function_names: MapSet.t(String.t()),
           class_defs: [Pylixir.ClassAnalysis.t()],
           # `[{alias_name, original_name, mod_name, arity}]` — stdlib
           # imports we hoist to module-top defps. See `hoistable_imports/1`.
@@ -55,6 +61,7 @@ defmodule Pylixir.ModuleAnalysis do
             runtime_statements: [],
             known_functions: MapSet.new(),
             known_function_arities: %{},
+            demoted_function_names: MapSet.new(),
             class_defs: [],
             hoisted_imports: [],
             module_doc: nil
@@ -122,7 +129,9 @@ defmodule Pylixir.ModuleAnalysis do
 
     {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
 
-    stmts = merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
+    stmts =
+      merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
+      |> topo_sort_demoted_runs(MapSet.new(demoted_fns, & &1["name"]))
 
     fn_known = MapSet.new(fns, & &1["name"])
     # Hoisted import names also become module-top defps, so they
@@ -156,6 +165,7 @@ defmodule Pylixir.ModuleAnalysis do
       runtime_statements: stmts,
       known_functions: known,
       known_function_arities: arities,
+      demoted_function_names: MapSet.new(demoted_fns, & &1["name"]),
       class_defs: class_defs,
       hoisted_imports: hoisted_imports,
       module_doc: module_doc
@@ -510,6 +520,99 @@ defmodule Pylixir.ModuleAnalysis do
       end)
 
     Enum.reverse(merged)
+  end
+
+  # Topologically sort each maximal "run" of consecutive demoted
+  # FunctionDef statements so a demoted fn that references a sibling
+  # demoted fn is emitted AFTER its callee. Without this, the natural
+  # Python source order can put the caller BEFORE the callee — when
+  # the caller's `fn ... end` body captures the callee name at fn
+  # creation time, Elixir's lexical scoping fails with "undefined
+  # variable". Runs are bounded by non-FunctionDef statements (or by
+  # non-demoted FunctionDefs, but those don't appear in `stmts`); a
+  # demoted fn that closes over a runtime stmt's binding (e.g.
+  # `comb = ...` from `from math import comb`) must still come after
+  # that stmt, so we never reorder ACROSS the run boundary.
+  defp topo_sort_demoted_runs(stmts, demoted_set) do
+    {acc, run} =
+      Enum.reduce(stmts, {[], []}, fn stmt, {acc, run} ->
+        if match?(%{"_type" => "FunctionDef"}, stmt) and
+             MapSet.member?(demoted_set, stmt["name"]) do
+          {acc, [stmt | run]}
+        else
+          flushed = topo_sort_run(Enum.reverse(run), demoted_set)
+          {[stmt | Enum.reverse(flushed) ++ acc], []}
+        end
+      end)
+
+    flushed = topo_sort_run(Enum.reverse(run), demoted_set)
+    Enum.reverse(flushed) ++ acc |> Enum.reverse()
+  end
+
+  defp topo_sort_run([], _), do: []
+  defp topo_sort_run([single], _), do: [single]
+
+  defp topo_sort_run(fns, _demoted_set) do
+    local_names = MapSet.new(fns, & &1["name"])
+    by_name = Map.new(fns, fn fn_node -> {fn_node["name"], fn_node} end)
+
+    deps =
+      Map.new(fns, fn fn_node ->
+        refs =
+          referenced_names(fn_node["body"], MapSet.new())
+          |> MapSet.intersection(local_names)
+
+        # Drop self-ref so we don't claim a non-existent cycle.
+        {fn_node["name"], MapSet.delete(refs, fn_node["name"])}
+      end)
+
+    case kahn_sort(deps) do
+      {:ok, sorted_names} ->
+        Enum.map(sorted_names, &Map.fetch!(by_name, &1))
+
+      :cycle ->
+        # Mutual recursion among demoted defs — no topological order
+        # exists. Fall back to source order; user will see a clear
+        # Elixir compile error if it actually breaks (which it likely
+        # will). Pylixir's Y-combinator pattern (recursive_lambdas)
+        # handles self-recursion but not mutual recursion yet.
+        fns
+    end
+  end
+
+  # Standard Kahn's algorithm: emit nodes whose in-degree (count of
+  # outgoing-dep edges) is zero; each emission decrements the in-degree
+  # of its dependents. Edge `a -> b` here means "a must come before b"
+  # — built by walking each fn's deps and adding `dep -> fn` edges.
+  defp kahn_sort(deps) do
+    in_deg = Map.new(deps, fn {name, refs} -> {name, MapSet.size(refs)} end)
+    queue = for {n, 0} <- in_deg, do: n
+    kahn_loop(queue, in_deg, deps, [])
+  end
+
+  defp kahn_loop([], in_deg, _deps, sorted) do
+    if Enum.any?(in_deg, fn {_, d} -> d > 0 end) do
+      :cycle
+    else
+      {:ok, Enum.reverse(sorted)}
+    end
+  end
+
+  defp kahn_loop([n | rest], in_deg, deps, sorted) do
+    in_deg = Map.delete(in_deg, n)
+
+    {new_zero, in_deg} =
+      Enum.reduce(deps, {[], in_deg}, fn {dep_name, dep_refs}, {zs, ind} ->
+        if MapSet.member?(dep_refs, n) and Map.has_key?(ind, dep_name) do
+          new_d = Map.get(ind, dep_name) - 1
+          ind = Map.put(ind, dep_name, new_d)
+          if new_d == 0, do: {[dep_name | zs], ind}, else: {zs, ind}
+        else
+          {zs, ind}
+        end
+      end)
+
+    kahn_loop(rest ++ Enum.reverse(new_zero), in_deg, deps, [n | sorted])
   end
 
   defp drop_unused_attrs(attrs, body) do
