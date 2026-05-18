@@ -268,7 +268,9 @@ defmodule Pylixir.Nodes.Functions do
   # lowering. For top-level `def`s the Converter promotes it to
   # `@doc` (via `extract_docstring/1`); for closures/lambdas there's
   # no equivalent and we just strip.
-  defp strip_docstring([%{"_type" => "Expr", "value" => %{"_type" => "Constant", "value" => v}} | rest])
+  defp strip_docstring([
+         %{"_type" => "Expr", "value" => %{"_type" => "Constant", "value" => v}} | rest
+       ])
        when is_binary(v),
        do: rest
 

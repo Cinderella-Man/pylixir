@@ -90,6 +90,7 @@ defmodule Pylixir.RuntimeHelpers.Format do
 
   def py_center_pad(s, width, fill) do
     diff = width - String.length(s)
+
     if diff <= 0 do
       s
     else

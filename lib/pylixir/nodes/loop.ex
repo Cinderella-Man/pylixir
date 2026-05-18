@@ -215,16 +215,19 @@ defmodule Pylixir.Nodes.Loop do
     state_var = {:pylixir_while_else_state, [], nil}
 
     try_ast =
-      {:try, [], [[
-        do: {:__block__, [], [{:=, [], [state_var, while_ast]}, {state_var, false}]},
-        catch: [
-          {:->, [],
-           [
-             [:throw, {:pylixir_break, {:payload, [], nil}}],
-             {{:payload, [], nil}, true}
-           ]}
-        ]
-      ]]}
+      {:try, [],
+       [
+         [
+           do: {:__block__, [], [{:=, [], [state_var, while_ast]}, {state_var, false}]},
+           catch: [
+             {:->, [],
+              [
+                [:throw, {:pylixir_break, {:payload, [], nil}}],
+                {{:payload, [], nil}, true}
+              ]}
+           ]
+         ]
+       ]}
 
     bind_state = {:=, [], [{state_var, broke_var}, try_ast]}
 
@@ -250,6 +253,7 @@ defmodule Pylixir.Nodes.Loop do
     # the tuple in the outer context. Mirrors the IfStmt threading
     # pattern.
     pre_else_context = context
+
     orelse_assigned =
       orelse
       |> LoopAnalysis.analyze()
@@ -753,5 +757,4 @@ defmodule Pylixir.Nodes.Loop do
         nil
     end
   end
-
 end

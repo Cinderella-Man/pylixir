@@ -28,8 +28,11 @@ defmodule Pylixir.Nodes.Assign do
   @spec assign(map(), Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
   def assign(%{"_type" => "Assign", "targets" => targets, "value" => value} = node, context) do
     case targets do
-      [single] -> single_target_assign(single, rewrite_stdlib_alias_call(value, context), node, context)
-      _ -> multi_target_assign(targets, value, node, context)
+      [single] ->
+        single_target_assign(single, rewrite_stdlib_alias_call(value, context), node, context)
+
+      _ ->
+        multi_target_assign(targets, value, node, context)
     end
   end
 
@@ -355,8 +358,13 @@ defmodule Pylixir.Nodes.Assign do
           # Slice-assignment: `coll[start:stop:step] = new_seq`.
           %{"_type" => "Slice"} = slice_node ->
             {value_ast, context} = Converter.convert(value, context)
-            {start_ast, context} = Converter.convert_optional(Map.get(slice_node, "lower"), context)
-            {stop_ast, context} = Converter.convert_optional(Map.get(slice_node, "upper"), context)
+
+            {start_ast, context} =
+              Converter.convert_optional(Map.get(slice_node, "lower"), context)
+
+            {stop_ast, context} =
+              Converter.convert_optional(Map.get(slice_node, "upper"), context)
+
             {step_ast, context} = Converter.convert_optional(Map.get(slice_node, "step"), context)
             {coll_ast, context} = Converter.convert(collection, context)
             rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
@@ -447,7 +455,11 @@ defmodule Pylixir.Nodes.Assign do
   # match Python's instance-attribute assignment for our map-backed
   # instances — `obj` is rebound so subsequent reads see the update.
   defp single_target_assign(
-         %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => obj_name}, "attr" => attr} = _target,
+         %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => obj_name},
+           "attr" => attr
+         } = _target,
          value,
          _node,
          context
@@ -473,8 +485,11 @@ defmodule Pylixir.Nodes.Assign do
   defp single_target_assign(
          %{
            "_type" => "Subscript",
-           "value" =>
-             %{"_type" => "Attribute", "value" => %{"_type" => "Name", "id" => obj_name}, "attr" => attr},
+           "value" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => obj_name},
+             "attr" => attr
+           },
            "slice" => slice
          },
          value,

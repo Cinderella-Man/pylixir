@@ -25,6 +25,7 @@ defmodule Pylixir.TypeInfer do
           | {:tuple, [t()] | :any_arity}
           | {:dict, t(), t()}
           | {:set}
+          | {:fn, [t()], t()}
           | {:union, MapSet.t(t())}
 
   # ---------------------------------------------------------------------
@@ -98,6 +99,17 @@ defmodule Pylixir.TypeInfer do
   end
 
   def lub({:tuple, _}, {:tuple, _}), do: {:tuple, :any_arity}
+
+  # Phase 7 Q1 — function types: structural lub. Same arity merges
+  # param-wise (contravariant glb approximated as lub for soundness;
+  # widening params is safe since lub-of-args at call sites already
+  # widens). Different arity → `:any`.
+  def lub({:fn, pa, ra}, {:fn, pb, rb}) when length(pa) == length(pb) do
+    params = Enum.zip(pa, pb) |> Enum.map(fn {a, b} -> lub(a, b) end)
+    {:fn, params, lub(ra, rb)}
+  end
+
+  def lub({:fn, _, _}, {:fn, _, _}), do: :any
 
   # unions absorb additional types
   def lub({:union, a}, {:union, b}) do
@@ -300,9 +312,21 @@ defmodule Pylixir.TypeInfer do
 
   def infer_expr(%{"_type" => "Name", "id" => id}, ctx) do
     cond do
-      Map.has_key?(ctx.types, id) -> Map.fetch!(ctx.types, id)
-      Map.has_key?(ctx.heap_types, id) -> Map.fetch!(ctx.heap_types, id)
-      true -> :any
+      Map.has_key?(ctx.types, id) ->
+        Map.fetch!(ctx.types, id)
+
+      Map.has_key?(ctx.heap_types, id) ->
+        Map.fetch!(ctx.heap_types, id)
+
+      # Phase 7 Q1 — Name resolves to a user-defined function: produce
+      # `{:fn, params, ret}` from fn_signatures. Enables `f` (as a
+      # value, e.g. `&f/1` or passed to map) to type as a function.
+      sig = Map.get(ctx.fn_signatures, id) ->
+        {params, ret} = sig
+        {:fn, params, ret}
+
+      true ->
+        :any
     end
   end
 
@@ -387,7 +411,9 @@ defmodule Pylixir.TypeInfer do
         cond do
           # User-defined signatures (PR 9 fixed-point) win over the
           # stdlib table — `def len(xs): return "always"` should shadow.
-          sig = Map.get(ctx.fn_signatures, id) -> elem(sig, 1)
+          sig = Map.get(ctx.fn_signatures, id) ->
+            elem(sig, 1)
+
           true ->
             Pylixir.TypeInfer.BuiltinSignatures.return_type(id, Map.get(node, "args", []), ctx)
         end
@@ -395,22 +421,32 @@ defmodule Pylixir.TypeInfer do
       %{"_type" => "Attribute", "attr" => method} ->
         Pylixir.TypeInfer.BuiltinSignatures.method_return_type(method)
 
-      _ ->
-        :any
+      # Phase 7 Q1+Q2 — callee is an expression (curried Call, Lambda
+      # literal, parenthesized Name resolving to fn-type, etc.). If
+      # the callee's inferred type is `{:fn, _, ret}`, return ret.
+      # Otherwise `:any`. Handles `f(a)(b)`, `(lambda x: x)(42)`,
+      # and Name lookups that resolve through fn_signatures.
+      other ->
+        case infer_expr(other, ctx) do
+          {:fn, _params, ret} -> ret
+          _ -> :any
+        end
     end
   end
 
-  # T8 — Lambda body inference. Python `lambda a, b: <expr>`. Params are
-  # primed to `:any` (no call-site info at this point); the body's
-  # inferred type becomes the lambda's "return type." Used by
-  # `BuiltinSignatures.function_return_type/2` (HOF arg propagation) AND
-  # by `infer_expr` when a Lambda appears in expression position.
+  # T8 + Phase 7 Q1 — Lambda inference. Python `lambda a, b: <expr>`.
+  # Params are primed to `:any` (no call-site info at this point); the
+  # body's inferred type becomes the lambda's RETURN type, and the
+  # whole lambda types as `{:fn, [:any, ...], body_type}`. Callers that
+  # want just the return type (e.g. `function_return_type/2`) unwrap.
   def infer_expr(%{"_type" => "Lambda", "args" => args, "body" => body}, ctx) do
     param_names =
       (Map.get(args, "args") || []) |> Enum.map(&Map.get(&1, "arg"))
 
     primed = Enum.reduce(param_names, ctx, fn n, c -> bind(c, n, :any) end)
-    infer_expr(body, primed)
+    body_type = infer_expr(body, primed)
+    params = List.duplicate(:any, length(param_names))
+    {:fn, params, body_type}
   end
 
   def infer_expr(_other, _ctx), do: :any
@@ -534,7 +570,11 @@ defmodule Pylixir.TypeInfer do
   end
 
   defp seed_heap_type(
-         %{"_type" => "Assign", "targets" => [%{"_type" => "Name", "id" => id}], "value" => value},
+         %{
+           "_type" => "Assign",
+           "targets" => [%{"_type" => "Name", "id" => id}],
+           "value" => value
+         },
          %Context{mutable_module_dicts: mutable, heap_types: heap_types} = ctx
        ) do
     if MapSet.member?(mutable, id) and not Map.has_key?(heap_types, id) do

@@ -213,7 +213,9 @@ defmodule Pylixir.Builtins do
   end
 
   def emit("zip", [a, b | rest], _kw, types) when length(types) == length([a, b | rest]) do
-    args = Enum.zip([a, b | rest], types) |> Enum.map(fn {arg, t} -> TypeInfer.coerce_iter(arg, t) end)
+    args =
+      Enum.zip([a, b | rest], types) |> Enum.map(fn {arg, t} -> TypeInfer.coerce_iter(arg, t) end)
+
     {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [args]}}
   end
 
@@ -226,8 +228,7 @@ defmodule Pylixir.Builtins do
   end
 
   def emit("map", [f, xs], _kw, [_ft, t]) do
-    {:ok,
-     {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [TypeInfer.coerce_iter(xs, t), f]}}
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [TypeInfer.coerce_iter(xs, t), f]}}
   end
 
   def emit("filter", [f, xs], _kw, [_ft, t]) do
@@ -243,13 +244,11 @@ defmodule Pylixir.Builtins do
   end
 
   def emit("set", [x], _kw, [t]) do
-    {:ok,
-     {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
+    {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
   end
 
   def emit("frozenset", [x], _kw, [t]) do
-    {:ok,
-     {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
+    {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
   end
 
   def emit("deque", [x], _kw, [t]) do
@@ -274,8 +273,7 @@ defmodule Pylixir.Builtins do
   end
 
   def emit("tuple", [x], _kw, [t]) do
-    {:ok,
-     {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [TypeInfer.coerce_iter(x, t)]}}
+    {:ok, {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [TypeInfer.coerce_iter(x, t)]}}
   end
 
   # `print(...)` with typed args — drop the `py_str` wrap for already-
@@ -475,13 +473,13 @@ defmodule Pylixir.Builtins do
     do:
       {:ok,
        {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-        [{:"..//", [], [0, sub_one(stop), 1]}]}}
+        [{:..//, [], [0, sub_one(stop), 1]}]}}
 
   def emit("range", [start, stop], _kw),
     do:
       {:ok,
        {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-        [{:"..//", [], [start, sub_one(stop), 1]}]}}
+        [{:..//, [], [start, sub_one(stop), 1]}]}}
 
   def emit("range", [start, stop, step], _kw),
     do:
@@ -508,8 +506,7 @@ defmodule Pylixir.Builtins do
   def emit("reversed", [xs], _kw),
     do:
       {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [],
-        [{:py_iter_to_list, [], [xs]}]}}
+       {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [{:py_iter_to_list, [], [xs]}]}}
 
   def emit("enumerate", [xs], kw), do: enumerate_call(xs, Map.get(kw, "start"))
   def emit("enumerate", [xs, start], _kw), do: enumerate_call(xs, start)
@@ -537,6 +534,7 @@ defmodule Pylixir.Builtins do
 
   def emit("max", [xs], kw),
     do: {:ok, minmax_call(:max, {:py_iter_to_list, [], [xs]}, kw)}
+
   def emit("min", [a, b | rest], _kw), do: {:ok, minmax_variadic(:min, [a, b | rest])}
   def emit("max", [a, b | rest], _kw), do: {:ok, minmax_variadic(:max, [a, b | rest])}
 
@@ -546,14 +544,12 @@ defmodule Pylixir.Builtins do
   def emit("map", [f, xs], _kw),
     do:
       {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [],
-        [{:py_iter_to_list, [], [xs]}, f]}}
+       {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [{:py_iter_to_list, [], [xs]}, f]}}
 
   def emit("filter", [f, xs], _kw),
     do:
       {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [],
-        [{:py_iter_to_list, [], [xs]}, f]}}
+       {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [{:py_iter_to_list, [], [xs]}, f]}}
 
   # --- T26 conversions ---------------------------------------------------
 
@@ -622,9 +618,7 @@ defmodule Pylixir.Builtins do
   def emit("tuple", [], _kw), do: {:ok, {:{}, [], []}}
 
   def emit("tuple", [x], _kw) do
-    {:ok,
-     {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [],
-      [{:py_iter_to_list, [], [x]}]}}
+    {:ok, {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [{:py_iter_to_list, [], [x]}]}}
   end
 
   def emit("set", [], _kw),
@@ -632,8 +626,7 @@ defmodule Pylixir.Builtins do
 
   def emit("set", [x], _kw),
     do:
-      {:ok,
-       {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
+      {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
 
   # `frozenset()` / `frozenset(iter)` — Elixir has no separate frozen vs
   # mutable set; MapSet already has value semantics + immutability. Both
@@ -646,8 +639,7 @@ defmodule Pylixir.Builtins do
 
   def emit("frozenset", [x], _kw),
     do:
-      {:ok,
-       {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
+      {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
 
   def emit("dict", [], _kw), do: {:ok, {:%{}, [], []}}
 
@@ -682,8 +674,7 @@ defmodule Pylixir.Builtins do
   def emit("Counter", [x], _kw),
     do:
       {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [],
-        [{:py_iter_to_list, [], [x]}]}}
+       {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [], [{:py_iter_to_list, [], [x]}]}}
 
   # `defaultdict(factory)` — Elixir doesn't track the factory, so we
   # emit a plain `%{}` and rely on `py_getitem` returning `nil` for
@@ -791,7 +782,10 @@ defmodule Pylixir.Builtins do
       {:fn, [],
        [
          {:->, [],
-          [[{:elem, [], nil}, {:acc, [], nil}], {:py_add, [], [{:acc, [], nil}, {:elem, [], nil}]}]}
+          [
+            [{:elem, [], nil}, {:acc, [], nil}],
+            {:py_add, [], [{:acc, [], nil}, {:elem, [], nil}]}
+          ]}
        ]}
 
     coerced = {:py_iter_to_list, [], [xs]}
@@ -898,15 +892,16 @@ defmodule Pylixir.Builtins do
         # (default `&<=/2`) and an empty_fallback 0-arity fn. Pass the
         # default through the fallback so empty iterables match Python.
         by_op = if op == :min, do: :min_by, else: :max_by
+
         sorter =
           {:fn, [],
            [
              {:->, [],
               [[{:a, [], nil}, {:b, [], nil}], {:<=, [], [{:a, [], nil}, {:b, [], nil}]}]}
            ]}
+
         fallback = {:fn, [], [{:->, [], [[], default_ast]}]}
-        {{:., [], [{:__aliases__, [], [:Enum]}, by_op]}, [],
-         [xs, key_ast, sorter, fallback]}
+        {{:., [], [{:__aliases__, [], [:Enum]}, by_op]}, [], [xs, key_ast, sorter, fallback]}
     end
   end
 

@@ -113,7 +113,11 @@ defmodule Pylixir.LoopAnalysis do
       generators
       |> Enum.reduce(MapSet.new(), fn gen, acc ->
         iter_reads = collect_names(Map.get(gen, "iter"))
-        filter_reads = Map.get(gen, "ifs", []) |> Enum.reduce(MapSet.new(), &MapSet.union(&2, collect_names(&1)))
+
+        filter_reads =
+          Map.get(gen, "ifs", [])
+          |> Enum.reduce(MapSet.new(), &MapSet.union(&2, collect_names(&1)))
+
         acc |> MapSet.union(iter_reads) |> MapSet.union(filter_reads)
       end)
       |> MapSet.union(Enum.reduce(exprs, MapSet.new(), &MapSet.union(&2, collect_names(&1))))
@@ -134,7 +138,11 @@ defmodule Pylixir.LoopAnalysis do
   end
 
   defp collect_names(%{"_type" => "DictComp"} = node),
-    do: comp_referenced(Map.get(node, "generators", []), [Map.get(node, "key"), Map.get(node, "value")])
+    do:
+      comp_referenced(Map.get(node, "generators", []), [
+        Map.get(node, "key"),
+        Map.get(node, "value")
+      ])
 
   defp collect_names(%{} = node) do
     node

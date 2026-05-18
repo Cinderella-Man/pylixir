@@ -34,6 +34,7 @@ defmodule Pylixir.RuntimeHelpers.MathExt do
   # Python's `math.factorial(n)`. BEAM integers are arbitrary-precision;
   # no overflow risk. Negative input raises (mirrors Python's ValueError).
   def py_math_factorial(0), do: 1
+
   def py_math_factorial(n) when is_integer(n) and n > 0,
     do: Enum.reduce(1..n, 1, &(&1 * &2))
 
@@ -73,6 +74,7 @@ defmodule Pylixir.RuntimeHelpers.MathExt do
 
   def py_lcm_pair(0, _), do: 0
   def py_lcm_pair(_, 0), do: 0
+
   def py_lcm_pair(a, b) when is_integer(a) and is_integer(b),
     do: div(abs(a * b), Integer.gcd(a, b))
 

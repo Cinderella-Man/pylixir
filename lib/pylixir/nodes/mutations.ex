@@ -184,7 +184,16 @@ defmodule Pylixir.Nodes.Mutations do
           map(),
           Pylixir.Context.t()
         ) :: {Macro.t(), Pylixir.Context.t()}
-  def emit_obj_attr_subscript(obj_name, attr_name, slice_node, method, args, kwargs_raw, source, context) do
+  def emit_obj_attr_subscript(
+        obj_name,
+        attr_name,
+        slice_node,
+        method,
+        args,
+        kwargs_raw,
+        source,
+        context
+      ) do
     {arg_asts, context} = Converter.convert_each(args, context)
     {kwargs, context} = Converter.convert_keywords(kwargs_raw, context)
     {slice_ref, slice_binding, context} = Converter.maybe_temp_bind(slice_node, context)

@@ -41,29 +41,67 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
   def return_type(id, args, ctx) do
     case {id, args} do
       # String/int conversions
-      {"int", _} -> {:int}
-      {"str", _} -> {:str}
-      {"bool", _} -> {:bool}
-      {"float", _} -> {:float}
-      {"hex", _} -> {:str}
-      {"oct", _} -> {:str}
-      {"bin", _} -> {:str}
-      {"chr", _} -> {:str}
-      {"repr", _} -> {:str}
-      {"format", _} -> {:str}
-      {"ord", _} -> {:int}
-      {"abs", _} -> :any
-      {"round", _} -> :any
-      {"input", _} -> {:str}
+      {"int", _} ->
+        {:int}
+
+      {"str", _} ->
+        {:str}
+
+      {"bool", _} ->
+        {:bool}
+
+      {"float", _} ->
+        {:float}
+
+      {"hex", _} ->
+        {:str}
+
+      {"oct", _} ->
+        {:str}
+
+      {"bin", _} ->
+        {:str}
+
+      {"chr", _} ->
+        {:str}
+
+      {"repr", _} ->
+        {:str}
+
+      {"format", _} ->
+        {:str}
+
+      {"ord", _} ->
+        {:int}
+
+      {"abs", _} ->
+        :any
+
+      {"round", _} ->
+        :any
+
+      {"input", _} ->
+        {:str}
+
       # `len` always returns a non-negative int.
-      {"len", _} -> {:int_lit_nonneg}
+      {"len", _} ->
+        {:int_lit_nonneg}
+
       # `range(...)` always yields a list of ints (lowered as Enum.to_list of a Range).
-      {"range", _} -> {:list, {:int}}
+      {"range", _} ->
+        {:list, {:int}}
+
       # `sorted(xs)` preserves the element type.
-      {"sorted", [xs | _]} -> {:list, TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))}
-      {"sorted", []} -> {:list, :any}
+      {"sorted", [xs | _]} ->
+        {:list, TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))}
+
+      {"sorted", []} ->
+        {:list, :any}
+
       # `reversed(xs)` likewise.
-      {"reversed", [xs]} -> {:list, TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))}
+      {"reversed", [xs]} ->
+        {:list, TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))}
+
       # `enumerate(xs)` → list of (int, elt) tuples.
       {"enumerate", [xs | _]} ->
         {:list, {:tuple, [{:int}, TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))]}}
@@ -72,13 +110,17 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
       {"zip", _} ->
         {:list, {:tuple, :any_arity}}
 
-      # T7 — `map(f, xs)` returns `{:list, return_type_of(f)}` when `f`
-      # is a Name-reference to a typed function or an inlinable Lambda.
-      # Falls through to `{:list, :any}` for unknown function shapes.
-      {"map", [f, _]} ->
-        case function_return_type(f, ctx) do
+      # T7 + Phase 7 Q3 — `map(f, xs)` returns `{:list, return_type_of(f)}`.
+      # When f is a Lambda, narrow its first param to the xs element type
+      # before re-inferring the body. Lets `map(lambda x: x*2, [1,2,3])`
+      # type as `{:list, {:int}}` (S3 inline path then drops py_str).
+      {"map", [f, xs]} ->
+        elem_t = TypeInfer.elem_of(TypeInfer.infer_expr(xs, ctx))
+        ret = function_return_type_narrowed(f, [elem_t], ctx)
+
+        case ret do
           :any -> {:list, :any}
-          ret -> {:list, ret}
+          t -> {:list, t}
         end
 
       {"map", _} ->
@@ -120,24 +162,51 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
           _ -> {:list, :any}
         end
 
-      {"tuple", _} -> {:tuple, :any_arity}
-      {"set", _} -> {:set}
-      {"frozenset", _} -> {:set}
-      {"dict", _} -> {:dict, :any, :any}
-      {"deque", _} -> {:list, :any}
-      {"bytearray", _} -> {:list, :any}
-      {"bytes", _} -> {:list, :any}
-      {"any", _} -> {:bool}
-      {"all", _} -> {:bool}
+      {"tuple", _} ->
+        {:tuple, :any_arity}
+
+      {"set", _} ->
+        {:set}
+
+      {"frozenset", _} ->
+        {:set}
+
+      {"dict", _} ->
+        {:dict, :any, :any}
+
+      {"deque", _} ->
+        {:list, :any}
+
+      {"bytearray", _} ->
+        {:list, :any}
+
+      {"bytes", _} ->
+        {:list, :any}
+
+      {"any", _} ->
+        {:bool}
+
+      {"all", _} ->
+        {:bool}
+
       # T6 — predicate builtins. Refining `:any` → `{:bool}` lets
       # `convert_test/2`'s S1 elision drop the `truthy?` wrap for
       # `if isinstance(x, T):` and `if isinstance(x, T1) or isinstance(x, T2):`
       # shapes (BoolOp of two bool-returning calls also lubs to `{:bool}`).
-      {"isinstance", _} -> {:bool}
-      {"callable", _} -> {:bool}
-      {"hasattr", _} -> {:bool}
-      {"issubclass", _} -> {:bool}
-      _ -> :any
+      {"isinstance", _} ->
+        {:bool}
+
+      {"callable", _} ->
+        {:bool}
+
+      {"hasattr", _} ->
+        {:bool}
+
+      {"issubclass", _} ->
+        {:bool}
+
+      _ ->
+        :any
     end
   end
 
@@ -224,8 +293,45 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
 
   def function_return_type(%{"_type" => "Lambda"} = lambda, ctx) do
     # Reuse the Lambda inference clause from `TypeInfer.infer_expr/2`.
-    TypeInfer.infer_expr(lambda, ctx)
+    # Phase 7 Q1: Lambda now returns `{:fn, params, ret}` — extract ret.
+    case TypeInfer.infer_expr(lambda, ctx) do
+      {:fn, _params, ret} -> ret
+      other -> other
+    end
   end
 
   def function_return_type(_, _ctx), do: :any
+
+  @doc """
+  Phase 7 Q3 — same as `function_return_type/2` but re-infers the
+  function's body with parameters narrowed to `param_types`. Used by
+  HOF builtins (map/reduce/filter/sorted-with-key) to propagate
+  element-type information from the iterable into the function arg.
+
+  Currently supports Lambda only — narrowing for `Name(user_fn)` would
+  require fn-body access in Context (deferred).
+  """
+  @spec function_return_type_narrowed(map(), [TypeInfer.t()], Context.t()) :: TypeInfer.t()
+  def function_return_type_narrowed(
+        %{"_type" => "Lambda", "args" => args, "body" => body},
+        param_types,
+        ctx
+      ) do
+    param_names = (Map.get(args, "args") || []) |> Enum.map(&Map.get(&1, "arg"))
+
+    primed =
+      Enum.zip(param_names, pad_or_truncate(param_types, length(param_names)))
+      |> Enum.reduce(ctx, fn {n, t}, c -> TypeInfer.bind(c, n, t) end)
+
+    TypeInfer.infer_expr(body, primed)
+  end
+
+  def function_return_type_narrowed(node, _param_types, ctx),
+    do: function_return_type(node, ctx)
+
+  defp pad_or_truncate(types, n) do
+    types
+    |> Kernel.++(List.duplicate(:any, n))
+    |> Enum.take(n)
+  end
 end

@@ -120,6 +120,9 @@ defmodule Pylixir.Stdlib.Bisect do
   # it as an expression (always discarded; nil-returning).
   def import_binding("insort"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_insort_right, 2)}
   def import_binding("insort_left"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_insort_left, 2)}
-  def import_binding("insort_right"), do: {:ok, Pylixir.Stdlib.capture(:py_bisect_insort_right, 2)}
+
+  def import_binding("insort_right"),
+    do: {:ok, Pylixir.Stdlib.capture(:py_bisect_insort_right, 2)}
+
   def import_binding(_), do: :error
 end

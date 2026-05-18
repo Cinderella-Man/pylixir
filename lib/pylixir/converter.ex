@@ -366,8 +366,13 @@ defmodule Pylixir.Converter do
                    {:iter, [], nil},
                    {:init, [], nil},
                    {:fn, [],
-                    [{:->, [], [[{:x, [], nil}, {:acc, [], nil}],
-                                {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}]}]}
+                    [
+                      {:->, [],
+                       [
+                         [{:x, [], nil}, {:acc, [], nil}],
+                         {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}
+                       ]}
+                    ]}
                  ]}
               ]}
            ]}
@@ -379,6 +384,7 @@ defmodule Pylixir.Converter do
       [%{"name" => "cmp_to_key"} = entry] ->
         alias_name = Map.get(entry, "asname") || "cmp_to_key"
         atom = alias_name |> Naming.rewrite() |> String.to_atom()
+
         lambda =
           {:fn, [],
            [
@@ -530,8 +536,8 @@ defmodule Pylixir.Converter do
                 {value_ast, context} = convert(value, context)
                 attr_atom = String.to_atom(attr)
 
-                {{{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [],
-                  [value_ast, attr_atom]}, context}
+                {{{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [value_ast, attr_atom]},
+                 context}
 
               true ->
                 raise UnsupportedNodeError,
@@ -544,7 +550,6 @@ defmodule Pylixir.Converter do
         end
     end
   end
-
 
   def convert(%{"_type" => "Return"} = node, context) do
     case context.return_mode do
@@ -796,72 +801,6 @@ defmodule Pylixir.Converter do
     end
   end
 
-  defp convert_if_runtime(test, body, orelse, context) do
-    # PR 11 — branch-isolated types. Type bindings introduced inside an
-    # If body / orelse leak into the surrounding scope as `:any` (the
-    # lub of "set in this branch" + "untouched in the other" is the
-    # safe conservative type since we don't know which branch ran).
-    # We snapshot before conversion, let the inner conversions update
-    # types as they go (so within-branch specialization fires), and
-    # restore on exit. Names typed *before* the If keep their type.
-    saved_types = context.types
-
-    # PR 12 — isinstance narrowing for the body-only case. Detect
-    # `if isinstance(x, T):` and prime `ctx.types[x]` to `T`'s lattice
-    # type before body conversion. emit_else's per-branch isolation is
-    # left to future work (the body and orelse share a `convert_test`
-    # call site so narrowing one without affecting the other is more
-    # intrusive than current scope permits).
-    body_context =
-      case orelse do
-        [] -> TypeInfer.IsinstanceNarrowing.narrow(test, context)
-        _ -> context
-      end
-
-    {ast, context} =
-      case orelse do
-        [] -> Nodes.If.emit_only(test, body, body_context)
-        [%{"_type" => "If"} = _elif | _] -> Nodes.If.emit_cond_chain(test, body, orelse, context)
-        _ -> Nodes.If.emit_else(test, body, orelse, context)
-      end
-
-    {ast, %{context | types: saved_types}}
-  end
-
-  # M2 helpers — used by the If clause's const-fold pre-check.
-
-  defp convert_body_inline([], context), do: {nil, context}
-
-  defp convert_body_inline(stmts, context) when is_list(stmts) do
-    {asts, context} = convert_each(stmts, context)
-    {body_to_block(asts), context}
-  end
-
-  # Detect a Compare test that folds to a known boolean at convert
-  # time. Handles single-op `Eq`/`NotEq` whose operands both fold via
-  # `LiteralFold.fold/1` (with `__name__` special-cased to "__main__"
-  # to match Pylixir's Name clause).
-  defp const_fold_if_test(%{
-         "_type" => "Compare",
-         "left" => left,
-         "ops" => [%{"_type" => op_type}],
-         "comparators" => [right]
-       })
-       when op_type in ["Eq", "NotEq"] do
-    with {:ok, lv} <- fold_value(left),
-         {:ok, rv} <- fold_value(right) do
-      eq = lv == rv
-      {:ok, if(op_type == "Eq", do: eq, else: not eq)}
-    else
-      _ -> :unknown
-    end
-  end
-
-  defp const_fold_if_test(_), do: :unknown
-
-  defp fold_value(%{"_type" => "Name", "id" => "__name__"}), do: {:ok, "__main__"}
-  defp fold_value(node), do: Pylixir.LiteralFold.fold(node)
-
   def convert(%{"_type" => "IfExp", "test" => test, "body" => body, "orelse" => orelse}, context) do
     # M1 — type-narrow the body arm when `test` is an `isinstance(x, T)`
     # call. Mirrors the If-statement clause's PR 12 path (line ~770).
@@ -1084,10 +1023,13 @@ defmodule Pylixir.Converter do
          {:iter, [], nil},
          {:init, [], nil},
          {:fn, [],
-          [{:->, [], [
-            [{:x, [], nil}, {:acc, [], nil}],
-            {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}
-          ]}]}
+          [
+            {:->, [],
+             [
+               [{:x, [], nil}, {:acc, [], nil}],
+               {{:., [], [{:fn_arg, [], nil}]}, [], [{:acc, [], nil}, {:x, [], nil}]}
+             ]}
+          ]}
        ]}
 
     {:defp, [],
@@ -1115,25 +1057,88 @@ defmodule Pylixir.Converter do
     name = alias_n |> Naming.rewrite() |> String.to_atom()
     body = {:py_itertools_chain, [], [{:iters, [], nil}]}
 
-    {:defp, [],
-     [{name, [], [{:iters, [], nil}]}, [do: body]]}
+    {:defp, [], [{name, [], [{:iters, [], nil}]}, [do: body]]}
   end
 
   defp hoisted_defp("itertools", "accumulate", alias_n) do
     name = alias_n |> Naming.rewrite() |> String.to_atom()
     body = {:py_itertools_accumulate, [], [{:iter, [], nil}]}
 
-    {:defp, [],
-     [{name, [], [{:iter, [], nil}]}, [do: body]]}
+    {:defp, [], [{name, [], [{:iter, [], nil}]}, [do: body]]}
   end
 
   defp hoisted_defp("itertools", "groupby", alias_n) do
     name = alias_n |> Naming.rewrite() |> String.to_atom()
     body = {:py_itertools_groupby, [], [{:iter, [], nil}]}
 
-    {:defp, [],
-     [{name, [], [{:iter, [], nil}]}, [do: body]]}
+    {:defp, [], [{name, [], [{:iter, [], nil}]}, [do: body]]}
   end
+
+  # --- If/IfExp helpers --------------------------------------------------
+
+  defp convert_if_runtime(test, body, orelse, context) do
+    # PR 11 — branch-isolated types. Type bindings introduced inside an
+    # If body / orelse leak into the surrounding scope as `:any` (the
+    # lub of "set in this branch" + "untouched in the other" is the
+    # safe conservative type since we don't know which branch ran).
+    # We snapshot before conversion, let the inner conversions update
+    # types as they go (so within-branch specialization fires), and
+    # restore on exit. Names typed *before* the If keep their type.
+    saved_types = context.types
+
+    # PR 12 — isinstance narrowing for the body-only case. Detect
+    # `if isinstance(x, T):` and prime `ctx.types[x]` to `T`'s lattice
+    # type before body conversion. emit_else's per-branch isolation is
+    # left to future work (the body and orelse share a `convert_test`
+    # call site so narrowing one without affecting the other is more
+    # intrusive than current scope permits).
+    body_context =
+      case orelse do
+        [] -> TypeInfer.IsinstanceNarrowing.narrow(test, context)
+        _ -> context
+      end
+
+    {ast, context} =
+      case orelse do
+        [] -> Nodes.If.emit_only(test, body, body_context)
+        [%{"_type" => "If"} = _elif | _] -> Nodes.If.emit_cond_chain(test, body, orelse, context)
+        _ -> Nodes.If.emit_else(test, body, orelse, context)
+      end
+
+    {ast, %{context | types: saved_types}}
+  end
+
+  defp convert_body_inline([], context), do: {nil, context}
+
+  defp convert_body_inline(stmts, context) when is_list(stmts) do
+    {asts, context} = convert_each(stmts, context)
+    {body_to_block(asts), context}
+  end
+
+  # Detect a Compare test that folds to a known boolean at convert
+  # time. Handles single-op `Eq`/`NotEq` whose operands both fold via
+  # `LiteralFold.fold/1` (with `__name__` special-cased to "__main__"
+  # to match Pylixir's Name clause).
+  defp const_fold_if_test(%{
+         "_type" => "Compare",
+         "left" => left,
+         "ops" => [%{"_type" => op_type}],
+         "comparators" => [right]
+       })
+       when op_type in ["Eq", "NotEq"] do
+    with {:ok, lv} <- fold_value(left),
+         {:ok, rv} <- fold_value(right) do
+      eq = lv == rv
+      {:ok, if(op_type == "Eq", do: eq, else: not eq)}
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp const_fold_if_test(_), do: :unknown
+
+  defp fold_value(%{"_type" => "Name", "id" => "__name__"}), do: {:ok, "__main__"}
+  defp fold_value(node), do: Pylixir.LiteralFold.fold(node)
 
   # --- Expr-clause helpers (statement-form mutations & class calls) ------
   #
@@ -1516,7 +1521,6 @@ defmodule Pylixir.Converter do
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
-
 
   @doc false
   def bind_name(context, name) when is_binary(name) do
@@ -2010,10 +2014,11 @@ defmodule Pylixir.Converter do
          "keywords" => []
        })
        when rest == [] or length(rest) == 1 do
-    default = case rest do
-      [] -> :no_default
-      [d] -> d
-    end
+    default =
+      case rest do
+        [] -> :no_default
+        [d] -> d
+      end
 
     {:ok, x, default}
   end
@@ -2382,7 +2387,6 @@ defmodule Pylixir.Converter do
     {atom, %{context | temp_counter: n + 1}}
   end
 
-
   # --- Literal-container rejections --------------------------------------
 
   defp convert_del_target(
@@ -2556,10 +2560,12 @@ defmodule Pylixir.Converter do
     mutating = class_mutating_methods(class)
 
     {init_ast, context} = emit_method(class_name, init, :init, context)
-    {method_asts, context} = Enum.map_reduce(methods, context, fn m, ctx ->
-      kind = if MapSet.member?(mutating, m.name), do: :mutating, else: :read_only
-      emit_method(class_name, m, kind, ctx)
-    end)
+
+    {method_asts, context} =
+      Enum.map_reduce(methods, context, fn m, ctx ->
+        kind = if MapSet.member?(mutating, m.name), do: :mutating, else: :read_only
+        emit_method(class_name, m, kind, ctx)
+      end)
 
     {[init_ast | method_asts], context}
   end
@@ -2790,7 +2796,6 @@ defmodule Pylixir.Converter do
   # PR 12 isinstance narrowing lives in
   # `Pylixir.TypeInfer.IsinstanceNarrowing`. The If clause above
   # delegates via `TypeInfer.IsinstanceNarrowing.narrow/2`.
-
 
   defp seed_module_attr_types(attrs, context) do
     Enum.reduce(attrs, context, fn {name, value_node}, ctx ->

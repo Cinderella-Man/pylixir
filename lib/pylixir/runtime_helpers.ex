@@ -237,7 +237,9 @@ defmodule Pylixir.RuntimeHelpers do
   # the post-`%` characters (e.g. `"05d"`, `".2f"`, `"x"`). Returns
   # the formatted string.
   def format_percent_value(spec, value) do
-    {flags, rest} = parse_percent_flags(spec, %{left: false, zero: false, plus: false, space: false})
+    {flags, rest} =
+      parse_percent_flags(spec, %{left: false, zero: false, plus: false, space: false})
+
     {width, rest} = parse_percent_int(rest, 0)
     {precision, rest} = parse_percent_precision(rest)
     type = rest
@@ -680,6 +682,7 @@ defmodule Pylixir.RuntimeHelpers do
         # Length of everything except the last segment, plus (n-1) sub-lengths,
         # gives the start of the last sub-occurrence.
         {init, [_last]} = Enum.split(parts, -1)
+
         Enum.reduce(init, 0, fn p, acc -> acc + String.length(p) + String.length(sub) end) -
           String.length(sub)
     end
@@ -743,10 +746,13 @@ defmodule Pylixir.RuntimeHelpers do
     |> String.graphemes()
     |> Enum.map_join("", fn g ->
       cond do
-        Map.has_key?(table, g) -> Map.fetch!(table, g) || ""
+        Map.has_key?(table, g) ->
+          Map.fetch!(table, g) || ""
+
         true ->
           # Codepoint-int lookup for Python-style ord-keyed tables.
           [cp | _] = String.to_charlist(g)
+
           case Map.fetch(table, cp) do
             {:ok, nil} -> ""
             {:ok, v} when is_integer(v) -> <<v::utf8>>
@@ -775,8 +781,11 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_str_replace_n_loop(s, old, new, count, acc) do
     case :binary.split(s, old) do
-      [whole] -> acc <> whole
-      [before, after_part] -> py_str_replace_n_loop(after_part, old, new, count - 1, acc <> before <> new)
+      [whole] ->
+        acc <> whole
+
+      [before, after_part] ->
+        py_str_replace_n_loop(after_part, old, new, count - 1, acc <> before <> new)
     end
   end
 
@@ -790,7 +799,8 @@ defmodule Pylixir.RuntimeHelpers do
   # convention) — degenerate to a plain split.
   def py_str_rsplit(s, sep, -1), do: String.split(s, sep)
 
-  def py_str_rsplit(s, sep, maxsplit) when is_binary(s) and is_binary(sep) and is_integer(maxsplit) do
+  def py_str_rsplit(s, sep, maxsplit)
+      when is_binary(s) and is_binary(sep) and is_integer(maxsplit) do
     String.reverse(s)
     |> String.split(String.reverse(sep), parts: maxsplit + 1)
     |> Enum.map(&String.reverse/1)
@@ -807,12 +817,14 @@ defmodule Pylixir.RuntimeHelpers do
   # character, which is what the != against the case-flipped form
   # checks.
   def py_str_islower(""), do: false
+
   def py_str_islower(s) when is_binary(s) do
     has_cased? = s != String.upcase(s) or s != String.downcase(s)
     has_cased? and s == String.downcase(s)
   end
 
   def py_str_isupper(""), do: false
+
   def py_str_isupper(s) when is_binary(s) do
     has_cased? = s != String.upcase(s) or s != String.downcase(s)
     has_cased? and s == String.upcase(s)
@@ -840,6 +852,7 @@ defmodule Pylixir.RuntimeHelpers do
   # Python's `str.capitalize()` — first char to upper, everything else
   # to lower. Empty string is unchanged.
   def py_str_capitalize(""), do: ""
+
   def py_str_capitalize(s) when is_binary(s) do
     {first, rest} = String.split_at(s, 1)
     String.upcase(first) <> String.downcase(rest)
@@ -895,8 +908,11 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_str_strip_iter(s, set, :leading) do
     case String.next_grapheme(s) do
-      nil -> s
-      {ch, rest} -> if MapSet.member?(set, ch), do: py_str_strip_iter(rest, set, :leading), else: s
+      nil ->
+        s
+
+      {ch, rest} ->
+        if MapSet.member?(set, ch), do: py_str_strip_iter(rest, set, :leading), else: s
     end
   end
 
@@ -961,6 +977,7 @@ defmodule Pylixir.RuntimeHelpers do
   end
 
   def drop_trailing_empty([]), do: []
+
   def drop_trailing_empty(list) do
     case List.last(list) do
       "" -> Enum.slice(list, 0, length(list) - 1)
@@ -1473,7 +1490,13 @@ defmodule Pylixir.RuntimeHelpers do
 
         inner =
           Enum.map_intersperse(kvs, item_sep, fn {k, v} ->
-            [?", py_json_escape(py_json_key_str(k), []), ?", ": ", py_json_enc(v, indent, depth + 1)]
+            [
+              ?",
+              py_json_escape(py_json_key_str(k), []),
+              ?",
+              ": ",
+              py_json_enc(v, indent, depth + 1)
+            ]
           end)
 
         [?{, inner_pad, inner, close_pad, ?}]
@@ -1570,17 +1593,29 @@ defmodule Pylixir.RuntimeHelpers do
   # instead.
   def py_iter_next(ref) when is_integer(ref) do
     case Process.get({:pylixir_iter, ref}) do
-      nil -> raise RuntimeError, "StopIteration: not an iterator (ref=#{ref})"
-      [] -> raise RuntimeError, "StopIteration"
-      [h | t] -> Process.put({:pylixir_iter, ref}, t); h
+      nil ->
+        raise RuntimeError, "StopIteration: not an iterator (ref=#{ref})"
+
+      [] ->
+        raise RuntimeError, "StopIteration"
+
+      [h | t] ->
+        Process.put({:pylixir_iter, ref}, t)
+        h
     end
   end
 
   def py_iter_next(ref, default) when is_integer(ref) do
     case Process.get({:pylixir_iter, ref}) do
-      nil -> default
-      [] -> default
-      [h | t] -> Process.put({:pylixir_iter, ref}, t); h
+      nil ->
+        default
+
+      [] ->
+        default
+
+      [h | t] ->
+        Process.put({:pylixir_iter, ref}, t)
+        h
     end
   end
 

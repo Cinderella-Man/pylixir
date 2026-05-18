@@ -51,16 +51,14 @@ defmodule Pylixir.HelpersCodegen do
   @start_sentinel "# --- HELPERS START ---"
   @end_sentinel "# --- HELPERS END ---"
 
-  @helpers_source (
-                    @helper_files
-                    |> Enum.map(fn path ->
-                      raw = File.read!(path)
-                      [_before, rest] = String.split(raw, @start_sentinel, parts: 2)
-                      [body, _after] = String.split(rest, @end_sentinel, parts: 2)
-                      String.trim(body)
-                    end)
-                    |> Enum.join("\n\n")
-                  )
+  @helpers_source @helper_files
+                  |> Enum.map(fn path ->
+                    raw = File.read!(path)
+                    [_before, rest] = String.split(raw, @start_sentinel, parts: 2)
+                    [body, _after] = String.split(rest, @end_sentinel, parts: 2)
+                    String.trim(body)
+                  end)
+                  |> Enum.join("\n\n")
 
   # Parse once at compile time. Wrap in a throwaway `defmodule` so the
   # def's get a valid syntactic context (defs aren't standalone
@@ -82,41 +80,35 @@ defmodule Pylixir.HelpersCodegen do
   # Compile-time index: every `def` head unwrapped to `{name, args}`.
   # Used to feed the by-name / order / deps tables below. Mirrors the
   # `head` extraction shape that `@helper_names` already relied on.
-  @helper_heads (
-                  Enum.map(@helpers_ast, fn {:def, _, [head, _body_kw]} ->
-                    case head do
-                      {:when, _, [{n, _, a}, _guard]} -> {n, a || []}
-                      {n, _, a} -> {n, a || []}
-                    end
-                  end)
-                )
+  @helper_heads Enum.map(@helpers_ast, fn {:def, _, [head, _body_kw]} ->
+                  case head do
+                    {:when, _, [{n, _, a}, _guard]} -> {n, a || []}
+                    {n, _, a} -> {n, a || []}
+                  end
+                end)
 
   # `name -> [def_ast]`. Multi-clause helpers (e.g. `py_add` has 8
   # clauses) must be spliced together; this map keeps them grouped.
-  @helpers_by_name (
-                    @helpers_ast
-                    |> Enum.zip(@helper_heads)
-                    |> Enum.reduce(%{}, fn {def_ast, {name, _args}}, acc ->
-                      Map.update(acc, name, [def_ast], &[def_ast | &1])
-                    end)
-                    |> Enum.into(%{}, fn {k, v} -> {k, Enum.reverse(v)} end)
-                  )
+  @helpers_by_name @helpers_ast
+                   |> Enum.zip(@helper_heads)
+                   |> Enum.reduce(%{}, fn {def_ast, {name, _args}}, acc ->
+                     Map.update(acc, name, [def_ast], &[def_ast | &1])
+                   end)
+                   |> Enum.into(%{}, fn {k, v} -> {k, Enum.reverse(v)} end)
 
   # First-seen order of helper names across the parsed source. Preserves
   # the canonical emission order so output diffs after tree-shaking only
   # show *removals*, not reorderings.
-  @helper_order (
-                  @helper_heads
-                  |> Enum.reduce({[], MapSet.new()}, fn {name, _}, {order, seen} ->
-                    if MapSet.member?(seen, name) do
-                      {order, seen}
-                    else
-                      {[name | order], MapSet.put(seen, name)}
-                    end
-                  end)
-                  |> elem(0)
-                  |> Enum.reverse()
-                )
+  @helper_order @helper_heads
+                |> Enum.reduce({[], MapSet.new()}, fn {name, _}, {order, seen} ->
+                  if MapSet.member?(seen, name) do
+                    {order, seen}
+                  else
+                    {[name | order], MapSet.put(seen, name)}
+                  end
+                end)
+                |> elem(0)
+                |> Enum.reverse()
 
   @helper_name_set MapSet.new(@helper_order)
 
@@ -366,7 +358,7 @@ defmodule Pylixir.HelpersCodegen do
     end
   end
 
-# Compute the set of `{name, arity}` pairs at Pylixir's compile time so
+  # Compute the set of `{name, arity}` pairs at Pylixir's compile time so
   # the linkage check (see `test/pylixir/helpers_linkage_test.exs`) costs
   # nothing at runtime. Helpers with a `when` guard wrap the head in
   # `{:when, _, [{name, _, args}, guard]}` — unwrap before extracting.

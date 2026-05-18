@@ -31,9 +31,7 @@ defmodule Pylixir.Stdlib.Sys do
   # CPython). `sys.stdin.read()` / `sys.stdin.readline()` are separate
   # multi-segment clauses below and don't go through this path.
   def attribute(["stdin"], _node),
-    do:
-      {:ok,
-       {{:., [], [{:__aliases__, [], [:IO]}, :stream]}, [], [:stdio, :line]}}
+    do: {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :stream]}, [], [:stdio, :line]}}
 
   def attribute(["stdout"], _node),
     do: {:error, "bare `sys.stdout` is not supported — use `print(...)` or `sys.stdout.write(s)`"}

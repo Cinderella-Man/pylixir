@@ -175,8 +175,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("format", _target, _args, _kw, node) do
     raise UnsupportedNodeError,
       node_type: "Call",
-      hint:
-        "`.format(...)` is only supported when the template is a literal string",
+      hint: "`.format(...)` is only supported when the template is a literal string",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end
@@ -367,8 +366,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # Python-style (Enum.join on a BitString crashes).
   defp do_dispatch("join", sep, [items], _kw, _node),
     do:
-      {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [],
-       [{:py_iter_to_list, [], [items]}, sep]}
+      {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [{:py_iter_to_list, [], [items]}, sep]}
 
   # --- T29b string methods: search / split / replace / classification ---
 
@@ -631,8 +629,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
       :error ->
         raise UnsupportedNodeError,
           node_type: "Call",
-          hint:
-            "`\"#{template}\".format(...)` — keyword `{#{name}}` has no matching kwarg",
+          hint: "`\"#{template}\".format(...)` — keyword `{#{name}}` has no matching kwarg",
           lineno: Map.get(node, "lineno"),
           col_offset: Map.get(node, "col_offset")
     end
@@ -666,5 +663,4 @@ defmodule Pylixir.Nodes.AttributeMethods do
     {{:., [], [{:__aliases__, [], [:Regex]}, :match?]}, [],
      [{:sigil_r, [], [{:<<>>, [], [pattern]}, []]}, target]}
   end
-
 end

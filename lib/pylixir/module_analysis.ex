@@ -565,7 +565,9 @@ defmodule Pylixir.ModuleAnalysis do
         # Add the newly-demoted names to the closure-binding set and
         # iterate over the remaining kept fns. Stop when no new fns
         # demote in a pass.
-        names = Enum.reduce(demoted, names, fn fn_node, acc -> MapSet.put(acc, fn_node["name"]) end)
+        names =
+          Enum.reduce(demoted, names, fn fn_node, acc -> MapSet.put(acc, fn_node["name"]) end)
+
         {kept_final, demoted_rest} = do_demote_fixpoint(kept, names)
         {kept_final, demoted ++ demoted_rest}
     end
@@ -786,7 +788,7 @@ defmodule Pylixir.ModuleAnalysis do
       end)
 
     flushed = topo_sort_run(Enum.reverse(run), demoted_set)
-    Enum.reverse(flushed) ++ acc |> Enum.reverse()
+    (Enum.reverse(flushed) ++ acc) |> Enum.reverse()
   end
 
   defp topo_sort_run([], _), do: []
@@ -911,7 +913,11 @@ defmodule Pylixir.ModuleAnalysis do
   # The `name` itself is the function's binding, but the *body* may
   # see it for recursion. Either way, treat params as shadowing reads
   # inside the body.
-  defp referenced_names(%{"_type" => "FunctionDef", "args" => args, "body" => body}, acc, shadowed) do
+  defp referenced_names(
+         %{"_type" => "FunctionDef", "args" => args, "body" => body},
+         acc,
+         shadowed
+       ) do
     inner = MapSet.union(shadowed, lambda_arg_names(args))
     referenced_names(body, acc, inner)
   end
@@ -932,7 +938,11 @@ defmodule Pylixir.ModuleAnalysis do
     referenced_names(gens, acc, inner)
   end
 
-  defp referenced_names(%{"_type" => "DictComp", "key" => k, "value" => v, "generators" => gens}, acc, shadowed) do
+  defp referenced_names(
+         %{"_type" => "DictComp", "key" => k, "value" => v, "generators" => gens},
+         acc,
+         shadowed
+       ) do
     inner = MapSet.union(shadowed, comp_target_names(gens))
     acc = referenced_names(k, acc, inner)
     acc = referenced_names(v, acc, inner)
