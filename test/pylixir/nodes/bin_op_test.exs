@@ -63,14 +63,21 @@ defmodule Pylixir.Nodes.BinOpTest do
   end
 
   describe "AST shape — T11 ops" do
-    test "FloorDiv emits py_floor_div" do
+    test "FloorDiv on two int literals specializes to Integer.floor_div" do
+      # Both operands are `int_lit_nonneg` per `TypeInfer.infer_expr`,
+      # which satisfies `TypeInfer.is_int?/1`. The bin_op_ast clause
+      # specializes — `py_floor_div` only emitted when one operand is
+      # `:any` / bool-tainted / non-int.
       {ast, _} = Converter.convert(binop("FloorDiv", const(7), const(2)), Context.new())
-      assert ast == {:py_floor_div, [], [7, 2]}
+      assert ast == {{:., [], [{:__aliases__, [], [:Integer]}, :floor_div]}, [], [7, 2]}
     end
 
-    test "Mod emits py_mod" do
+    test "Mod on two int literals specializes to Integer.mod" do
+      # Same reasoning as FloorDiv. Avoids dragging `py_mod`'s polymorphic
+      # binary-string clause + the entire percent-format helper cascade
+      # into the output for an obviously-int operation.
       {ast, _} = Converter.convert(binop("Mod", const(7), const(2)), Context.new())
-      assert ast == {:py_mod, [], [7, 2]}
+      assert ast == {{:., [], [{:__aliases__, [], [:Integer]}, :mod]}, [], [7, 2]}
     end
 
     test "LShift emits Bitwise.bsl (fully-qualified)" do

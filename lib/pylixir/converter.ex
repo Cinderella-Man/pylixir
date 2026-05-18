@@ -1505,10 +1505,38 @@ defmodule Pylixir.Converter do
   # helper. `lt`/`rt` are accepted for API uniformity.
   defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node, _lt, _rt), do: {:py_pow, [], [l, r]}
 
-  defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node, _lt, _rt),
-    do: {:py_floor_div, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) -> {:py_floor_div, [], [l, r]}
 
-  defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node, _lt, _rt), do: {:py_mod, [], [l, r]}
+      TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) ->
+        {{:., [], [{:__aliases__, [], [:Integer]}, :floor_div]}, [], [l, r]}
+
+      true ->
+        {:py_floor_div, [], [l, r]}
+    end
+  end
+
+  # `int % int` → `Integer.mod/2`. Specialization avoids pulling in
+  # `py_mod`'s polymorphic clauses, which include a `is_binary(a)`
+  # branch that drags the *entire* percent-format machinery
+  # (`py_str_percent_format`, `parse_percent_*`, `format_percent_*`,
+  # which in turn pull `py_str` + `py_repr`). One unspecialised `i %
+  # 15` against an obviously-int operand was therefore enough to
+  # inflate a 9-line fizzbuzz to a ~320-line emit. Bool-tainted falls
+  # through because `True % 2` is `1` in Python but `true % 2` raises
+  # in Elixir.
+  defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) -> {:py_mod, [], [l, r]}
+
+      TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) ->
+        {{:., [], [{:__aliases__, [], [:Integer]}, :mod]}, [], [l, r]}
+
+      true ->
+        {:py_mod, [], [l, r]}
+    end
+  end
   defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsl, l, r)
   defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsr, l, r)
   # Python's `|` / `&` / `^` are overloaded: bitwise on ints, set ops
