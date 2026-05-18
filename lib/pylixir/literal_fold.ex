@@ -139,4 +139,158 @@ defmodule Pylixir.LiteralFold do
   defp truthy?(""), do: false
   defp truthy?([]), do: false
   defp truthy?(_), do: true
+
+  @doc """
+  Compute Python's `repr(value)` for a BEAM term at compile time.
+
+  Same surface as `Pylixir.RuntimeHelpers.py_repr/1` but operates on the
+  already-materialised BEAM term (post-`fold/1`). Returns `:error` for
+  shapes we don't support — floats, nested non-foldable values, structs
+  other than `MapSet`. The runtime path stays correct for the `:error`
+  fallback.
+
+  Algorithm mirrored from the runtime helper after the escape-table
+  fix; this is the single source of truth (the runtime clause
+  delegates back here to keep behaviour identical).
+  """
+  @spec repr_of(term()) :: {:ok, binary()} | :error
+  def repr_of(true), do: {:ok, "True"}
+  def repr_of(false), do: {:ok, "False"}
+  def repr_of(nil), do: {:ok, "None"}
+  def repr_of(v) when is_integer(v), do: {:ok, Integer.to_string(v)}
+  def repr_of(v) when is_binary(v), do: {:ok, str_repr(v)}
+
+  def repr_of(v) when is_list(v), do: fold_seq(v, "[", "]")
+
+  def repr_of(v) when is_tuple(v) and tuple_size(v) == 1 do
+    with {:ok, r} <- repr_of(elem(v, 0)), do: {:ok, "(" <> r <> ",)"}
+  end
+
+  def repr_of(v) when is_tuple(v), do: fold_seq(Tuple.to_list(v), "(", ")")
+
+  def repr_of(%MapSet{} = s) do
+    case MapSet.to_list(s) do
+      [] -> {:ok, "set()"}
+      xs -> fold_seq(xs, "{", "}")
+    end
+  end
+
+  def repr_of(v) when is_map(v) and not is_struct(v) do
+    with {:ok, pairs} <- fold_pairs(Map.to_list(v)),
+         do: {:ok, "{" <> Enum.join(pairs, ", ") <> "}"}
+  end
+
+  # Floats / structs / pids / refs / functions — runtime handles these.
+  def repr_of(_), do: :error
+
+  @doc """
+  Compute Python's `str(value)` for a BEAM term at compile time.
+
+  Identical to `repr_of/1` for every type EXCEPT binary, where `str()`
+  returns the string unchanged (no quotes, no escapes — Python's `str`
+  of a string is the identity).
+  """
+  @spec str_of(term()) :: {:ok, binary()} | :error
+  def str_of(v) when is_binary(v), do: {:ok, v}
+  def str_of(v), do: repr_of(v)
+
+  @doc """
+  Compute Python's `repr()` of a single string. Chooses single vs.
+  double quotes the way Python does (prefer single; switch to double
+  when the string contains `'` and no `"`) and applies the full
+  Python escape table.
+
+  Used both as `repr_of/1`'s binary clause and (after Q4 back-port) as
+  the runtime `py_repr/1` and `py_repr_str/1` binary implementations.
+  """
+  @spec str_repr(binary()) :: binary()
+  def str_repr(s) when is_binary(s) do
+    escaped = str_escape_body(s)
+    has_single = String.contains?(escaped, "'")
+    has_double = String.contains?(escaped, "\"")
+
+    if has_single and not has_double do
+      "\"" <> escaped <> "\""
+    else
+      "'" <> String.replace(escaped, "'", "\\'") <> "'"
+    end
+  end
+
+  # Python-correct escape table. Three observations to get right:
+  #
+  # 1. Backslash MUST be replaced FIRST, otherwise the `\\xNN` we
+  #    insert later would be re-escaped to `\\\\xNN`.
+  # 2. Python's repr uses named-escape sequences ONLY for `\n` `\t`
+  #    `\r` (and `\\` `\'` `\"`). Despite C / many other languages,
+  #    `\a` (0x07), `\b` (0x08), `\f` (0x0c), `\v` (0x0b) are NOT
+  #    named in Python repr output — they emit as `\x07`/`\x08`/etc.
+  # 3. All other C0 controls (0x00-0x1F minus the three named) and
+  #    all of C1 (0x7F-0x9F) emit as `\xNN` with two lowercase hex
+  #    digits.
+  #
+  # Applied to the string body BEFORE the quote-choice in `str_repr/1`.
+  defp str_escape_body(s) do
+    s
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\n", "\\n")
+    |> String.replace("\t", "\\t")
+    |> String.replace("\r", "\\r")
+    |> hex_escape_remaining_controls()
+  end
+
+  defp hex_escape_remaining_controls(s) do
+    for <<cp::utf8 <- s>>, into: "" do
+      cond do
+        # C0 controls minus the three already named (0x09 \t, 0x0A
+        # \n, 0x0D \r): full 0x00-0x1F range except those three.
+        cp <= 0x08 or cp == 0x0B or cp == 0x0C or (cp >= 0x0E and cp <= 0x1F) ->
+          hex_byte(cp)
+
+        # DEL + C1 controls (0x7F-0x9F). Higher printable Unicode is
+        # left as-is — Python repr keeps printable codepoints raw.
+        cp >= 0x7F and cp <= 0x9F ->
+          hex_byte(cp)
+
+        true ->
+          <<cp::utf8>>
+      end
+    end
+  end
+
+  defp hex_byte(cp) do
+    "\\x" <> (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+  end
+
+  # `fold_seq([1, 2, 3], "[", "]") -> {:ok, "[1, 2, 3]"}`. Recursively
+  # repr's each element; halts on the first `:error`.
+  defp fold_seq(items, open, close) do
+    items
+    |> Enum.reduce_while({:ok, []}, fn elem, {:ok, acc} ->
+      case repr_of(elem) do
+        {:ok, r} -> {:cont, {:ok, [r | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, rev} -> {:ok, open <> Enum.join(Enum.reverse(rev), ", ") <> close}
+      :error -> :error
+    end
+  end
+
+  # Each key + value through `repr_of/1`; pair joined by `": "`.
+  defp fold_pairs(kvs) do
+    kvs
+    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
+      with {:ok, kr} <- repr_of(k),
+           {:ok, vr} <- repr_of(v) do
+        {:cont, {:ok, [kr <> ": " <> vr | acc]}}
+      else
+        _ -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, rev} -> {:ok, Enum.reverse(rev)}
+      :error -> :error
+    end
+  end
 end

@@ -190,6 +190,12 @@ defmodule Pylixir.ModuleAnalysis do
     stmts =
       merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
       |> topo_sort_demoted_runs(MapSet.new(demoted_fns, & &1["name"]))
+      |> Pylixir.SingleUseClosureInline.rewrite()
+
+    # Apply the same inline pass to each surviving top-level def's
+    # body — catches patterns like `def go(...): ...` nested inside
+    # `def foldl(f)` whose `go` is only used once.
+    fns = Enum.map(fns, &inline_fn_body/1)
 
     fn_known = MapSet.new(fns, & &1["name"])
     # Hoisted import names also become module-top defps, so they
@@ -1282,4 +1288,14 @@ defmodule Pylixir.ModuleAnalysis do
   end
 
   defp target_mentions?(_, _), do: false
+
+  # Apply the single-use closure inliner to a top-level FunctionDef's
+  # body so patterns like nested `def go(...): ...` inside `def foldl`
+  # get rewritten before the converter sees them. Lambdas inside the
+  # body are left intact (they live as expressions; see the pass's
+  # `recurse_into` clause for the boundary).
+  defp inline_fn_body(%{"body" => body} = node) when is_list(body),
+    do: %{node | "body" => Pylixir.SingleUseClosureInline.rewrite(body)}
+
+  defp inline_fn_body(node), do: node
 end

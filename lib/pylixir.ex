@@ -29,7 +29,9 @@ defmodule Pylixir do
   """
   @spec to_source(map()) :: String.t()
   def to_source(python_ast) when is_map(python_ast) do
-    analysis = ModuleAnalysis.analyze(python_ast["body"] || [])
+    body = Pylixir.LiteralPropagation.rewrite(python_ast["body"] || [])
+    python_ast = Map.put(python_ast, "body", body)
+    analysis = ModuleAnalysis.analyze(body)
 
     context = %{
       Context.new(analysis.known_functions)

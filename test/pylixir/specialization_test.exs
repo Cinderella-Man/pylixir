@@ -63,10 +63,15 @@ defmodule Pylixir.SpecializationTest do
       refute out =~ "py_mult("
     end
 
-    test ~s|literal "abc" * 3 specializes to String.duplicate (Q2-B)| do
+    test ~s|literal "abc" * 3 folds to a static string at compile time| do
+      # `LiteralPropagation` recognises `"-" * 80` as a foldable
+      # expression (`LiteralFold` handles `binary * int`) and folds
+      # the entire `print` arg to the 80-char repeat. No
+      # `String.duplicate` call survives — the better outcome.
       out = Pylixir.transpile(~s|print("-" * 80)\n|)
       refute out =~ "py_mult("
-      assert out =~ "String.duplicate"
+      refute out =~ "String.duplicate"
+      assert out =~ String.duplicate("-", 80)
     end
 
     test "literal [0] * 100 specializes to List.duplicate |> Enum.concat (Q2-B)" do
@@ -241,20 +246,26 @@ defmodule Pylixir.SpecializationTest do
   end
 
   describe "S3: typed container inline reprs" do
-    test "print([int, ...]) inlines, no py_str/py_repr_*" do
+    test "print([int, ...]) folds to a static literal at compile time" do
+      # `LiteralPropagation` now folds the entire list literal to its
+      # repr string before the typed-container inline path even runs.
+      # The earlier S3 path (Enum.map_join + Integer.to_string) is
+      # still reachable for *dynamic* lists; this test now pins the
+      # superior outcome — a static binary in the output.
       out = Pylixir.transpile("print([1, 2, 3])\n")
       refute out =~ "py_str"
       refute out =~ "py_repr"
-      assert out =~ "Enum.map_join"
-      assert out =~ "Integer.to_string"
+      assert out =~ ~s|"[1, 2, 3]"|
     end
 
-    test "print({str: int}) inlines dict repr with py_repr_str for keys" do
+    test "print({str: int}) folds the entire dict to a static literal" do
       out = Pylixir.transpile(~s|print({"a": 1, "b": 2})\n|)
       refute out =~ "py_str("
       refute out =~ "py_repr_map"
-      assert out =~ "py_repr_str"
-      assert out =~ "Integer.to_string"
+      # Dict literal is fully static — folded to the repr binary
+      # rather than going through py_repr_str + Integer.to_string at
+      # runtime.
+      assert out =~ ~s|"{'a': 1, 'b': 2}"|
     end
 
     test "print([[int]]) recurses nested-list inline" do
@@ -622,7 +633,12 @@ defmodule Pylixir.SpecializationTest do
       assert out =~ "f()"
     end
 
-    test "f-string of an int variable specializes to Integer.to_string" do
+    test "f-string of an int variable folds to the literal at compile time" do
+      # `n = 5; f"{n}"` — LiteralPropagation sees `n` as a literal
+      # binding (single assign to a foldable Constant, no mutation /
+      # alias / escape inside f). The f-string segment for `n`
+      # resolves to `5` then folds to `"5"`. We never need
+      # `Integer.to_string(n)` at runtime — the better outcome.
       src = """
       def f():
           n = 5
@@ -632,7 +648,8 @@ defmodule Pylixir.SpecializationTest do
 
       out = Pylixir.transpile(src)
       refute out =~ "py_str(n)"
-      assert out =~ "Integer.to_string(n)"
+      refute out =~ "Integer.to_string(n)"
+      assert out =~ ~s|"5"|
     end
   end
 end

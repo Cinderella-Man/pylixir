@@ -600,10 +600,51 @@ defmodule Pylixir.RuntimeHelpers do
     sign <> formatted
   end
 
+  # Python-correct `repr` of a string. Implements quote-choice (prefer
+  # single; switch to double when the input contains `'` and no `"`)
+  # plus the full escape table: `\\` `\n` `\t` `\r` named, every
+  # other C0 (0x00-0x1F) and C1 (0x7F-0x9F) control codepoint as
+  # `\xNN`. The algorithm is duplicated in
+  # `Pylixir.LiteralFold.str_repr/1` for the compile-time fold path;
+  # a sync test in `test/pylixir/repr_sync_test.exs` asserts the two
+  # paths produce identical output for a fuzz corpus, catching any
+  # drift.
+  #
+  # No private helpers — `helpers_codegen.ex` only parses top-level
+  # `def`s within the sentinel block, so we inline the escape walk
+  # rather than refactor into smaller defs.
   def py_repr(x) when is_binary(x) do
-    if String.contains?(x, "'") and not String.contains?(x, "\""),
-      do: "\"" <> x <> "\"",
-      else: "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
+    escaped =
+      x
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\t", "\\t")
+      |> String.replace("\r", "\\r")
+
+    escaped =
+      for <<cp::utf8 <- escaped>>, into: "" do
+        cond do
+          cp <= 0x08 or cp == 0x0B or cp == 0x0C or (cp >= 0x0E and cp <= 0x1F) ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          cp >= 0x7F and cp <= 0x9F ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          true ->
+            <<cp::utf8>>
+        end
+      end
+
+    has_single = String.contains?(escaped, "'")
+    has_double = String.contains?(escaped, "\"")
+
+    if has_single and not has_double do
+      "\"" <> escaped <> "\""
+    else
+      "'" <> String.replace(escaped, "'", "\\'") <> "'"
+    end
   end
 
   def py_repr(x) when is_list(x),
@@ -633,17 +674,44 @@ defmodule Pylixir.RuntimeHelpers do
   def py_repr(x), do: py_str(x)
 
   # S3 — Python-correct quote choice for `repr(<str>)`, used by the
-  # typed-container print path. Independent of py_repr/1 so it
-  # tree-shakes alone when the inline path is the only consumer (saves
-  # ~150 bytes vs delegating from py_repr's binary clause, which would
-  # also pull py_str via py_repr's catch-all). Logic is duplicated by
-  # design — same 5 lines as py_repr's binary clause above, so the
-  # two paths stay aligned. "foo" → 'foo'; "can't" → "can't"; both
-  # quote types → single-outer with escapes.
+  # typed-container print path. Kept as a standalone helper (rather
+  # than delegating through `py_repr` or an outer module) so tree-
+  # shaking can drop it when the inline path is the only consumer —
+  # pulling `py_repr` in would also pull `py_str` via its catch-all.
+  # Algorithm identical to `py_repr/1`'s binary clause; the sync
+  # test in `repr_sync_test.exs` keeps them aligned.
   def py_repr_str(s) when is_binary(s) do
-    if String.contains?(s, "'") and not String.contains?(s, "\""),
-      do: "\"" <> s <> "\"",
-      else: "'" <> String.replace(String.replace(s, "\\", "\\\\"), "'", "\\'") <> "'"
+    escaped =
+      s
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\t", "\\t")
+      |> String.replace("\r", "\\r")
+
+    escaped =
+      for <<cp::utf8 <- escaped>>, into: "" do
+        cond do
+          cp <= 0x08 or cp == 0x0B or cp == 0x0C or (cp >= 0x0E and cp <= 0x1F) ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          cp >= 0x7F and cp <= 0x9F ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          true ->
+            <<cp::utf8>>
+        end
+      end
+
+    has_single = String.contains?(escaped, "'")
+    has_double = String.contains?(escaped, "\"")
+
+    if has_single and not has_double do
+      "\"" <> escaped <> "\""
+    else
+      "'" <> String.replace(escaped, "'", "\\'") <> "'"
+    end
   end
 
   # === String methods ===

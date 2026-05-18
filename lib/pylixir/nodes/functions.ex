@@ -29,7 +29,15 @@ defmodule Pylixir.Nodes.Functions do
   `body_to_block`) live on `Pylixir.Converter`.
   """
 
-  alias Pylixir.{AST.Walk, Context, ControlFlow, Converter, Naming, UnsupportedNodeError}
+  alias Pylixir.{
+    AST.Walk,
+    Context,
+    ControlFlow,
+    Converter,
+    Naming,
+    TypeInfer.IsinstanceNarrowing,
+    UnsupportedNodeError
+  }
 
   # --- Public entry points -----------------------------------------------
 
@@ -58,6 +66,7 @@ defmodule Pylixir.Nodes.Functions do
     reject_defaults!(args, "Lambda", node)
     {param_asts, context} = build_param_asts(args, context)
     param_names = arg_names(args)
+    param_asts = mark_unused_params(param_asts, param_names, body)
 
     saved_scopes = context.scopes
     new_scope = MapSet.new(param_names)
@@ -94,6 +103,7 @@ defmodule Pylixir.Nodes.Functions do
 
     {param_asts, context} = build_param_asts(args, context)
     param_names = arg_names(args)
+    param_asts = mark_unused_params(param_asts, param_names, body)
     return_mode = decide_return_mode(body)
 
     saved_scopes = context.scopes
@@ -198,46 +208,230 @@ defmodule Pylixir.Nodes.Functions do
     }
 
     {doc, stripped_body} = extract_docstring(body)
-    {body_asts, context} = Converter.convert_each(stripped_body, context)
-
-    context = %{
-      context
-      | scopes: saved_scopes,
-        def_position: saved_def_position,
-        return_mode: saved_return_mode,
-        types: saved_types
-    }
-
-    body_block =
-      case body_asts do
-        [] -> nil
-        _ -> Converter.body_to_block(body_asts)
-      end
-
-    body_block = maybe_wrap_return_catch(body_block, return_mode)
 
     fn_name_atom = py_name |> Naming.rewrite() |> String.to_atom()
-    # Top-level Python `def f` → Elixir `def f` (not `defp`). Two
-    # reasons: `@doc` only attaches cleanly to public functions (defp
-    # warns "always discarded"), and `apply(__MODULE__, :f, args)`
-    # in the star-unpack-call path needs `f` to be reachable.
-    def_ast = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_block]]}
 
-    case doc do
-      nil ->
-        {def_ast, context}
+    case isinstance_dispatch_pattern(stripped_body, param_names) do
+      {:ok, test_node, type_ref, body_expr, orelse_expr} ->
+        emit_isinstance_dispatch(
+          fn_name_atom,
+          param_asts,
+          test_node,
+          type_ref,
+          body_expr,
+          orelse_expr,
+          doc,
+          context,
+          saved_scopes,
+          saved_def_position,
+          saved_return_mode,
+          saved_types
+        )
 
-      text when is_binary(text) ->
-        # M5 — return @doc + def as a flat list rather than a
-        # `__block__` tuple. `Pylixir.Converter`'s Module clause
-        # flat-maps fn_asts before splicing, so each member appears at
-        # module-top scope (no `(...)` wrapping from `Macro.to_string`
-        # rendering 2-item blocks). Each call site that handles a
-        # `FunctionDef` result must be ready for a list.
-        doc_attr = {:@, [], [{:doc, [], [text]}]}
-        {[doc_attr, def_ast], context}
+      :no ->
+        {body_asts, context} = Converter.convert_each(stripped_body, context)
+
+        context = %{
+          context
+          | scopes: saved_scopes,
+            def_position: saved_def_position,
+            return_mode: saved_return_mode,
+            types: saved_types
+        }
+
+        body_block =
+          case body_asts do
+            [] -> nil
+            _ -> Converter.body_to_block(body_asts)
+          end
+
+        body_block = maybe_wrap_return_catch(body_block, return_mode)
+
+        # Top-level Python `def f` → Elixir `def f` (not `defp`). Two
+        # reasons: `@doc` only attaches cleanly to public functions (defp
+        # warns "always discarded"), and `apply(__MODULE__, :f, args)`
+        # in the star-unpack-call path needs `f` to be reachable.
+        def_ast = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_block]]}
+
+        case doc do
+          nil ->
+            {def_ast, context}
+
+          text when is_binary(text) ->
+            # M5 — return @doc + def as a flat list rather than a
+            # `__block__` tuple. `Pylixir.Converter`'s Module clause
+            # flat-maps fn_asts before splicing, so each member appears at
+            # module-top scope (no `(...)` wrapping from `Macro.to_string`
+            # rendering 2-item blocks). Each call site that handles a
+            # `FunctionDef` result must be ready for a list.
+            doc_attr = {:@, [], [{:doc, [], [text]}]}
+            {[doc_attr, def_ast], context}
+        end
     end
   end
+
+  # Detect `def f(<single_param>): [docstring]; return <body> if
+  # isinstance(<single_param>, T) else <orelse>` for one of the bare
+  # type names we can lower into an Elixir guard. Returns either
+  # `{:ok, test_node, type_ref, body_expr, orelse_expr}` or `:no`.
+  defp isinstance_dispatch_pattern(
+         [
+           %{
+             "_type" => "Return",
+             "value" => %{
+               "_type" => "IfExp",
+               "test" =>
+                 %{
+                   "_type" => "Call",
+                   "func" => %{"_type" => "Name", "id" => "isinstance"},
+                   "args" => [%{"_type" => "Name", "id" => target_id}, type_ref]
+                 } = test_node,
+               "body" => body_expr,
+               "orelse" => orelse_expr
+             }
+           }
+         ],
+         [param_name]
+       ) do
+    if target_id == param_name and dispatchable_isinstance_type?(type_ref) do
+      {:ok, test_node, type_ref, body_expr, orelse_expr}
+    else
+      :no
+    end
+  end
+
+  defp isinstance_dispatch_pattern(_body, _params), do: :no
+
+  # Types we know how to express as an Elixir guard. `set` is
+  # excluded — would require head-match (`%MapSet{} = x`) form which
+  # complicates clause emission; defer.
+  defp dispatchable_isinstance_type?(%{"_type" => "Name", "id" => id})
+       when id in ~w(int float str bool list tuple dict),
+       do: true
+
+  defp dispatchable_isinstance_type?(_), do: false
+
+  defp emit_isinstance_dispatch(
+         fn_name_atom,
+         param_asts,
+         test_node,
+         type_ref,
+         body_expr,
+         orelse_expr,
+         doc,
+         context,
+         saved_scopes,
+         saved_def_position,
+         saved_return_mode,
+         saved_types
+       ) do
+    [param_ast] = param_asts
+    [%{"_type" => "Name", "id" => param_name}, _] = test_node["args"]
+    param_type = Map.get(context.types, param_name, :any)
+
+    # If the param's static lattice type proves isinstance(param, T) is
+    # always true (E2 const-fold path), the orelse clause is dead —
+    # emit a single-clause def. Mirrors `const_fold_if_test/2` in the
+    # converter; kept inline because emission happens before `convert`.
+    if isinstance_proves_match?(param_type, type_ref) do
+      body_ctx = IsinstanceNarrowing.narrow(test_node, context)
+      {body_ast, body_ctx} = Converter.convert(body_expr, body_ctx)
+
+      context = %{
+        body_ctx
+        | scopes: saved_scopes,
+          def_position: saved_def_position,
+          return_mode: saved_return_mode,
+          types: saved_types
+      }
+
+      single_def = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_ast]]}
+
+      case doc do
+        nil ->
+          {single_def, context}
+
+        text when is_binary(text) ->
+          {[{:@, [], [{:doc, [], [text]}]}, single_def], context}
+      end
+    else
+      # Body branch — narrow the param via isinstance.
+      body_ctx = IsinstanceNarrowing.narrow(test_node, context)
+      {body_ast, body_ctx} = Converter.convert(body_expr, body_ctx)
+
+      # Orelse branch — no narrowing. Reuse the same primed context as
+      # the body's pre-narrow snapshot. Thread updates forward.
+      orelse_ctx = %{body_ctx | types: context.types}
+      {orelse_ast, orelse_ctx} = Converter.convert(orelse_expr, orelse_ctx)
+
+      context = %{
+        orelse_ctx
+        | scopes: saved_scopes,
+          def_position: saved_def_position,
+          return_mode: saved_return_mode,
+          types: saved_types
+      }
+
+      guard = isinstance_guard(type_ref, param_ast)
+
+      body_def =
+        {:def, [],
+         [
+           {:when, [], [{fn_name_atom, [], param_asts}, guard]},
+           [do: body_ast]
+         ]}
+
+      orelse_def = {:def, [], [{fn_name_atom, [], param_asts}, [do: orelse_ast]]}
+
+      defs = [body_def, orelse_def]
+
+      case doc do
+        nil -> {defs, context}
+        text when is_binary(text) -> {[{:@, [], [{:doc, [], [text]}]} | defs], context}
+      end
+    end
+  end
+
+  # Same shape rules as `Converter.isinstance_type_match?/2` — kept
+  # local because emission runs before `convert`. Conservative on
+  # disjoint types (returns false → emit both clauses, the orelse
+  # branch is harmless dead code at runtime when types prove the
+  # body branch).
+  defp isinstance_proves_match?(t, %{"_type" => "Name", "id" => "int"})
+       when t == {:int} or t == {:int_lit_nonneg} or t == {:bool},
+       do: true
+
+  defp isinstance_proves_match?({:float}, %{"_type" => "Name", "id" => "float"}), do: true
+  defp isinstance_proves_match?({:str}, %{"_type" => "Name", "id" => "str"}), do: true
+  defp isinstance_proves_match?({:bool}, %{"_type" => "Name", "id" => "bool"}), do: true
+  defp isinstance_proves_match?({:list, _}, %{"_type" => "Name", "id" => "list"}), do: true
+  defp isinstance_proves_match?({:tuple, _}, %{"_type" => "Name", "id" => "tuple"}), do: true
+  defp isinstance_proves_match?({:dict, _, _}, %{"_type" => "Name", "id" => "dict"}), do: true
+  defp isinstance_proves_match?({:set}, %{"_type" => "Name", "id" => "set"}), do: true
+  defp isinstance_proves_match?({:none}, %{"_type" => "Constant", "value" => nil}), do: true
+  defp isinstance_proves_match?(_, _), do: false
+
+  # Build the guard AST for a supported isinstance target type.
+  defp isinstance_guard(%{"_type" => "Name", "id" => "int"}, x),
+    do: {:or, [], [{:is_integer, [], [x]}, {:is_boolean, [], [x]}]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "float"}, x),
+    do: {:is_float, [], [x]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "str"}, x),
+    do: {:is_binary, [], [x]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "bool"}, x),
+    do: {:is_boolean, [], [x]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "list"}, x),
+    do: {:is_list, [], [x]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "tuple"}, x),
+    do: {:is_tuple, [], [x]}
+
+  defp isinstance_guard(%{"_type" => "Name", "id" => "dict"}, x),
+    do: {:and, [], [{:is_map, [], [x]}, {:not, [], [{:is_struct, [], [x]}]}]}
 
   # --- Return-mode + parameter plumbing (shared) -------------------------
 
@@ -381,6 +575,52 @@ defmodule Pylixir.Nodes.Functions do
         col_offset: Map.get(node, "col_offset")
     end
   end
+
+  # When a closure/lambda param is never referenced in the body, prefix
+  # it with `_` so Elixir doesn't warn. Conservative on shadowing:
+  # references inside inner Lambda/FunctionDef bodies that shadow the
+  # param still count as references — we never rename a param whose
+  # name appears anywhere in the body subtree.
+  defp mark_unused_params(param_asts, param_names, body) do
+    refs = referenced_names_anywhere(body)
+
+    Enum.zip(param_asts, param_names)
+    |> Enum.map(fn {ast, name} ->
+      if name in refs, do: ast, else: underscore_param(ast)
+    end)
+  end
+
+  defp underscore_param({:\\, m, [{atom, m2, ctx}, default]}),
+    do: {:\\, m, [{prefix_underscore(atom), m2, ctx}, default]}
+
+  defp underscore_param({atom, m, ctx}), do: {prefix_underscore(atom), m, ctx}
+
+  defp prefix_underscore(atom) when is_atom(atom) do
+    s = Atom.to_string(atom)
+    if String.starts_with?(s, "_"), do: atom, else: String.to_atom("_" <> s)
+  end
+
+  defp referenced_names_anywhere(node, acc \\ MapSet.new())
+
+  defp referenced_names_anywhere(%{"_type" => "Name", "id" => id} = node, acc) do
+    acc = MapSet.put(acc, id)
+
+    node
+    |> Map.delete("_type")
+    |> Enum.reduce(acc, fn {_k, v}, a -> referenced_names_anywhere(v, a) end)
+  end
+
+  defp referenced_names_anywhere(node, acc) when is_map(node) do
+    node
+    |> Map.delete("_type")
+    |> Enum.reduce(acc, fn {_k, v}, a -> referenced_names_anywhere(v, a) end)
+  end
+
+  defp referenced_names_anywhere(list, acc) when is_list(list) do
+    Enum.reduce(list, acc, fn item, a -> referenced_names_anywhere(item, a) end)
+  end
+
+  defp referenced_names_anywhere(_leaf, acc), do: acc
 
   defp build_param_asts(args, context) do
     arg_list = Map.get(args, "args", [])

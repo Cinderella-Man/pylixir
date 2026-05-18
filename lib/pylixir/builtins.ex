@@ -699,7 +699,7 @@ defmodule Pylixir.Builtins do
   def emit("input", [prompt], _kw), do: {:ok, {:py_input, [], [prompt]}}
 
   def emit("chr", [x], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:List]}, :to_string]}, [], [[x]]}}
+    do: {:ok, {:<<>>, [], [{:"::", [], [x, {:utf8, [], nil}]}]}}
 
   def emit("ord", [x], _kw) do
     charlist_call = {{:., [], [{:__aliases__, [], [:String]}, :to_charlist]}, [], [x]}

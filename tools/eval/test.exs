@@ -21,10 +21,36 @@ defmodule TranslatedCode do
   end
 
   def py_repr(x) when is_binary(x) do
-    if String.contains?(x, "'") and not String.contains?(x, "\"") do
-      "\"" <> x <> "\""
+    escaped =
+      x
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\t", "\\t")
+      |> String.replace("\r", "\\r")
+
+    escaped =
+      for <<cp::utf8 <- escaped>>, into: "" do
+        cond do
+          cp <= 8 or cp == 11 or cp == 12 or (cp >= 14 and cp <= 31) ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          cp >= 127 and cp <= 159 ->
+            "\\x" <>
+              (cp |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(2, "0"))
+
+          true ->
+            <<cp::utf8>>
+        end
+      end
+
+    has_single = String.contains?(escaped, "'")
+    has_double = String.contains?(escaped, "\"")
+
+    if has_single and not has_double do
+      "\"" <> escaped <> "\""
     else
-      "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
+      "'" <> String.replace(escaped, "'", "\\'") <> "'"
     end
   end
 
@@ -38,7 +64,7 @@ defmodule TranslatedCode do
 
   @doc "The identity function.\n       No applications of any supplied f\n       to its argument.\n    "
   def churchZero() do
-    fn f -> &identity/1 end
+    fn _f -> &identity/1 end
   end
 
   @doc "The successor of a given\n       Church numeral. One additional\n       application of f. Equivalent to\n       the arithmetic addition of one.\n    "
@@ -73,8 +99,7 @@ defmodule TranslatedCode do
 
   @doc "Left to right reduction of a list,\n       using the binary operator f, and\n       starting with an initial value a.\n    "
   def foldl(f) do
-    go = fn acc, xs -> Enum.reduce(xs, acc, fn x, a -> f.(a).(x) end) end
-    fn acc -> fn xs -> go.(acc, xs) end end
+    fn acc -> fn xs -> Enum.reduce(xs, acc, fn x, a -> f.(a).(x) end) end end
   end
 
   @doc "The identity function."
@@ -83,38 +108,33 @@ defmodule TranslatedCode do
   end
 
   @doc "The successor of a value.\n       For numeric types, (1 +).\n    "
+  def succ(x) when is_integer(x) or is_boolean(x) do
+    1 + x
+  end
+
   def succ(x) do
-    if is_integer(x) || is_boolean(x) do
-      1 + x
-    else
-      List.to_string([1 + hd(String.to_charlist(x))])
-    end
+    <<1 + hd(String.to_charlist(x))::utf8>>
   end
 
   def py_main do
     replicate = fn n -> fn x -> List.duplicate(x, n) end end
     churchFromInt = fn n -> fn f -> foldl(&compose/1).(&identity/1).(replicate.(n).(f)) end end
+    cThree = churchFromInt.(3)
+    cFour = churchFromInt.(4)
 
-    main = fn ->
-      cThree = churchFromInt.(3)
-      cFour = churchFromInt.(4)
-
-      IO.write(
-        py_repr(
-          Enum.map(
-            [
-              churchAdd(cThree).(cFour),
-              churchMult(cThree).(cFour),
-              churchExp(cFour).(cThree),
-              churchExp(cThree).(cFour)
-            ],
-            &intFromChurch/1
-          )
-        ) <> "\n"
-      )
-    end
-
-    main.()
+    IO.write(
+      py_repr(
+        Enum.map(
+          [
+            churchAdd(cThree).(cFour),
+            churchMult(cThree).(cFour),
+            churchExp(cFour).(cThree),
+            churchExp(cThree).(cFour)
+          ],
+          &intFromChurch/1
+        )
+      ) <> "\n"
+    )
   end
 end
 

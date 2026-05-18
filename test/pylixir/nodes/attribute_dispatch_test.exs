@@ -151,17 +151,18 @@ defmodule Pylixir.Nodes.AttributeDispatchTest do
       end
     end
 
-    test "multi-placeholder template lowers via segment-based concat" do
+    test "multi-placeholder template folds to a static string when args are literal" do
       python = System.get_env("PYLIXIR_PYTHON") || "python3.14"
 
       case System.cmd(python, ["--version"], stderr_to_stdout: true) do
         {out, 0} ->
           if String.starts_with?(out, "Python 3.14") do
             out_src = Pylixir.transpile(~s|"{} and {}".format(1, 2)\n|)
-            # The segments are joined with `<>` chains and each
-            # placeholder lowers via py_str (no spec).
-            assert out_src =~ "py_str"
-            assert out_src =~ "<>"
+            # `LiteralPropagation` folds `.format()` on a literal
+            # template with literal args to the final string at
+            # compile time. No py_str / runtime concat needed.
+            refute out_src =~ "py_str"
+            assert out_src =~ ~s|"1 and 2"|
           end
 
         _ ->

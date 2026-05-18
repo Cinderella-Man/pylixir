@@ -792,9 +792,10 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
     # M2 — compile-time tautology const-fold. If the test resolves to
     # a known constant comparison (e.g. `__name__ == "__main__"`, which
-    # is always true in Pylixir's runtime model), emit just the body
+    # is always true in Pylixir's runtime model) or to a typed-isinstance
+    # whose target's lattice type matches the spec, emit just the body
     # or orelse directly. Skips the `if … do … end` wrapper.
-    case const_fold_if_test(test) do
+    case const_fold_if_test(test, context) do
       {:ok, true} -> convert_body_inline(body, context)
       {:ok, false} -> convert_body_inline(orelse, context)
       :unknown -> convert_if_runtime(test, body, orelse, context)
@@ -802,20 +803,13 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "IfExp", "test" => test, "body" => body, "orelse" => orelse}, context) do
-    # M1 — type-narrow the body arm when `test` is an `isinstance(x, T)`
-    # call. Mirrors the If-statement clause's PR 12 path (line ~770).
-    # Save/restore types so the orelse arm doesn't see the body's
-    # narrowing.
-    saved_types = context.types
-    body_context = TypeInfer.IsinstanceNarrowing.narrow(test, context)
-
-    {test_ast, body_context} = convert_test(test, body_context)
-    {body_ast, body_context} = convert(body, body_context)
-
-    context = %{body_context | types: saved_types}
-    {orelse_ast, context} = convert(orelse, context)
-
-    {{:if, [], [test_ast, [do: body_ast, else: orelse_ast]]}, context}
+    # Const-fold isinstance/Compare tests when the operand types are
+    # statically known. Mirrors the If-statement clause's M2 path.
+    case const_fold_if_test(test, context) do
+      {:ok, true} -> convert(body, context)
+      {:ok, false} -> convert(orelse, context)
+      :unknown -> convert_ifexp_runtime(test, body, orelse, context)
+    end
   end
 
   def convert(%{"_type" => "Assign"} = node, context),
@@ -1076,6 +1070,22 @@ defmodule Pylixir.Converter do
 
   # --- If/IfExp helpers --------------------------------------------------
 
+  defp convert_ifexp_runtime(test, body, orelse, context) do
+    # M1 — type-narrow the body arm when `test` is an `isinstance(x, T)`
+    # call. Save/restore types so the orelse arm doesn't see the body's
+    # narrowing.
+    saved_types = context.types
+    body_context = TypeInfer.IsinstanceNarrowing.narrow(test, context)
+
+    {test_ast, body_context} = convert_test(test, body_context)
+    {body_ast, body_context} = convert(body, body_context)
+
+    context = %{body_context | types: saved_types}
+    {orelse_ast, context} = convert(orelse, context)
+
+    {{:if, [], [test_ast, [do: body_ast, else: orelse_ast]]}, context}
+  end
+
   defp convert_if_runtime(test, body, orelse, context) do
     # PR 11 — branch-isolated types. Type bindings introduced inside an
     # If body / orelse leak into the surrounding scope as `:any` (the
@@ -1115,16 +1125,23 @@ defmodule Pylixir.Converter do
     {body_to_block(asts), context}
   end
 
-  # Detect a Compare test that folds to a known boolean at convert
-  # time. Handles single-op `Eq`/`NotEq` whose operands both fold via
-  # `LiteralFold.fold/1` (with `__name__` special-cased to "__main__"
-  # to match Pylixir's Name clause).
+  # Detect a test that folds to a known boolean at convert time.
+  # Two shapes:
+  #   * Single-op `Compare(Eq|NotEq)` whose operands both fold via
+  #     `LiteralFold.fold/1` (with `__name__` special-cased to
+  #     "__main__" to match Pylixir's Name clause).
+  #   * `Call(isinstance, [Name(n), type_ref])` where `n`'s lattice
+  #     type in `context.types` matches the spec. Disjoint types are
+  #     conservatively reported as `:unknown` — only positive matches
+  #     fold to `{:ok, true}`. The orelse-elision case (`{:ok, false}`)
+  #     stays out of scope until call-graph-driven monomorphization
+  #     lands.
   defp const_fold_if_test(%{
          "_type" => "Compare",
          "left" => left,
          "ops" => [%{"_type" => op_type}],
          "comparators" => [right]
-       })
+       }, _context)
        when op_type in ["Eq", "NotEq"] do
     with {:ok, lv} <- fold_value(left),
          {:ok, rv} <- fold_value(right) do
@@ -1135,7 +1152,40 @@ defmodule Pylixir.Converter do
     end
   end
 
-  defp const_fold_if_test(_), do: :unknown
+  defp const_fold_if_test(
+         %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => "isinstance"},
+           "args" => [%{"_type" => "Name", "id" => name}, type_ref]
+         },
+         context
+       ) do
+    case Map.get(context.types, name, :any) do
+      :any -> :unknown
+      type -> if isinstance_type_match?(type, type_ref), do: {:ok, true}, else: :unknown
+    end
+  end
+
+  defp const_fold_if_test(_, _), do: :unknown
+
+  # True iff a value of lattice type `t` provably matches the Python
+  # `isinstance` spec `type_ref`. Conservative — returns false for any
+  # shape we don't explicitly recognize, including unions and `:any`.
+  defp isinstance_type_match?(t, %{"_type" => "Name", "id" => "int"})
+       when t == {:int} or t == {:int_lit_nonneg} or t == {:bool},
+       do: true
+
+  defp isinstance_type_match?({:float}, %{"_type" => "Name", "id" => "float"}), do: true
+  defp isinstance_type_match?({:str}, %{"_type" => "Name", "id" => "str"}), do: true
+  defp isinstance_type_match?({:bool}, %{"_type" => "Name", "id" => "bool"}), do: true
+  defp isinstance_type_match?({:list, _}, %{"_type" => "Name", "id" => "list"}), do: true
+  defp isinstance_type_match?({:tuple, _}, %{"_type" => "Name", "id" => "tuple"}), do: true
+  defp isinstance_type_match?({:dict, _, _}, %{"_type" => "Name", "id" => "dict"}), do: true
+  defp isinstance_type_match?({:set}, %{"_type" => "Name", "id" => "set"}), do: true
+
+  defp isinstance_type_match?({:none}, %{"_type" => "Constant", "value" => nil}), do: true
+
+  defp isinstance_type_match?(_, _), do: false
 
   defp fold_value(%{"_type" => "Name", "id" => "__name__"}), do: {:ok, "__main__"}
   defp fold_value(node), do: Pylixir.LiteralFold.fold(node)
