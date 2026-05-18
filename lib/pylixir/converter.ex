@@ -136,7 +136,13 @@ defmodule Pylixir.Converter do
         hoisted_asts ++
         user_code
 
-    helpers = HelpersCodegen.helpers_ast_for(emitted, drop_float: not analysis.uses_float)
+    helpers =
+      HelpersCodegen.helpers_ast_for(emitted,
+        drop_float: not analysis.uses_float,
+        drop_tuple_clause: not analysis.uses_tuple,
+        drop_set_clause: not analysis.uses_set,
+        drop_dict_clause: not analysis.uses_dict
+      )
 
     moduledoc = moduledoc_ast(analysis.module_doc)
 

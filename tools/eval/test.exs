@@ -32,26 +32,6 @@ defmodule TranslatedCode do
     "[" <> Enum.map_join(x, ", ", &py_repr/1) <> "]"
   end
 
-  def py_repr(x) when is_tuple(x) do
-    items = Tuple.to_list(x)
-
-    case items do
-      [single] -> "(" <> py_repr(single) <> ",)"
-      _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
-    end
-  end
-
-  def py_repr(%MapSet{} = s) do
-    case MapSet.to_list(s) do
-      [] -> "set()"
-      items -> "{" <> Enum.map_join(items, ", ", &py_repr/1) <> "}"
-    end
-  end
-
-  def py_repr(x) when is_map(x) and not is_struct(x) do
-    "{" <> Enum.map_join(x, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
-  end
-
   def py_repr(x) do
     py_str(x)
   end

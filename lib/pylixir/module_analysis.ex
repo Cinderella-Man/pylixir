@@ -69,7 +69,15 @@ defmodule Pylixir.ModuleAnalysis do
           # at runtime, so the `py_str_float` helper chain is dead
           # weight and `helpers_ast_for/2` drops it + py_str's
           # is_float clause.
-          uses_float: boolean()
+          uses_float: boolean(),
+          # Phase 6 — true iff any syntactic Tuple/Set/Dict construct
+          # (literal, comprehension, or container-producing builtin
+          # call) appears in the module. When false, `py_repr`'s
+          # corresponding container clause is unreachable and
+          # `helpers_ast_for/2` drops it.
+          uses_tuple: boolean(),
+          uses_set: boolean(),
+          uses_dict: boolean()
         }
 
   defstruct module_attrs: [],
@@ -83,7 +91,10 @@ defmodule Pylixir.ModuleAnalysis do
             hoisted_imports: [],
             module_doc: nil,
             uses_exit: false,
-            uses_float: false
+            uses_float: false,
+            uses_tuple: false,
+            uses_set: false,
+            uses_dict: false
 
   @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault
                        intersection_update difference_update symmetric_difference_update)
@@ -218,7 +229,10 @@ defmodule Pylixir.ModuleAnalysis do
       hoisted_imports: hoisted_imports,
       module_doc: module_doc,
       uses_exit: uses_exit?(body),
-      uses_float: uses_float?(body)
+      uses_float: uses_float?(body),
+      uses_tuple: uses_tuple?(body),
+      uses_set: uses_set?(body),
+      uses_dict: uses_dict?(body)
     }
   end
 
@@ -285,6 +299,99 @@ defmodule Pylixir.ModuleAnalysis do
 
   defp float_node_in?(list) when is_list(list), do: Enum.any?(list, &float_node_in?/1)
   defp float_node_in?(_leaf), do: false
+
+  # Phase 6 — module-wide syntactic scans for container constructs.
+  # Over-approximate: any matching AST node sets the flag. False
+  # positives just inhibit the optimization (kept clauses). False
+  # negatives would break runtime — none possible here, since we only
+  # care about values that py_repr might receive, and every container
+  # value originates from one of these syntactic forms.
+  #
+  # Excludes Tuple/Set/Dict appearing in `Assign.targets` (multi-
+  # assign syntax sugar — no value created). For simplicity we handle
+  # this by recognizing Assign and only recursing into `value`.
+
+  # Bare-name tuple-producing calls (builtin + common from-imports).
+  # `product`/`combinations`/etc. as bare names catches both
+  # `from itertools import product` and user-aliased imports.
+  @tuple_returning_calls ~w(tuple zip enumerate divmod
+                            product combinations permutations
+                            combinations_with_replacement tee
+                            modf frexp)
+  # Tuple-producing attribute methods (`.items()`, etc.) and
+  # tuple-producing module attribute calls (`math.modf`,
+  # `itertools.product`, etc.). Matched by `attr` name only — false
+  # positives (user method also named `items`) inhibit optimization
+  # but never break.
+  @tuple_returning_attrs ~w(items popitem
+                            modf frexp
+                            product combinations permutations
+                            combinations_with_replacement tee
+                            split splitext)
+  defp uses_tuple?(body), do: Enum.any?(body, &tuple_node_in?/1)
+
+  defp tuple_node_in?(%{"_type" => "Tuple"}), do: true
+
+  defp tuple_node_in?(%{
+         "_type" => "Call",
+         "func" => %{"_type" => "Name", "id" => id}
+       })
+       when id in @tuple_returning_calls,
+       do: true
+
+  defp tuple_node_in?(%{
+         "_type" => "Call",
+         "func" => %{"_type" => "Attribute", "attr" => attr}
+       })
+       when attr in @tuple_returning_attrs,
+       do: true
+
+  defp tuple_node_in?(node), do: walk_value_only(node, &tuple_node_in?/1)
+
+  defp uses_set?(body), do: Enum.any?(body, &set_node_in?/1)
+
+  defp set_node_in?(%{"_type" => t}) when t in ["Set", "SetComp"], do: true
+
+  defp set_node_in?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "set"}}),
+    do: true
+
+  defp set_node_in?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "frozenset"}}),
+    do: true
+
+  defp set_node_in?(node), do: walk_value_only(node, &set_node_in?/1)
+
+  defp uses_dict?(body), do: Enum.any?(body, &dict_node_in?/1)
+
+  defp dict_node_in?(%{"_type" => t}) when t in ["Dict", "DictComp"], do: true
+
+  defp dict_node_in?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "dict"}}),
+    do: true
+
+  defp dict_node_in?(node), do: walk_value_only(node, &dict_node_in?/1)
+
+  # Generic recursion that skips Assign-target / For-target fields
+  # (Tuple/Set/Dict appearing there is destructuring syntax — no
+  # runtime value created). Falls through to whole-map recursion
+  # for other node types, mirroring exit_call_in?/float_node_in?.
+  defp walk_value_only(%{"_type" => "Assign", "value" => value}, pred), do: pred.(value)
+
+  defp walk_value_only(%{"_type" => "AugAssign", "value" => value}, pred), do: pred.(value)
+
+  defp walk_value_only(
+         %{"_type" => "For", "iter" => iter, "body" => body, "orelse" => orelse},
+         pred
+       ) do
+    pred.(iter) or Enum.any?(body, pred) or Enum.any?(orelse, pred)
+  end
+
+  defp walk_value_only(node, pred) when is_map(node) do
+    node
+    |> Map.delete("_type")
+    |> Enum.any?(fn {_k, v} -> pred.(v) end)
+  end
+
+  defp walk_value_only(list, pred) when is_list(list), do: Enum.any?(list, pred)
+  defp walk_value_only(_leaf, _pred), do: false
 
   # `from <stdlib> import <name>` cases where the binding is a
   # pure (capture-free) function — hoistable to a module-top defp

@@ -231,19 +231,39 @@ defmodule Pylixir.HelpersCodegen do
       not MapSet.member?(roots, :py_str) and
         MapSet.disjoint?(@polymorphic_py_str_callers, needed)
 
+    # Phase 6 — static container-usage shake of py_repr's per-type
+    # clauses. Caller sets each opt based on
+    # `ModuleAnalysis.uses_tuple/set/dict`. Soundness: walker is
+    # over-approximate (e.g. multi-assign `a, b =` is excluded), so
+    # a `false` flag means no value of that container type can flow
+    # through py_repr at runtime.
+    flags = %{
+      drop_float: drop_float,
+      drop_containers: drop_containers,
+      drop_tuple: Keyword.get(opts, :drop_tuple_clause, false),
+      drop_set: Keyword.get(opts, :drop_set_clause, false),
+      drop_dict: Keyword.get(opts, :drop_dict_clause, false)
+    }
+
     for name <- @helper_order,
         MapSet.member?(needed, name),
         def_ast <- Map.fetch!(@helpers_by_name, name),
-        keep_clause?(name, def_ast, drop_float, drop_containers),
+        keep_clause?(name, def_ast, flags),
         do: def_ast
   end
 
-  defp keep_clause?(:py_str, def_ast, drop_float, drop_containers) do
-    not (drop_float and is_float_guarded?(def_ast)) and
-      not (drop_containers and is_container_clause?(def_ast))
+  defp keep_clause?(:py_str, def_ast, %{drop_float: df, drop_containers: dc}) do
+    not (df and is_float_guarded?(def_ast)) and
+      not (dc and is_container_clause?(def_ast))
   end
 
-  defp keep_clause?(_name, _def_ast, _drop_float, _drop_containers), do: true
+  defp keep_clause?(:py_repr, def_ast, %{drop_tuple: dt, drop_set: ds, drop_dict: dd}) do
+    not (dt and is_tuple_clause?(def_ast)) and
+      not (ds and is_set_clause?(def_ast)) and
+      not (dd and is_dict_clause?(def_ast))
+  end
+
+  defp keep_clause?(_name, _def_ast, _flags), do: true
 
   defp is_float_guarded?({:def, _, [{:when, _, [_head, guard]}, _body]}),
     do: contains_is_float?(guard)
@@ -284,6 +304,32 @@ defmodule Pylixir.HelpersCodegen do
   end
 
   defp matches_mapset_struct?(_), do: false
+
+  # Phase 6 per-type predicates for py_repr clause shaking.
+  defp is_tuple_clause?({:def, _, [{:when, _, [_head, guard]}, _body]}),
+    do: contains_guard?(guard, :is_tuple)
+
+  defp is_tuple_clause?(_), do: false
+
+  defp is_set_clause?({:def, _, [head, _body]}), do: matches_mapset_struct?(head)
+  defp is_set_clause?(_), do: false
+
+  # `def py_repr(x) when is_map(x) and not is_struct(x)` — the dict
+  # clause. is_map alone would also match the MapSet struct clause
+  # via `is_struct(x, MapSet)` which is `is_map(x) and ...`, but
+  # MapSet's clause head uses `%MapSet{} = s` not a when-guard, so
+  # the `is_map`-guarded clause is unambiguously the dict one.
+  defp is_dict_clause?({:def, _, [{:when, _, [_head, guard]}, _body]}),
+    do: contains_guard?(guard, :is_map)
+
+  defp is_dict_clause?(_), do: false
+
+  defp contains_guard?({op, _, _}, op), do: true
+
+  defp contains_guard?({_op, _meta, args}, target) when is_list(args),
+    do: Enum.any?(args, &contains_guard?(&1, target))
+
+  defp contains_guard?(_, _), do: false
 
   defp collect_helper_refs(asts) do
     Enum.reduce(asts, MapSet.new(), fn ast, acc ->
