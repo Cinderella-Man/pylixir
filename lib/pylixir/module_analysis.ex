@@ -169,6 +169,13 @@ defmodule Pylixir.ModuleAnalysis do
 
     {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
 
+    # N1 — dead-demoted-fn elim. A demoted-fn becomes a `name = fn ...
+    # end` binding in py_main. If `name` is never referenced anywhere
+    # else in the module body, the binding is dead and the entire
+    # function emission can be skipped — cascade-drops any helpers
+    # its body alone kept alive.
+    demoted_fns = drop_dead_demoted(demoted_fns, body)
+
     stmts =
       merge_in_original_order(body, stmts, demoted_fns, demoted_attr_names)
       |> topo_sort_demoted_runs(MapSet.new(demoted_fns, & &1["name"]))
@@ -460,6 +467,22 @@ defmodule Pylixir.ModuleAnalysis do
   defp function_uses_any?(%{"args" => args, "body" => body}, names) do
     locals = function_local_names(args, body)
     Enum.any?(body, &refs_free_name?(&1, names, locals))
+  end
+
+  # N1 — drop demoted-fn nodes whose name is never referenced anywhere
+  # in the module body (outside their own definition). `referenced_names/2`
+  # is scope-aware: it walks into Lambda / FunctionDef / comprehension
+  # bodies and records `Name(id)` Load-context occurrences from the
+  # enclosing scope. A demoted-fn name absent from the reference set
+  # is bound but never read — its `name = fn ... end` binding is dead.
+  #
+  # Self-recursion would still register the name as referenced (the
+  # walker doesn't skip the fn's own body), so genuinely-recursive
+  # demoted fns stay safely. Only fns that are never called from
+  # anywhere — including from each other — get dropped.
+  defp drop_dead_demoted(demoted_fns, body) do
+    referenced = referenced_names(body, MapSet.new())
+    Enum.reject(demoted_fns, fn fn_node -> not MapSet.member?(referenced, fn_node["name"]) end)
   end
 
   defp function_local_names(args, body) do

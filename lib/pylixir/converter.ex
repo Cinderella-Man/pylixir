@@ -123,10 +123,18 @@ defmodule Pylixir.Converter do
 
     py_main = py_main_def(stmt_asts, analysis.uses_exit)
 
+    # N2 — drop hoisted defps that the user code never references.
+    # After N2's reduce-inline path lands, `reduce` calls become
+    # `Enum.reduce/3` inline and the hoisted wrapper is dead. Same
+    # cascade applies to any other hoisted alias whose call sites all
+    # got inlined elsewhere.
+    user_code = class_asts ++ fn_asts ++ context.while_helpers ++ [py_main]
+    hoisted_asts = drop_unused_hoisted(hoisted_asts, user_code)
+
     emitted =
       attr_asts ++
         hoisted_asts ++
-        class_asts ++ fn_asts ++ context.while_helpers ++ [py_main]
+        user_code
 
     helpers = HelpersCodegen.helpers_ast_for(emitted, drop_float: not analysis.uses_float)
 
@@ -1048,6 +1056,16 @@ defmodule Pylixir.Converter do
         hoisted_defp(mod, orig, alias_n)
       end)
 
+    # Pre-populate stdlib_aliases for hoisted imports so that call sites
+    # inside FunctionDef bodies (converted before the corresponding
+    # ImportFrom statement runs through the converter) can still see
+    # `<alias> → {mod, name}` and route accordingly. The duplicate
+    # registration inside the ImportFrom path is a no-op.
+    context =
+      Enum.reduce(imports, context, fn {alias_n, orig, mod, _arity}, ctx ->
+        %{ctx | stdlib_aliases: Map.put(ctx.stdlib_aliases, alias_n, {mod, orig})}
+      end)
+
     {asts, context}
   end
 
@@ -1743,11 +1761,20 @@ defmodule Pylixir.Converter do
   defp emit_name_call(id, node, context) do
     raw_args = Map.get(node, "args", [])
 
-    case single_starred_args(raw_args) do
-      {:ok, star_node} ->
+    cond do
+      # N2 — `reduce(lambda, iter, init)` from `functools.reduce`
+      # inlines at the call site as `Enum.reduce(iter, init, λ_flipped)`,
+      # avoiding the hoisted wrapper. Only fires when the first arg is
+      # a Lambda literal — swapping its params is local. Other shapes
+      # (Name/Capture) fall through to the wrapper path.
+      reduce_lambda_inline_target?(id, raw_args, context) ->
+        emit_reduce_lambda_inline(raw_args, node, context)
+
+      match?({:ok, _}, single_starred_args(raw_args)) ->
+        {:ok, star_node} = single_starred_args(raw_args)
         emit_starred_call(id, star_node, node, context)
 
-      :no ->
+      true ->
         arg_types = Enum.map(raw_args, &TypeInfer.infer_expr(&1, context))
         {arg_asts, context} = convert_each(raw_args, context)
         {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
@@ -1858,6 +1885,102 @@ defmodule Pylixir.Converter do
   # multiple stars require list-concat at the call site; not handled.
   defp single_starred_args([%{"_type" => "Starred", "value" => v}]), do: {:ok, v}
   defp single_starred_args(_), do: :no
+
+  # N2 — recognize a `reduce(lambda, iter, init)` call that can inline
+  # to `Enum.reduce(iter, init, fn elem, acc -> ... end)`. Only fires
+  # when the function arg is a Python Lambda literal — swapping its
+  # params (matching Python's `(acc, elem)` to Elixir's `(elem, acc)`)
+  # is purely structural. Name/Capture/Attribute args fall through to
+  # the existing hoisted-wrapper path.
+  defp reduce_lambda_inline_target?("reduce", [%{"_type" => "Lambda"} | _] = args, context)
+       when length(args) == 3 do
+    case Map.get(context.stdlib_aliases, "reduce") do
+      {"functools", "reduce"} -> true
+      _ -> false
+    end
+  end
+
+  defp reduce_lambda_inline_target?(_id, _args, _ctx), do: false
+
+  defp emit_reduce_lambda_inline([lambda, iter_node, init_node], _node, context) do
+    %{"args" => %{"args" => params}, "body" => body} = lambda
+
+    case params do
+      [acc_param, elem_param] ->
+        {iter_ast, context} = convert(iter_node, context)
+        {init_ast, context} = convert(init_node, context)
+
+        # Param names are scoped to the lambda body — push onto scopes
+        # so `convert(body)` resolves them as locals.
+        acc_name = Map.get(acc_param, "arg")
+        elem_name = Map.get(elem_param, "arg")
+        acc_atom = acc_name |> Naming.rewrite() |> String.to_atom()
+        elem_atom = elem_name |> Naming.rewrite() |> String.to_atom()
+
+        saved_scopes = context.scopes
+        [head | rest] = context.scopes
+        scope_with_params = head |> MapSet.put(acc_name) |> MapSet.put(elem_name)
+        context = %{context | scopes: [scope_with_params | rest]}
+
+        {body_ast, context} = convert(body, context)
+        context = %{context | scopes: saved_scopes}
+
+        # `fn elem, acc -> body end` — params positionally swapped to
+        # match Elixir's `Enum.reduce/3` callback signature. Body still
+        # references the original Python names (`acc_atom`, `elem_atom`)
+        # which now bind correctly via positional order.
+        callback =
+          {:fn, [],
+           [
+             {:->, [],
+              [
+                [{elem_atom, [], nil}, {acc_atom, [], nil}],
+                body_ast
+              ]}
+           ]}
+
+        reduce_call =
+          {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, init_ast, callback]}
+
+        {reduce_call, context}
+
+      _ ->
+        # Lambda with wrong arity (Python reduce callback is always
+        # binary, so this shouldn't fire — but be conservative).
+        emit_name_call_fallback("reduce", [lambda, iter_node, init_node], context)
+    end
+  end
+
+  defp emit_name_call_fallback(id, raw_args, context) do
+    {arg_asts, context} = convert_each(raw_args, context)
+    atom = id |> Naming.rewrite() |> String.to_atom()
+    {{atom, [], arg_asts}, context}
+  end
+
+  # Drop hoisted-import defps whose name is never referenced in the
+  # surrounding user code (N2). After call-site inlining (e.g.
+  # `reduce(lambda, …) → Enum.reduce/3`) the wrapper becomes dead.
+  defp drop_unused_hoisted(hoisted_asts, user_code) do
+    Enum.reject(hoisted_asts, fn def_ast -> hoisted_unused?(def_ast, user_code) end)
+  end
+
+  defp hoisted_unused?({:defp, _, [{name, _, _} | _]}, user_code) when is_atom(name) do
+    not name_referenced?(user_code, name)
+  end
+
+  defp hoisted_unused?(_, _), do: false
+
+  defp name_referenced?(asts, name) do
+    Enum.any?(asts, fn ast ->
+      {_, found?} =
+        Macro.prewalk(ast, false, fn
+          {^name, _, _} = node, _ -> {node, true}
+          other, acc -> {other, acc}
+        end)
+
+      found?
+    end)
+  end
 
   # `next(iter(x))` and `next(iter(x), default)` — the only iterator-
   # protocol idiom we lower (general `iter`/`next` is rejected by
