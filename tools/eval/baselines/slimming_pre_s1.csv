@@ -1,0 +1,8 @@
+path,bytes,status
+test/fixtures/slimming/01_typed_bool_prints.py,1203,ok
+test/fixtures/slimming/02_typed_int_list.py,3447,ok
+test/fixtures/slimming/03_typed_dict.py,3489,ok
+test/fixtures/slimming/04_nested_containers.py,3456,ok
+test/fixtures/slimming/05_isinstance_narrowed_bool.py,994,ok
+test/fixtures/slimming/06_repeat_inlined.py,3872,ok
+test/fixtures/slimming/07_polymorphic_fallback.py,3417,ok

@@ -482,6 +482,16 @@ defmodule Pylixir.RuntimeHelpers do
   end
 
   # === String representation ===
+
+  # S2 — tiny helper for `print(<bool>)` to drop the inline if/else
+  # expansion at every call site. Only `true`/`false` clauses — no
+  # catch-all on purpose: emit sites are gated on `TypeInfer` saying
+  # `{:bool}`, so a non-bool reaching here means inference was wrong.
+  # FunctionClauseError surfaces the bug loudly. Keeping the helper
+  # zero-dependency lets it tree-shake without pulling `py_str`.
+  def py_bool_str(true), do: "True"
+  def py_bool_str(false), do: "False"
+
   def py_str(true), do: "True"
   def py_str(false), do: "False"
   def py_str(nil), do: "None"
@@ -617,8 +627,27 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
-  def py_repr(x) when is_binary(x), do: "'" <> x <> "'"
+  def py_repr(x) when is_binary(x) do
+    if String.contains?(x, "'") and not String.contains?(x, "\""),
+      do: "\"" <> x <> "\"",
+      else: "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
+  end
+
   def py_repr(x), do: py_str(x)
+
+  # S3 — Python-correct quote choice for `repr(<str>)`, used by the
+  # typed-container print path. Independent of py_repr/1 so it
+  # tree-shakes alone when the inline path is the only consumer (saves
+  # ~150 bytes vs delegating from py_repr's binary clause, which would
+  # also pull py_str via py_repr's catch-all). Logic is duplicated by
+  # design — same 5 lines as py_repr's binary clause above, so the
+  # two paths stay aligned. "foo" → 'foo'; "can't" → "can't"; both
+  # quote types → single-outer with escapes.
+  def py_repr_str(s) when is_binary(s) do
+    if String.contains?(s, "'") and not String.contains?(s, "\""),
+      do: "\"" <> s <> "\"",
+      else: "'" <> String.replace(String.replace(s, "\\", "\\\\"), "'", "\\'") <> "'"
+  end
 
   # === String methods ===
   def py_str_find(s, sub) do

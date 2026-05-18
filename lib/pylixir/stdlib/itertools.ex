@@ -60,10 +60,10 @@ defmodule Pylixir.Stdlib.Itertools do
   def call(["accumulate"], [iter, func], _kwargs, _node),
     do: {:ok, {:py_itertools_accumulate_with, [], [iter, func]}}
 
-  # `itertools.repeat(elem[, times])` — yield `elem` forever, or
-  # `times` times if given. We only support the bounded form
-  # (unbounded would require lazy streams that don't compose with
-  # the rest of Pylixir's eager-list lowering).
+  # `itertools.repeat(elem, times)` — bounded list of `times` copies of
+  # `elem`. Inlines to `List.duplicate/2` directly at the call site
+  # (S5 — was previously a hoisted wrapper defp). Unbounded form
+  # (no `times` arg) isn't supported — would need lazy streams.
   def call(["repeat"], [elem, times], _kwargs, _node),
     do: {:ok, {{:., [], [{:__aliases__, [], [:List]}, :duplicate]}, [], [elem, times]}}
 

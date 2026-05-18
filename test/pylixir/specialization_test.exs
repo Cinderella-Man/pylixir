@@ -204,9 +204,11 @@ defmodule Pylixir.SpecializationTest do
       assert out =~ ~s|IO.write("hello" <> "\\n")|
     end
 
-    test "print({:bool}) inlines if-then-else" do
+    test "print({:bool}) routes through py_bool_str (S2)" do
       out = Pylixir.transpile(~s|print("a" == "b")\n|)
       refute out =~ "py_str"
+      assert out =~ "py_bool_str"
+      # py_bool_str helper preamble has the True/False literals.
       assert out =~ "True"
       assert out =~ "False"
     end
@@ -235,6 +237,42 @@ defmodule Pylixir.SpecializationTest do
       out = Pylixir.transpile(~s|print("file.txt".endswith(".txt"))\n|)
       refute out =~ "py_str_endswith"
       assert out =~ "String.ends_with?"
+    end
+  end
+
+  describe "S3: typed container inline reprs" do
+    test "print([int, ...]) inlines, no py_str/py_repr_*" do
+      out = Pylixir.transpile("print([1, 2, 3])\n")
+      refute out =~ "py_str"
+      refute out =~ "py_repr"
+      assert out =~ "Enum.map_join"
+      assert out =~ "Integer.to_string"
+    end
+
+    test "print({str: int}) inlines dict repr with py_repr_str for keys" do
+      out = Pylixir.transpile(~s|print({"a": 1, "b": 2})\n|)
+      refute out =~ "py_str("
+      refute out =~ "py_repr_map"
+      assert out =~ "py_repr_str"
+      assert out =~ "Integer.to_string"
+    end
+
+    test "print([[int]]) recurses nested-list inline" do
+      out = Pylixir.transpile("print([[1, 2], [3, 4]])\n")
+      refute out =~ "py_str"
+      refute out =~ "py_repr"
+    end
+
+    test "print([]) emits literal \"[]\", no py_str" do
+      out = Pylixir.transpile("print([])\n")
+      refute out =~ "py_str"
+    end
+
+    test "py_repr_str handles apostrophe-containing strings (S3 bugfix)" do
+      # Direct test of the helper to confirm Python-correct quoting.
+      assert Pylixir.RuntimeHelpers.py_repr_str("foo") == "'foo'"
+      assert Pylixir.RuntimeHelpers.py_repr_str("can't") == ~s|"can't"|
+      assert Pylixir.RuntimeHelpers.py_repr_str(~s|say "hi"|) == ~s|'say "hi"'|
     end
   end
 

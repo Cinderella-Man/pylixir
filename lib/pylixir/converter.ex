@@ -2118,13 +2118,22 @@ defmodule Pylixir.Converter do
 
   @doc false
   def convert_test(test_node, context) do
+    # S1 — type-aware truthy? elision. Order matters: TypeInfer first
+    # (handles BoolOp / Call / Name cases the AST-shape check can't),
+    # then BoolReturning.bool_returning?/1 (handles `Compare` regardless
+    # of operand types — even `a < b` where one operand is `:any`).
+    #
+    # Soundness: only exact `{:bool}` elides. Unions even containing
+    # `{:bool}` keep the wrap — Python's `0 is falsy` vs Elixir's
+    # `only false/nil are falsy` would diverge for bool/int union.
+    inferred_type = TypeInfer.infer_expr(test_node, context)
     {test_ast, context} = convert(test_node, context)
 
     wrapped =
-      if BoolReturning.bool_returning?(test_node) do
-        test_ast
-      else
-        {:truthy?, [], [test_ast]}
+      cond do
+        inferred_type == {:bool} -> test_ast
+        BoolReturning.bool_returning?(test_node) -> test_ast
+        true -> {:truthy?, [], [test_ast]}
       end
 
     {wrapped, context}

@@ -222,7 +222,10 @@ defmodule Pylixir.ModuleAnalysis do
   end
 
   defp import_arity("functools", "reduce"), do: 3
-  defp import_arity("itertools", "repeat"), do: 2
+  # `itertools.repeat` was hoisted as a wrapper defp; S5 inlines at the
+  # call site via `Pylixir.Stdlib.Itertools.call(["repeat"], …)` so no
+  # wrapper is emitted. Captures (`&repeat/2`, `f = repeat`) still work
+  # via `Pylixir.Stdlib.Itertools.import_binding/1`.
   defp import_arity("itertools", "chain"), do: 1
   defp import_arity("itertools", "accumulate"), do: 1
   defp import_arity("itertools", "groupby"), do: 1

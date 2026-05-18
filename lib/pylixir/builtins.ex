@@ -314,15 +314,130 @@ defmodule Pylixir.Builtins do
         {{:., [], [{:__aliases__, [], [:Integer]}, :to_string]}, [], [arg]}
 
       # `print(<bool>)` — Python prints `True`/`False` (capitalised).
-      # Elixir's `to_string(true) == "true"`, so inline the conditional
-      # to match Python output without needing py_str.
+      # Elixir's `to_string(true) == "true"`, so route through the tiny
+      # `py_bool_str/1` helper. One-line per call site; the helper itself
+      # is 2 clauses and tree-shakes out when no bool print exists.
       type == {:bool} ->
-        {:if, [], [arg, [do: "True", else: "False"]]}
+        {:py_bool_str, [], [arg]}
 
       true ->
-        {:py_str, [], [arg]}
+        # S3 — typed-container inline repr. Walks the element type
+        # recursively (cap at depth 3) and emits an inline-formatter
+        # call site, bypassing `py_str` / `py_repr_*` entirely.
+        case inline_repr_call(type, arg, 0) do
+          nil -> {:py_str, [], [arg]}
+          ast -> ast
+        end
     end
   end
+
+  # Returns an Elixir AST that formats `arg_ast` (a value of the given
+  # lattice type) into a Python-repr-compatible binary, or `nil` if no
+  # inline path applies (caller falls through to `py_str`).
+  #
+  # `depth` is bounded at 3 to keep deeply-nested inferred types from
+  # generating exponentially-large output. Deeper than 3 → return nil
+  # (caller's polymorphic fallback runs at runtime).
+  defp inline_repr_call(_type, _arg, depth) when depth > 3, do: nil
+
+  defp inline_repr_call({:str}, arg, _depth), do: {:py_repr_str, [], [arg]}
+
+  defp inline_repr_call(type, arg, _depth) when type == {:int} or type == {:int_lit_nonneg} do
+    {{:., [], [{:__aliases__, [], [:Integer]}, :to_string]}, [], [arg]}
+  end
+
+  defp inline_repr_call({:bool}, arg, _depth), do: {:py_bool_str, [], [arg]}
+
+  # Statically-known empty list literal — emit the binary "[]"
+  # directly, no Enum.map_join needed. Lets `print([])` skip py_str.
+  defp inline_repr_call({:list, _}, [], _depth), do: "[]"
+
+  defp inline_repr_call({:list, e}, arg, depth) do
+    case inline_elem_fn(e, depth + 1) do
+      nil ->
+        nil
+
+      elem_fn ->
+        map_join =
+          {{:., [], [{:__aliases__, [], [:Enum]}, :map_join]}, [], [arg, ", ", elem_fn]}
+
+        {:<>, [], [{:<>, [], ["[", map_join]}, "]"]}
+    end
+  end
+
+  defp inline_repr_call({:tuple, ts}, arg, depth) when is_list(ts) do
+    case ts_uniform_elem_fn(ts, depth + 1) do
+      nil ->
+        nil
+
+      elem_fn ->
+        to_list = {{:., [], [{:__aliases__, [], [:Tuple]}, :to_list]}, [], [arg]}
+
+        map_join =
+          {{:., [], [{:__aliases__, [], [:Enum]}, :map_join]}, [], [to_list, ", ", elem_fn]}
+
+        {:<>, [], [{:<>, [], ["(", map_join]}, ")"]}
+    end
+  end
+
+  # Empty dict literal — emit "{}" directly.
+  defp inline_repr_call({:dict, _, _}, {:%{}, _, []}, _depth), do: "{}"
+
+  defp inline_repr_call({:dict, k, v}, arg, depth) do
+    with kf when not is_nil(kf) <- inline_elem_fn(k, depth + 1),
+         vf when not is_nil(vf) <- inline_elem_fn(v, depth + 1) do
+      pair = pair_formatter(kf, vf)
+      map_join = {{:., [], [{:__aliases__, [], [:Enum]}, :map_join]}, [], [arg, ", ", pair]}
+      {:<>, [], [{:<>, [], ["{", map_join]}, "}"]}
+    else
+      _ -> nil
+    end
+  end
+
+  defp inline_repr_call(_type, _arg, _depth), do: nil
+
+  # Returns `fn x -> <inline_repr_for_e>(x) end` AST for use inside
+  # `Enum.map_join`. Nil if `e` can't inline.
+  defp inline_elem_fn(e, depth) do
+    x = Macro.var(:x, __MODULE__)
+
+    case inline_repr_call(e, x, depth) do
+      nil -> nil
+      body -> {:fn, [], [{:->, [], [[x], body]}]}
+    end
+  end
+
+  # All slots share the same lattice type → uniform formatter usable
+  # inside `Enum.map_join`. Heterogeneous tuples fall through to py_str.
+  defp ts_uniform_elem_fn([], _depth), do: nil
+
+  defp ts_uniform_elem_fn([first | rest], depth) do
+    if Enum.all?(rest, &(&1 == first)),
+      do: inline_elem_fn(first, depth),
+      else: nil
+  end
+
+  # `fn {k, v} -> kf.(k) <> ": " <> vf.(v) end` AST.
+  defp pair_formatter(kf, vf) do
+    k = Macro.var(:k, __MODULE__)
+    v = Macro.var(:v, __MODULE__)
+    kf_body = inline_repr_call_inline(kf, k)
+    vf_body = inline_repr_call_inline(vf, v)
+    body = {:<>, [], [{:<>, [], [kf_body, ": "]}, vf_body]}
+    {:fn, [], [{:->, [], [[{k, v}], body]}]}
+  end
+
+  # Given an `fn`-AST formatter and an argument, produce the AST that
+  # *calls* the formatter on the argument. We could just emit
+  # `formatter.(arg)`, but inlining the body avoids a nested `fn`.
+  defp inline_repr_call_inline({:fn, _, [{:->, _, [[param], body]}]}, arg) do
+    Macro.prewalk(body, fn
+      ^param -> arg
+      other -> other
+    end)
+  end
+
+  defp inline_repr_call_inline(formatter, arg), do: {{:., [], [formatter]}, [], [arg]}
 
   @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) ::
           Pylixir.Lowering.result()
