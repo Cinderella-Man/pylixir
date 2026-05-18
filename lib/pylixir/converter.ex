@@ -23,6 +23,7 @@ defmodule Pylixir.Converter do
     Naming,
     Nodes,
     Stdlib,
+    TypeInfer,
     UnsupportedNodeError
   }
 
@@ -61,6 +62,12 @@ defmodule Pylixir.Converter do
         class_names: class_names,
         class_methods: class_methods
     }
+
+    # PR 3 — seed heap_types for `mutable_module_dicts` from their
+    # initial top-level assigns. Container tag only; element types
+    # stay `:any` per Q5-C. Must precede any conversion that reads
+    # these names so reads through `process_dict_get` see the type.
+    context = TypeInfer.module_summary(analysis.runtime_statements, context)
 
     {class_asts, context} = convert_class_defs(analysis.class_defs, context)
     {hoisted_asts, context} = emit_hoisted_imports(analysis.hoisted_imports, context)
@@ -117,9 +124,11 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "BinOp", "op" => op, "left" => left, "right" => right} = node, context) do
+    lt = TypeInfer.infer_expr(left, context)
+    rt = TypeInfer.infer_expr(right, context)
     {left_ast, context} = convert(left, context)
     {right_ast, context} = convert(right, context)
-    {bin_op_ast(op, left_ast, right_ast, node), context}
+    {bin_op_ast(op, left_ast, right_ast, node, lt, rt), context}
   end
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
@@ -170,7 +179,9 @@ defmodule Pylixir.Converter do
   def convert(%{"_type" => "NamedExpr", "target" => target, "value" => value}, context) do
     case target do
       %{"_type" => "Name", "id" => id} ->
+        value_type = TypeInfer.infer_expr(value, context)
         {value_ast, context} = convert(value, context)
+        context = TypeInfer.bind(context, id, value_type)
         context = bind_name(context, id)
         target_atom = id |> Naming.rewrite() |> String.to_atom()
         {{:=, [], [{target_atom, [], nil}, value_ast]}, context}
@@ -1216,24 +1227,97 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  defp bin_op_ast(%{"_type" => "Add"}, l, r, _node), do: {:py_add, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Sub"}, l, r, _node), do: {:py_sub, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Mult"}, l, r, _node), do: {:py_mult, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Div"}, l, r, _node), do: {:py_div, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node), do: {:py_pow, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node), do: {:py_floor_div, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node), do: {:py_mod, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node), do: bitwise_call(:bsl, l, r)
-  defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node), do: bitwise_call(:bsr, l, r)
+  # `bin_op_ast/4` is the legacy entry point (AugAssign callers still
+  # use it). It dispatches to `/6` with `:any` operand types — no
+  # specialization, identical emit to before. New callers (the BinOp
+  # clause) compute types via `TypeInfer.infer_expr/2` and call `/6`
+  # directly so specializations can fire.
+  defp bin_op_ast(op, l, r, node), do: bin_op_ast(op, l, r, node, :any, :any)
+
+  # Add/Sub/Mult/Div: type-aware specialization (decision Q2-B for
+  # `Mult` on str/list × {:int_lit_nonneg}). Bool-tainted operands
+  # (hazard #9 / decision Q7-A) inhibit specialization — `True + 1 = 2`
+  # in Python but `true + 1` raises in Elixir. `TypeInfer.bin_op_type/3`
+  # already returns `:any` when bool is involved, but we re-check at
+  # the emit site so direct callers can't bypass it.
+
+  defp bin_op_ast(%{"_type" => "Add"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) -> {:py_add, [], [l, r]}
+      TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) -> {:+, [], [l, r]}
+      TypeInfer.is_str?(lt) and TypeInfer.is_str?(rt) -> {:<>, [], [l, r]}
+      TypeInfer.is_list?(lt) and TypeInfer.is_list?(rt) -> {:++, [], [l, r]}
+      true -> {:py_add, [], [l, r]}
+    end
+  end
+
+  defp bin_op_ast(%{"_type" => "Sub"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) -> {:py_sub, [], [l, r]}
+      TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) -> {:-, [], [l, r]}
+      true -> {:py_sub, [], [l, r]}
+    end
+  end
+
+  defp bin_op_ast(%{"_type" => "Mult"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) ->
+        {:py_mult, [], [l, r]}
+
+      TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) ->
+        {:*, [], [l, r]}
+
+      # `"abc" * n` — Python returns "" for n <= 0; String.duplicate
+      # crashes on negative. Only the literal-nonneg int refinement
+      # makes the specialization safe (decision Q2-B). Dynamic ints fall
+      # through to py_mult, which has the `b <= 0` clause.
+      TypeInfer.is_str?(lt) and rt == {:int_lit_nonneg} ->
+        string_duplicate(l, r)
+
+      lt == {:int_lit_nonneg} and TypeInfer.is_str?(rt) ->
+        string_duplicate(r, l)
+
+      TypeInfer.is_list?(lt) and rt == {:int_lit_nonneg} ->
+        list_duplicate_concat(l, r)
+
+      lt == {:int_lit_nonneg} and TypeInfer.is_list?(rt) ->
+        list_duplicate_concat(r, l)
+
+      true ->
+        {:py_mult, [], [l, r]}
+    end
+  end
+
+  # Python 3 `/` is true division: int/int = float. Elixir `Kernel./`
+  # has matching semantics for two numerics, so emit directly when both
+  # sides are statically numeric. Bool-tainted falls through.
+  defp bin_op_ast(%{"_type" => "Div"}, l, r, _node, lt, rt) do
+    cond do
+      bool_tainted_pair?(lt, rt) -> {:py_div, [], [l, r]}
+      numeric_type?(lt) and numeric_type?(rt) -> {:/, [], [l, r]}
+      true -> {:py_div, [], [l, r]}
+    end
+  end
+
+  # Remaining ops have no specialization yet; just emit the polymorphic
+  # helper. `lt`/`rt` are accepted for API uniformity.
+  defp bin_op_ast(%{"_type" => "Pow"}, l, r, _node, _lt, _rt), do: {:py_pow, [], [l, r]}
+
+  defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node, _lt, _rt),
+    do: {:py_floor_div, [], [l, r]}
+
+  defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node, _lt, _rt), do: {:py_mod, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsl, l, r)
+  defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsr, l, r)
   # Python's `|` / `&` / `^` are overloaded: bitwise on ints, set ops
   # on MapSets. Route through `py_bor` / `py_band` / `py_bxor` helpers
   # which dispatch at runtime. (LShift/RShift stay direct — there's
   # no set equivalent.)
-  defp bin_op_ast(%{"_type" => "BitOr"}, l, r, _node), do: {:py_bor, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "BitAnd"}, l, r, _node), do: {:py_band, [], [l, r]}
-  defp bin_op_ast(%{"_type" => "BitXor"}, l, r, _node), do: {:py_bxor, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "BitOr"}, l, r, _node, _lt, _rt), do: {:py_bor, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "BitAnd"}, l, r, _node, _lt, _rt), do: {:py_band, [], [l, r]}
+  defp bin_op_ast(%{"_type" => "BitXor"}, l, r, _node, _lt, _rt), do: {:py_bxor, [], [l, r]}
 
-  defp bin_op_ast(%{"_type" => "MatMult"}, _l, _r, node) do
+  defp bin_op_ast(%{"_type" => "MatMult"}, _l, _r, node, _lt, _rt) do
     raise UnsupportedNodeError,
       node_type: "MatMult",
       hint: "matrix-multiplication operator `@` is not supported",
@@ -1241,7 +1325,7 @@ defmodule Pylixir.Converter do
       col_offset: Map.get(node, "col_offset")
   end
 
-  defp bin_op_ast(%{"_type" => other}, _l, _r, node) do
+  defp bin_op_ast(%{"_type" => other}, _l, _r, node, _lt, _rt) do
     raise UnsupportedNodeError,
       node_type: other,
       hint: "binary operator `#{other}` is not supported",
@@ -1251,6 +1335,28 @@ defmodule Pylixir.Converter do
 
   defp bitwise_call(fun_name, l, r) do
     {{:., [], [{:__aliases__, [], [:Bitwise]}, fun_name]}, [], [l, r]}
+  end
+
+  # ---- bin_op specialization helpers ---------------------------------
+
+  defp bool_tainted_pair?(lt, rt), do: bool_tainted?(lt) or bool_tainted?(rt)
+
+  defp bool_tainted?({:bool}), do: true
+  defp bool_tainted?({:union, set}), do: MapSet.member?(set, {:bool})
+  defp bool_tainted?(_), do: false
+
+  defp numeric_type?({:int}), do: true
+  defp numeric_type?({:int_lit_nonneg}), do: true
+  defp numeric_type?({:float}), do: true
+  defp numeric_type?(_), do: false
+
+  defp string_duplicate(s, n) do
+    {{:., [], [{:__aliases__, [], [:String]}, :duplicate]}, [], [s, n]}
+  end
+
+  defp list_duplicate_concat(l, n) do
+    duplicate = {{:., [], [{:__aliases__, [], [:List]}, :duplicate]}, [], [l, n]}
+    {{:., [], [{:__aliases__, [], [:Enum]}, :concat]}, [], [duplicate]}
   end
 
   defp bool_op_atom(%{"_type" => "And"}, _node), do: :&&
@@ -1285,7 +1391,16 @@ defmodule Pylixir.Converter do
         {process_dict_put_ast(id, combined), context}
 
       true ->
+        synthetic_binop = %{
+          "_type" => "BinOp",
+          "op" => op,
+          "left" => %{"_type" => "Name", "id" => id},
+          "right" => value
+        }
+
+        result_type = TypeInfer.infer_expr(synthetic_binop, context)
         {value_ast, context} = convert(value, context)
+        context = TypeInfer.bind(context, id, result_type)
         context = bind_name(context, id)
         target_atom = id |> Naming.rewrite() |> String.to_atom()
         target_ref = {target_atom, [], nil}
@@ -1510,6 +1625,7 @@ defmodule Pylixir.Converter do
         emit_starred_call(id, star_node, node, context)
 
       :no ->
+        arg_types = Enum.map(raw_args, &TypeInfer.infer_expr(&1, context))
         {arg_asts, context} = convert_each(raw_args, context)
         {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
 
@@ -1569,7 +1685,7 @@ defmodule Pylixir.Converter do
 
           Builtins.supported?(id) ->
             Lowering.dispatch(
-              Builtins.emit(id, arg_asts, kwargs),
+              Builtins.emit(id, arg_asts, kwargs, arg_types),
               "`#{id}/#{length(arg_asts)}` is not a supported Python builtin call shape",
               node,
               context
@@ -2007,6 +2123,7 @@ defmodule Pylixir.Converter do
        ) do
     {slice_ast, context} = convert(slice, context)
     {coll_ast, context} = convert(collection, context)
+    context = TypeInfer.demote(context, coll_id)
     context = bind_name(context, coll_id)
     {{:=, [], [coll_ast, {:py_delitem, [], [coll_ast, slice_ast]}]}, context}
   end

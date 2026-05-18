@@ -32,6 +32,8 @@ defmodule Pylixir.Context do
 
   @type return_mode :: nil | :unwrapped | :wrapped | :tuple_with_self
 
+  @type type_frame_kind :: :module | :function | :class | :lambda | :comprehension
+
   @type t :: %__MODULE__{
           scopes: [MapSet.t(String.t())],
           while_counter: non_neg_integer(),
@@ -50,7 +52,11 @@ defmodule Pylixir.Context do
           recursive_self_binding: nil | String.t(),
           stdlib_aliases: %{optional(String.t()) => {String.t(), String.t()}},
           class_names: MapSet.t(String.t()),
-          class_methods: %{optional(String.t()) => [{String.t(), :mutating | :read_only}]}
+          class_methods: %{optional(String.t()) => [{String.t(), :mutating | :read_only}]},
+          types: %{optional(String.t()) => term()},
+          type_stack: [{type_frame_kind(), %{optional(String.t()) => term()}}],
+          fn_signatures: %{optional(String.t()) => {[term()], term()}},
+          heap_types: %{optional(String.t()) => term()}
         }
 
   @enforce_keys [:scopes]
@@ -71,7 +77,11 @@ defmodule Pylixir.Context do
             recursive_self_binding: nil,
             stdlib_aliases: %{},
             class_names: MapSet.new(),
-            class_methods: %{}
+            class_methods: %{},
+            types: %{},
+            type_stack: [],
+            fn_signatures: %{},
+            heap_types: %{}
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

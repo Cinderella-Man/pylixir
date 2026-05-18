@@ -19,7 +19,7 @@ defmodule Pylixir.Nodes.Mutations do
   Deeper chains (`m[i][j].method(args)`) are not yet supported.
   """
 
-  alias Pylixir.{Converter, Naming, UnsupportedNodeError}
+  alias Pylixir.{Converter, Naming, TypeInfer, UnsupportedNodeError}
 
   @methods ~w(append appendleft sort reverse insert extend remove clear pop popleft add discard update setdefault
               intersection_update difference_update symmetric_difference_update)
@@ -124,6 +124,7 @@ defmodule Pylixir.Nodes.Mutations do
     target_ast = {target_atom, [], nil}
     new_value = mutation_rhs(method, target_ast, arg_asts, kwargs, source)
 
+    context = TypeInfer.demote(context, target_name)
     context = Converter.bind_name(context, target_name)
     {{:=, [], [target_ast, new_value]}, context}
   end
@@ -155,6 +156,7 @@ defmodule Pylixir.Nodes.Mutations do
     setitem = {:py_setitem, [], [coll_ref, slice_ref, new_inner]}
     assign = {:=, [], [coll_ref, setitem]}
 
+    context = TypeInfer.demote(context, coll_name)
     context = Converter.bind_name(context, coll_name)
 
     ast =

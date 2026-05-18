@@ -50,13 +50,21 @@ defmodule Pylixir.Nodes.CompareTest do
       assert isnot_ast == {:!=, [], [{:x, [], nil}, nil]}
     end
 
-    test "In/NotIn route through py_in" do
+    test "In/NotIn specialize to Kernel.in when rhs is a known list (PR 5)" do
       lst = %{"_type" => "List", "elts" => [const(1), const(2)]}
       {in_ast, _} = Converter.convert(compare(name("x"), ["In"], [lst]), Context.new())
       {notin_ast, _} = Converter.convert(compare(name("x"), ["NotIn"], [lst]), Context.new())
 
-      assert in_ast == {:py_in, [], [{:x, [], nil}, [1, 2]]}
-      assert notin_ast == {:!, [], [{:py_in, [], [{:x, [], nil}, [1, 2]]}]}
+      # rhs `[1, 2]` has type `{:list, _}` → emit `Kernel.in/2` directly.
+      assert in_ast == {:in, [], [{:x, [], nil}, [1, 2]]}
+      assert notin_ast == {:!, [], [{:in, [], [{:x, [], nil}, [1, 2]]}]}
+    end
+
+    test "In falls back to py_in when rhs is an unknown name" do
+      {in_ast, _} =
+        Converter.convert(compare(name("x"), ["In"], [name("xs")]), Context.new())
+
+      assert in_ast == {:py_in, [], [{:x, [], nil}, {:xs, [], nil}]}
     end
   end
 

@@ -19,7 +19,7 @@ defmodule Pylixir.Nodes.FString do
   extractor.
   """
 
-  alias Pylixir.{Converter, UnsupportedNodeError}
+  alias Pylixir.{Converter, TypeInfer, UnsupportedNodeError}
 
   @spec joined_str(map(), Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
   def joined_str(%{"_type" => "JoinedStr", "values" => values}, context) do
@@ -47,18 +47,24 @@ defmodule Pylixir.Nodes.FString do
     do: {v, context}
 
   defp part(%{"_type" => "FormattedValue"} = node, context) do
-    {value_ast, context} = Converter.convert(Map.fetch!(node, "value"), context)
+    value_node = Map.fetch!(node, "value")
+    # Infer the segment's type BEFORE recursive convert so we can drop
+    # `py_str` when the value is already a binary, or emit
+    # `Integer.to_string/1` when it's a statically-known int (Q9).
+    value_type = TypeInfer.infer_expr(value_node, context)
+    {value_ast, context} = Converter.convert(value_node, context)
     # `conversion` is `-1` (none), `!r` (114), `!s` (115), or `!a` (97).
     # Apply BEFORE the format spec — Python evaluates `value!r:spec` as
     # `format(repr(value), spec)`. !r and !a both stringify via repr
     # (Pylixir's `py_repr` collapses both since we don't model ASCII
     # escaping distinctly).
-    value_ast = apply_conversion(Map.get(node, "conversion", -1), value_ast)
+    conversion = Map.get(node, "conversion", -1)
+    value_ast = apply_conversion(conversion, value_ast)
     spec = extract_format_spec(Map.get(node, "format_spec"))
 
     case spec do
       :none ->
-        {{:py_str, [], [value_ast]}, context}
+        {specialize_no_spec(value_ast, value_type, conversion), context}
 
       {:literal, text} ->
         {{:py_format_value, [], [value_ast, text]}, context}
@@ -78,6 +84,24 @@ defmodule Pylixir.Nodes.FString do
       node_type: "JoinedStr",
       hint:
         "unexpected JoinedStr child `#{Map.get(other, "_type")}` — expected Constant or FormattedValue"
+  end
+
+  # No format spec — specialize `py_str(value)` based on the inferred
+  # value type. Skipped when a conversion (`!r` / `!s` / `!a`) was
+  # applied above — that already wraps the value through py_repr or
+  # py_str, so the outer call sees a binary.
+  defp specialize_no_spec(value_ast, type, conversion) when conversion in [-1, nil] do
+    cond do
+      type == {:str} -> value_ast
+      type == {:int} or type == {:int_lit_nonneg} -> integer_to_string(value_ast)
+      true -> {:py_str, [], [value_ast]}
+    end
+  end
+
+  defp specialize_no_spec(value_ast, _type, _conversion), do: {:py_str, [], [value_ast]}
+
+  defp integer_to_string(value_ast) do
+    {{:., [], [{:__aliases__, [], [:Integer]}, :to_string]}, [], [value_ast]}
   end
 
   # Format spec is itself a JoinedStr. If it's a single Constant string

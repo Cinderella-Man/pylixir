@@ -14,27 +14,34 @@ defmodule Pylixir.Nodes.Compare do
   small and well-defined) can reuse it.
   """
 
-  alias Pylixir.{AST.Trivial, Converter}
+  alias Pylixir.{AST.Trivial, Converter, TypeInfer}
 
   @spec emit(map(), [map()], [map()], Pylixir.Context.t()) ::
           {Macro.t(), Pylixir.Context.t()}
   def emit(left, [single_op], comparators, context) do
     [right_node] = comparators
+    lt = TypeInfer.infer_expr(left, context)
+    rt = TypeInfer.infer_expr(right_node, context)
     {left_ast, context} = Converter.convert(left, context)
     {right_ast, context} = Converter.convert(right_node, context)
-    {pair_ast(single_op, left_ast, right_ast), context}
+    {pair_ast(single_op, left_ast, right_ast, lt, rt), context}
   end
 
   def emit(left, ops, comparators, context) do
+    lt = TypeInfer.infer_expr(left, context)
     {left_ast, context} = Converter.convert(left, context)
     {middles, last} = Enum.split(comparators, length(comparators) - 1)
 
+    middle_types = Enum.map(middles, &TypeInfer.infer_expr(&1, context))
     {middle_refs, temp_bindings, context} = build_middle_refs(middles, context)
 
-    {last_ast, context} = Converter.convert(hd(last), context)
+    last_node = hd(last)
+    last_type = TypeInfer.infer_expr(last_node, context)
+    {last_ast, context} = Converter.convert(last_node, context)
 
     operand_asts = [left_ast | middle_refs] ++ [last_ast]
-    pairs = build_compare_pairs(operand_asts, ops)
+    operand_types = [lt | middle_types] ++ [last_type]
+    pairs = build_compare_pairs(operand_asts, operand_types, ops)
     [first_pair | rest_pairs] = pairs
     chain = Enum.reduce(rest_pairs, first_pair, fn p, acc -> {:&&, [], [acc, p]} end)
 
@@ -49,18 +56,53 @@ defmodule Pylixir.Nodes.Compare do
 
   @doc """
   Map a single Python comparison operator to its Elixir equivalent.
+
+  The 5-arg form takes the operand types and specializes `In` / `NotIn`
+  to container-specific operators when the right-hand type is known
+  (decision PR 5). Equality / ordering operators don't currently
+  specialize — the polymorphic Elixir operators already match Python
+  semantics for the typed cases.
   """
   @spec pair_ast(map(), Macro.t(), Macro.t()) :: Macro.t()
-  def pair_ast(%{"_type" => "Eq"}, l, r), do: {:==, [], [l, r]}
-  def pair_ast(%{"_type" => "NotEq"}, l, r), do: {:!=, [], [l, r]}
-  def pair_ast(%{"_type" => "Lt"}, l, r), do: {:<, [], [l, r]}
-  def pair_ast(%{"_type" => "LtE"}, l, r), do: {:<=, [], [l, r]}
-  def pair_ast(%{"_type" => "Gt"}, l, r), do: {:>, [], [l, r]}
-  def pair_ast(%{"_type" => "GtE"}, l, r), do: {:>=, [], [l, r]}
-  def pair_ast(%{"_type" => "Is"}, l, r), do: {:==, [], [l, r]}
-  def pair_ast(%{"_type" => "IsNot"}, l, r), do: {:!=, [], [l, r]}
-  def pair_ast(%{"_type" => "In"}, l, r), do: {:py_in, [], [l, r]}
-  def pair_ast(%{"_type" => "NotIn"}, l, r), do: {:!, [], [{:py_in, [], [l, r]}]}
+  def pair_ast(op, l, r), do: pair_ast(op, l, r, :any, :any)
+
+  @spec pair_ast(map(), Macro.t(), Macro.t(), TypeInfer.t(), TypeInfer.t()) :: Macro.t()
+  def pair_ast(%{"_type" => "Eq"}, l, r, _lt, _rt), do: {:==, [], [l, r]}
+  def pair_ast(%{"_type" => "NotEq"}, l, r, _lt, _rt), do: {:!=, [], [l, r]}
+  def pair_ast(%{"_type" => "Lt"}, l, r, _lt, _rt), do: {:<, [], [l, r]}
+  def pair_ast(%{"_type" => "LtE"}, l, r, _lt, _rt), do: {:<=, [], [l, r]}
+  def pair_ast(%{"_type" => "Gt"}, l, r, _lt, _rt), do: {:>, [], [l, r]}
+  def pair_ast(%{"_type" => "GtE"}, l, r, _lt, _rt), do: {:>=, [], [l, r]}
+  def pair_ast(%{"_type" => "Is"}, l, r, _lt, _rt), do: {:==, [], [l, r]}
+  def pair_ast(%{"_type" => "IsNot"}, l, r, _lt, _rt), do: {:!=, [], [l, r]}
+
+  def pair_ast(%{"_type" => "In"}, l, r, lt, rt), do: in_emit(l, r, lt, rt)
+
+  def pair_ast(%{"_type" => "NotIn"}, l, r, lt, rt) do
+    {:!, [], [in_emit(l, r, lt, rt)]}
+  end
+
+  defp in_emit(l, r, lt, rt) do
+    cond do
+      # String-in-string: `needle in haystack` → String.contains?(haystack, needle).
+      # Requires BOTH sides to be strings — Python `"a" in 1` would TypeError;
+      # in Elixir, String.contains? requires both args to be binaries.
+      TypeInfer.is_str?(lt) and TypeInfer.is_str?(rt) ->
+        {{:., [], [{:__aliases__, [], [:String]}, :contains?]}, [], [r, l]}
+
+      TypeInfer.is_list?(rt) ->
+        {:in, [], [l, r]}
+
+      TypeInfer.is_set?(rt) ->
+        {{:., [], [{:__aliases__, [], [:MapSet]}, :member?]}, [], [r, l]}
+
+      TypeInfer.is_dict?(rt) ->
+        {{:., [], [{:__aliases__, [], [:Map]}, :has_key?]}, [], [r, l]}
+
+      true ->
+        {:py_in, [], [l, r]}
+    end
+  end
 
   defp build_middle_refs(middles, context) do
     {refs, bindings, context} =
@@ -80,10 +122,11 @@ defmodule Pylixir.Nodes.Compare do
     {Enum.reverse(refs), Enum.reverse(bindings), context}
   end
 
-  defp build_compare_pairs(operands, ops) do
+  defp build_compare_pairs(operands, types, ops) do
     pairs = Enum.zip(operands, tl(operands))
+    type_pairs = Enum.zip(types, tl(types))
 
-    Enum.zip(pairs, ops)
-    |> Enum.map(fn {{l, r}, op} -> pair_ast(op, l, r) end)
+    Enum.zip([pairs, type_pairs, ops])
+    |> Enum.map(fn {{l, r}, {lt, rt}, op} -> pair_ast(op, l, r, lt, rt) end)
   end
 end

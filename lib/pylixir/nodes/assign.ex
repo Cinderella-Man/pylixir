@@ -22,7 +22,7 @@ defmodule Pylixir.Nodes.Assign do
   `Pylixir.Converter` and are called back into here.
   """
 
-  alias Pylixir.{Converter, Naming, UnsupportedNodeError}
+  alias Pylixir.{Converter, Naming, TypeInfer, UnsupportedNodeError}
   alias Pylixir.AST.Trivial
 
   @spec assign(map(), Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
@@ -284,6 +284,15 @@ defmodule Pylixir.Nodes.Assign do
       {:starred, before, star_name, after_elts} ->
         if Enum.all?(before, &match?(%{"_type" => "Name"}, &1)) and
              Enum.all?(after_elts, &match?(%{"_type" => "Name"}, &1)) do
+          value_type = TypeInfer.infer_expr(value, context)
+
+          context =
+            TypeInfer.bind_pattern(
+              %{"_type" => "Tuple", "elts" => elts},
+              value_type,
+              context
+            )
+
           emit_starred_destructure(before, star_name, after_elts, value, context)
         else
           raise UnsupportedNodeError,
@@ -298,6 +307,11 @@ defmodule Pylixir.Nodes.Assign do
           pure_destructure_target?(elts) ->
             # Pure tuple-of-Names (possibly nested) — e.g.
             # `a, b = (1, 2)` or `count, (a, b) = func()`.
+            value_type = TypeInfer.infer_expr(value, context)
+
+            context =
+              TypeInfer.bind_pattern(%{"_type" => "Tuple", "elts" => elts}, value_type, context)
+
             {value_ast, context} = Converter.convert(value, context)
             context = bind_destructure_target(elts, context)
             pattern = destructure_pattern(elts)
@@ -346,6 +360,7 @@ defmodule Pylixir.Nodes.Assign do
             {step_ast, context} = Converter.convert_optional(Map.get(slice_node, "step"), context)
             {coll_ast, context} = Converter.convert(collection, context)
             rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
+            context = TypeInfer.demote(context, coll_id)
             context = Converter.bind_name(context, coll_id)
             {{:=, [], [coll_ast, rhs]}, context}
 
@@ -354,6 +369,7 @@ defmodule Pylixir.Nodes.Assign do
             {slice_ast, context} = Converter.convert(slice, context)
             {coll_ast, context} = Converter.convert(collection, context)
             setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
+            context = TypeInfer.demote(context, coll_id)
             context = Converter.bind_name(context, coll_id)
             {{:=, [], [coll_ast, setitem]}, context}
         end
@@ -413,7 +429,9 @@ defmodule Pylixir.Nodes.Assign do
           {{:=, [], [pattern, call]}, context}
 
         :no ->
+          value_type = TypeInfer.infer_expr(value, context)
           {value_ast, context} = Converter.convert(value, context)
+          context = TypeInfer.bind(context, id, value_type)
           context = Converter.bind_name(context, id)
           {target_ast, context} = Converter.convert(target, context)
           {{:=, [], [target_ast, value_ast]}, context}

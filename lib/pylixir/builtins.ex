@@ -132,6 +132,53 @@ defmodule Pylixir.Builtins do
     {:fn, [], [{:->, [], [[arg], body]}]}
   end
 
+  alias Pylixir.TypeInfer
+
+  @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}, [TypeInfer.t()]) ::
+          Pylixir.Lowering.result()
+  # PR 4 — type-aware specialization. When the arg type is concrete,
+  # emit the matching kernel/stdlib call directly instead of the
+  # polymorphic helper. Falls through to `emit/3` for everything else.
+
+  def emit("len", [x], _kw, [t]) do
+    cond do
+      TypeInfer.is_list?(t) ->
+        {:ok, {:length, [], [x]}}
+
+      TypeInfer.is_str?(t) ->
+        {:ok, {{:., [], [{:__aliases__, [], [:String]}, :length]}, [], [x]}}
+
+      TypeInfer.is_dict?(t) ->
+        {:ok, {:map_size, [], [x]}}
+
+      TypeInfer.is_set?(t) ->
+        {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :size]}, [], [x]}}
+
+      match?({:tuple, _}, t) ->
+        {:ok, {:tuple_size, [], [x]}}
+
+      true ->
+        emit("len", [x], %{})
+    end
+  end
+
+  # `int(int_value)` / `str(str_value)` / `bool(bool_value)` — Python
+  # identity calls on already-typed values. Drop the wrapping helper
+  # entirely.
+  def emit("int", [x], kw, [t]) do
+    if TypeInfer.is_int?(t), do: {:ok, x}, else: emit("int", [x], kw)
+  end
+
+  def emit("str", [x], kw, [t]) do
+    if TypeInfer.is_str?(t), do: {:ok, x}, else: emit("str", [x], kw)
+  end
+
+  def emit("bool", [x], kw, [t]) do
+    if t == {:bool}, do: {:ok, x}, else: emit("bool", [x], kw)
+  end
+
+  def emit(id, args, kw, _arg_types), do: emit(id, args, kw)
+
   @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) ::
           Pylixir.Lowering.result()
   def emit("len", [x], _kw), do: {:ok, {:py_len, [], [x]}}

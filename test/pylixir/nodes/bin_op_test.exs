@@ -6,6 +6,7 @@ defmodule Pylixir.Nodes.BinOpTest do
   defp const(v), do: %{"_type" => "Constant", "value" => v}
   defp list_node(elts), do: %{"_type" => "List", "elts" => elts}
   defp op(name), do: %{"_type" => name}
+  defp unbound_name(id), do: %{"_type" => "Name", "id" => id}
 
   defp binop(op_name, left, right),
     do: %{"_type" => "BinOp", "op" => op(op_name), "left" => left, "right" => right}
@@ -13,29 +14,51 @@ defmodule Pylixir.Nodes.BinOpTest do
   defp module_with(stmt), do: %{"_type" => "Module", "body" => [stmt]}
 
   describe "AST shape — T10 arithmetic ops" do
-    test "Add emits py_add(left, right)" do
+    # Specialization (PR 2) collapses int+int / int-int / int*int / int/int
+    # to the direct Kernel op. When operand types are unknown, the
+    # polymorphic helper still fires (see "polymorphic fallback" tests
+    # below). Bool-tainted operands also fall through.
+
+    test "Add on two int literals specializes to Kernel.+" do
       {ast, _} = Converter.convert(binop("Add", const(1), const(2)), Context.new())
-      assert ast == {:py_add, [], [1, 2]}
+      assert ast == {:+, [], [1, 2]}
     end
 
-    test "Sub emits py_sub — handles bool→int coercion per RFC §6.11" do
+    test "Sub on two int literals specializes to Kernel.-" do
       {ast, _} = Converter.convert(binop("Sub", const(5), const(3)), Context.new())
-      assert ast == {:py_sub, [], [5, 3]}
+      assert ast == {:-, [], [5, 3]}
     end
 
-    test "Mult emits py_mult(left, right)" do
+    test "Mult on two int literals specializes to Kernel.*" do
       {ast, _} = Converter.convert(binop("Mult", const(2), const(3)), Context.new())
-      assert ast == {:py_mult, [], [2, 3]}
+      assert ast == {:*, [], [2, 3]}
     end
 
-    test "Div emits py_div — handles bool→int coercion per RFC §6.11" do
+    test "Div on two int literals specializes to Kernel./ (Python 3 / = float)" do
       {ast, _} = Converter.convert(binop("Div", const(10), const(4)), Context.new())
-      assert ast == {:py_div, [], [10, 4]}
+      assert ast == {:/, [], [10, 4]}
     end
 
-    test "Pow emits py_pow(left, right)" do
+    test "Pow emits py_pow (no specialization yet)" do
       {ast, _} = Converter.convert(binop("Pow", const(2), const(3)), Context.new())
       assert ast == {:py_pow, [], [2, 3]}
+    end
+  end
+
+  describe "polymorphic fallback — types unknown" do
+    # An operand that resolves to :any (an unbound Name) keeps the
+    # polymorphic helper. Proves PR 2 is purely additive.
+
+    test "Add on unknown operands emits py_add" do
+      {ast, _} = Converter.convert(binop("Add", unbound_name("x"), const(1)), Context.new())
+      assert {:py_add, [], _} = ast
+    end
+
+    test "Mult on str literal × dynamic int emits py_mult (Q2-B)" do
+      {ast, _} =
+        Converter.convert(binop("Mult", const("ab"), unbound_name("n")), Context.new())
+
+      assert {:py_mult, [], _} = ast
     end
   end
 
