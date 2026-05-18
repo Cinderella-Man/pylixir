@@ -808,6 +808,14 @@ defmodule Pylixir.Converter do
         atom = id |> Naming.rewrite() |> String.to_atom()
         {{atom, [], nil}, context}
 
+      MapSet.member?(context.mutable_module_dicts, id) ->
+        # Module-level dict that gets `name[k] = v`-mutated inside a
+        # def — read via Process dict so the mutation persists. The
+        # initial `name = {…}` Assign at module-runtime position
+        # writes to the same key (see `aug_or_subscript_assign`'s
+        # mutable-dict branch).
+        {process_dict_get(id), context}
+
       MapSet.member?(context.module_attrs, id) ->
         attr_name = String.to_atom("var_" <> id)
         {{:@, [], [{attr_name, [], nil}]}, context}
@@ -2311,6 +2319,27 @@ defmodule Pylixir.Converter do
   # unconditionally.
   defp moduledoc_ast(nil), do: []
   defp moduledoc_ast(doc) when is_binary(doc), do: [{:@, [], [{:moduledoc, [], [doc]}]}]
+
+  # `Process.put({:pylixir_mod, name}, value)` and
+  # `Process.get({:pylixir_mod, name})` — the lowering shape for
+  # module-level mutable dicts (`memo = {}` + `memo[k] = v` inside a
+  # def). The `:pylixir_mod` tag namespaces the key away from any
+  # process dict slot the user's own code might touch.
+  defp process_dict_get(name) do
+    key = {:{}, [], [:pylixir_mod, name]}
+    {{:., [], [{:__aliases__, [], [:Process]}, :get]}, [], [key]}
+  end
+
+  @doc false
+  @spec process_dict_get_ast(String.t()) :: Macro.t()
+  def process_dict_get_ast(name), do: process_dict_get(name)
+
+  @doc false
+  @spec process_dict_put_ast(String.t(), Macro.t()) :: Macro.t()
+  def process_dict_put_ast(name, value_ast) do
+    key = {:{}, [], [:pylixir_mod, name]}
+    {{:., [], [{:__aliases__, [], [:Process]}, :put]}, [], [key, value_ast]}
+  end
 
   defp py_main_def([]) do
     {:def, [], [{:py_main, [], nil}, [do: nil]]}

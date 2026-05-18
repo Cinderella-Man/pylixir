@@ -49,6 +49,10 @@ defmodule Pylixir.ModuleAnalysis do
           # `f.(args)` (the closure form) instead of `f(args)` (the
           # never-emitted top-level defp form).
           demoted_function_names: MapSet.t(String.t()),
+          # Names of module-level dict literals that get mutated via
+          # `name[k] = v` inside a def — lowered through Process dict
+          # so the mutation persists.
+          mutable_module_dicts: MapSet.t(String.t()),
           class_defs: [Pylixir.ClassAnalysis.t()],
           # `[{alias_name, original_name, mod_name, arity}]` — stdlib
           # imports we hoist to module-top defps. See `hoistable_imports/1`.
@@ -62,6 +66,7 @@ defmodule Pylixir.ModuleAnalysis do
             known_functions: MapSet.new(),
             known_function_arities: %{},
             demoted_function_names: MapSet.new(),
+            mutable_module_dicts: MapSet.new(),
             class_defs: [],
             hoisted_imports: [],
             module_doc: nil
@@ -104,6 +109,23 @@ defmodule Pylixir.ModuleAnalysis do
     hoisted_imports = hoistable_imports(body_no_classes)
     hoisted_names = MapSet.new(hoisted_imports, fn {alias_n, _, _, _} -> alias_n end)
     promotable = mutation_free_literal_names(body_no_classes)
+
+    # Top-level dict literals (`memo = {}`) that get subscript-mutated
+    # inside a top-level def (`memo[k] = v`) are the classic Python
+    # memoization shape. Pylixir routes these through Process dict at
+    # codegen time so the mutation persists — see the Name / Assign /
+    # AugAssign converter clauses that check
+    # `context.mutable_module_dicts`. Bumped out of `promotable` so the
+    # initial `memo = {}` becomes a runtime statement that the
+    # Converter rewrites into `Process.put(...)`.
+    mutable_module_dicts =
+      mutable_module_dict_names(body_no_classes, promotable)
+
+    promotable = MapSet.difference(promotable, mutable_module_dicts)
+
+    # Any *non*-dict mutable promotable still gets the loud rejection —
+    # int counters via `global x; x += 1`, lists via `xs.append`, …
+    # need different lowerings we don't yet have.
     reject_mutated_in_top_defs!(body_no_classes, promotable)
     {attrs, fns, stmts} = partition(body_no_classes, promotable)
 
@@ -126,6 +148,10 @@ defmodule Pylixir.ModuleAnalysis do
     mutable_module_names =
       mutable_top_level_names(body, attrs)
       |> MapSet.difference(hoisted_names)
+      # `mutable_module_dicts` are accessed through Process dict at
+      # codegen time — readable from any scope (top-level defp OR
+      # closure), so they don't need to drive demotion.
+      |> MapSet.difference(mutable_module_dicts)
 
     {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
 
@@ -166,6 +192,7 @@ defmodule Pylixir.ModuleAnalysis do
       known_functions: known,
       known_function_arities: arities,
       demoted_function_names: MapSet.new(demoted_fns, & &1["name"]),
+      mutable_module_dicts: mutable_module_dicts,
       class_defs: class_defs,
       hoisted_imports: hoisted_imports,
       module_doc: module_doc
@@ -799,6 +826,40 @@ defmodule Pylixir.ModuleAnalysis do
   # Reject the pattern at transpile time so the user refactors to
   # pass state explicitly through return values (the only shape
   # Pylixir's immutable lowering can model correctly).
+  # Identify module-level names whose:
+  #   1. initial assign is a literal *dict* (`memo = {}` / `memo = {0: 1}`)
+  #   2. and which are mutated via `name[k] = v` inside a top-level def
+  # These are the memoization shape — the Converter lowers reads to
+  # `Process.get/1` and subscript-writes to `Process.put/2` so the
+  # mutation persists across calls. Other mutable patterns (int
+  # counters, list `.append`, etc.) still fall through to
+  # `reject_mutated_in_top_defs!`.
+  defp mutable_module_dict_names(body, promotable) do
+    body_index = Enum.with_index(body)
+
+    promotable
+    |> Enum.filter(fn name ->
+      dict_init_assign?(body_index, name) and mutated_inside_top_def?(body, name)
+    end)
+    |> MapSet.new()
+  end
+
+  defp dict_init_assign?(body_index, name) do
+    Enum.any?(body_index, fn {node, _} ->
+      case node do
+        %{
+          "_type" => "Assign",
+          "targets" => [%{"_type" => "Name", "id" => ^name}],
+          "value" => %{"_type" => "Dict"}
+        } ->
+          true
+
+        _ ->
+          false
+      end
+    end)
+  end
+
   defp reject_mutated_in_top_defs!(body, promotable) do
     promotable
     |> Enum.find(fn name -> mutated_inside_top_def?(body, name) end)

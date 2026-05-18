@@ -320,25 +320,43 @@ defmodule Pylixir.Nodes.Assign do
          _node,
          context
        ) do
-    case slice do
-      # Slice-assignment: `coll[start:stop:step] = new_seq`.
-      %{"_type" => "Slice"} = slice_node ->
-        {value_ast, context} = Converter.convert(value, context)
-        {start_ast, context} = Converter.convert_optional(Map.get(slice_node, "lower"), context)
-        {stop_ast, context} = Converter.convert_optional(Map.get(slice_node, "upper"), context)
-        {step_ast, context} = Converter.convert_optional(Map.get(slice_node, "step"), context)
-        {coll_ast, context} = Converter.convert(collection, context)
-        rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
-        context = Converter.bind_name(context, coll_id)
-        {{:=, [], [coll_ast, rhs]}, context}
-
-      _ ->
+    cond do
+      MapSet.member?(context.mutable_module_dicts, coll_id) and
+          not match?(%{"_type" => "Slice"}, slice) ->
+        # `memo[k] = v` where `memo` is a module-level mutable dict.
+        # Reads of `memo` already lower to `Process.get/1` (Name
+        # clause); the write here is the matching `Process.put/2` with
+        # the dict-after-setitem as the new value. Slice-assign on
+        # mutable dicts isn't meaningful (Python dicts aren't sliceable)
+        # so we let the slice branch fall through to the regular path
+        # and crash loudly if it ever fires.
         {value_ast, context} = Converter.convert(value, context)
         {slice_ast, context} = Converter.convert(slice, context)
-        {coll_ast, context} = Converter.convert(collection, context)
-        setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
-        context = Converter.bind_name(context, coll_id)
-        {{:=, [], [coll_ast, setitem]}, context}
+        get = Pylixir.Converter.process_dict_get_ast(coll_id)
+        setitem = {:py_setitem, [], [get, slice_ast, value_ast]}
+        {Pylixir.Converter.process_dict_put_ast(coll_id, setitem), context}
+
+      true ->
+        case slice do
+          # Slice-assignment: `coll[start:stop:step] = new_seq`.
+          %{"_type" => "Slice"} = slice_node ->
+            {value_ast, context} = Converter.convert(value, context)
+            {start_ast, context} = Converter.convert_optional(Map.get(slice_node, "lower"), context)
+            {stop_ast, context} = Converter.convert_optional(Map.get(slice_node, "upper"), context)
+            {step_ast, context} = Converter.convert_optional(Map.get(slice_node, "step"), context)
+            {coll_ast, context} = Converter.convert(collection, context)
+            rhs = {:py_slice_assign, [], [coll_ast, start_ast, stop_ast, step_ast, value_ast]}
+            context = Converter.bind_name(context, coll_id)
+            {{:=, [], [coll_ast, rhs]}, context}
+
+          _ ->
+            {value_ast, context} = Converter.convert(value, context)
+            {slice_ast, context} = Converter.convert(slice, context)
+            {coll_ast, context} = Converter.convert(collection, context)
+            setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
+            context = Converter.bind_name(context, coll_id)
+            {{:=, [], [coll_ast, setitem]}, context}
+        end
     end
   end
 
@@ -366,28 +384,40 @@ defmodule Pylixir.Nodes.Assign do
   end
 
   defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
-    # `x = obj.method(args)` where method is a known mutating class
-    # method returns `{value, updated_self}` — destructure into both.
-    # The non-mutating path stays a plain assign.
-    case detect_mutating_method_call(value, context) do
-      {:ok, obj_name, class_name, method, args} ->
-        {arg_asts, context} = Converter.convert_each(args, context)
-        fn_name = Pylixir.Converter.method_fn_name(class_name, method)
-        obj_atom = obj_name |> Pylixir.Naming.rewrite() |> String.to_atom()
-        obj_ref = {obj_atom, [], nil}
-        call = {fn_name, [], [obj_ref | arg_asts]}
-        target_atom = id |> Pylixir.Naming.rewrite() |> String.to_atom()
-        target_ref = {target_atom, [], nil}
-        context = Converter.bind_name(context, obj_name)
-        context = Converter.bind_name(context, id)
-        pattern = {target_ref, obj_ref}
-        {{:=, [], [pattern, call]}, context}
+    # Module-level mutable dict — the initial `memo = {…}` lives in
+    # runtime statements (py_main); we store the value in the process
+    # dict so subsequent `memo[k] = v` writes inside top-level defs
+    # can persist. Reads route through `process_dict_get/1` (in
+    # Pylixir.Converter). Local rebinds (`memo = something_else` inside
+    # a closure) intentionally also go through Process.put — matches
+    # Python's `global` semantics for this restricted shape.
+    if MapSet.member?(context.mutable_module_dicts, id) do
+      {value_ast, context} = Converter.convert(value, context)
+      {Pylixir.Converter.process_dict_put_ast(id, value_ast), context}
+    else
+      # `x = obj.method(args)` where method is a known mutating class
+      # method returns `{value, updated_self}` — destructure into both.
+      # The non-mutating path stays a plain assign.
+      case detect_mutating_method_call(value, context) do
+        {:ok, obj_name, class_name, method, args} ->
+          {arg_asts, context} = Converter.convert_each(args, context)
+          fn_name = Pylixir.Converter.method_fn_name(class_name, method)
+          obj_atom = obj_name |> Pylixir.Naming.rewrite() |> String.to_atom()
+          obj_ref = {obj_atom, [], nil}
+          call = {fn_name, [], [obj_ref | arg_asts]}
+          target_atom = id |> Pylixir.Naming.rewrite() |> String.to_atom()
+          target_ref = {target_atom, [], nil}
+          context = Converter.bind_name(context, obj_name)
+          context = Converter.bind_name(context, id)
+          pattern = {target_ref, obj_ref}
+          {{:=, [], [pattern, call]}, context}
 
-      :no ->
-        {value_ast, context} = Converter.convert(value, context)
-        context = Converter.bind_name(context, id)
-        {target_ast, context} = Converter.convert(target, context)
-        {{:=, [], [target_ast, value_ast]}, context}
+        :no ->
+          {value_ast, context} = Converter.convert(value, context)
+          context = Converter.bind_name(context, id)
+          {target_ast, context} = Converter.convert(target, context)
+          {{:=, [], [target_ast, value_ast]}, context}
+      end
     end
   end
 

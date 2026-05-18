@@ -228,17 +228,17 @@ defmodule Pylixir.TranspileTest do
   end
 
   describe "module-level dict mutated inside top-level def" do
-    # Regression: `walk_scope` doesn't descend into FunctionDef bodies,
-    # so a `memo[x] = ...` inside `def f(...)` was invisible to the
-    # promotability check. `memo = {1: 1}` got promoted to `@var_memo`
-    # (immutable), the converter rewrote the subscript-assign to
-    # `@var_memo = py_setitem(...)` (runtime no-op), and any
-    # post-assign `memo[x]` read emitted bare `memo` — undefined
-    # variable. Five samples in the 5000-sample eval landed in the
-    # `compile_error--compile_quoted_raised` bucket from this.
-    # ModuleAnalysis now rejects the pattern at transpile time.
+    # Memoization shape: `memo = {…}` at module top, mutated via
+    # `memo[k] = v` inside a top-level def. Originally rejected because
+    # Pylixir lowers module-level literals to immutable Elixir module
+    # attributes (the mutation would silently vanish). Now lowered
+    # through the Erlang Process dict — reads emit `Process.get/1`,
+    # writes emit `Process.put/2`, so mutations persist across calls
+    # within the same py_main run. See ModuleAnalysis's
+    # `mutable_module_dict_names` and Converter's
+    # `process_dict_get_ast` / `_put_ast`.
 
-    test "subscript-assign of a module dict inside a def raises Module hint" do
+    test "subscript-assign of a module dict inside a def transpiles + runs" do
       if python_available?() do
         src = """
         memo = {1: 1}
@@ -250,16 +250,15 @@ defmodule Pylixir.TranspileTest do
             return memo[x]
 
         print(f(2))
+        print(f(2))  # second call hits the cached value
         """
 
-        err =
-          assert_raise UnsupportedNodeError, fn ->
-            Pylixir.transpile(src)
-          end
-
-        assert err.node_type == "Module"
-        assert err.hint =~ "memo"
-        assert err.hint =~ "Refactor"
+        out = Pylixir.transpile(src)
+        # Confirm the lowering shape — every read/write of `memo`
+        # routes through Process dict, no `@var_memo` attr left behind.
+        assert out =~ "Process.put({:pylixir_mod, \"memo\"}"
+        assert out =~ "Process.get({:pylixir_mod, \"memo\"})"
+        refute out =~ "@var_memo"
       end
     end
 
