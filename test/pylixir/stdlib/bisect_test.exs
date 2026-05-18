@@ -28,6 +28,21 @@ defmodule Pylixir.Stdlib.BisectTest do
                {:ok, {:py_bisect_right, [], [a_ast, x_ast]}}
     end
 
+    test "3-arg form (lo only) routes to the 3-arg helper variant" do
+      a = {:a, [], nil}
+      x = {:x, [], nil}
+      lo = {:lo, [], nil}
+
+      assert Bisect.call(["bisect_left"], [a, x, lo], %{}, %{}) ==
+               {:ok, {:py_bisect_left, [], [a, x, lo]}}
+
+      assert Bisect.call(["bisect_right"], [a, x, lo], %{}, %{}) ==
+               {:ok, {:py_bisect_right, [], [a, x, lo]}}
+
+      assert Bisect.call(["bisect"], [a, x, lo], %{}, %{}) ==
+               {:ok, {:py_bisect_right, [], [a, x, lo]}}
+    end
+
     test "unknown call returns :no_clause" do
       assert Bisect.call(["insort_left"], [], %{}, %{}) == :no_clause
     end
@@ -46,6 +61,13 @@ defmodule Pylixir.Stdlib.BisectTest do
     test "py_bisect_right — rightmost insertion point for equal values" do
       assert H.py_bisect_right([1, 3, 5, 7, 9], 5) == 3
       assert H.py_bisect_right([1, 3, 5, 5, 9], 5) == 4
+    end
+
+    test "3-arg variant defaults hi to len(list)" do
+      a = [1, 3, 5, 7, 9, 11, 13]
+      assert H.py_bisect_left(a, 7, 2) == 3
+      assert H.py_bisect_right(a, 7, 2) == 4
+      assert H.py_bisect_left(a, 100, 2) == 7
     end
   end
 end

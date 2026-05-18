@@ -1266,6 +1266,16 @@ defmodule Pylixir.RuntimeHelpers do
     Enum.find_index(list, fn v -> v > x end) || length(list)
   end
 
+  # 3-arg form: `bisect.bisect_left(a, x, lo)` — Python defaults
+  # `hi=len(a)` when omitted, so search the suffix `[lo, len(a))`.
+  def py_bisect_left(list, x, lo) when is_list(list) do
+    py_bisect_left(list, x, lo, length(list))
+  end
+
+  def py_bisect_right(list, x, lo) when is_list(list) do
+    py_bisect_right(list, x, lo, length(list))
+  end
+
   # 4-arg form: `bisect.bisect_left(a, x, lo, hi)` — search restricted
   # to `[lo, hi)`. Implemented by slicing then offsetting the result.
   def py_bisect_left(list, x, lo, hi) when is_list(list) do

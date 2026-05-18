@@ -47,8 +47,10 @@ defmodule Pylixir.Converter do
     # rejected at the call site with a clear hint.
     class_methods =
       Enum.reduce(analysis.class_defs, %{}, fn cls, acc ->
+        mutating = class_mutating_methods(cls)
+
         Enum.reduce(cls.methods, acc, fn m, acc2 ->
-          kind = if method_mutates_self?(m.body), do: :mutating, else: :read_only
+          kind = if MapSet.member?(mutating, m.name), do: :mutating, else: :read_only
           Map.update(acc2, m.name, [{cls.name, kind}], &[{cls.name, kind} | &1])
         end)
       end)
@@ -374,27 +376,35 @@ defmodule Pylixir.Converter do
   # generalize to `Attribute` calls, builtins, math, kwargs, local-scope
   # shadowing precedence with explicit `.(args)` for shadowed names.
   def convert(%{"_type" => "Call"} = node, context) do
-    case node["func"] do
-      %{"_type" => "Name", "id" => id} ->
-        emit_name_call(id, node, context)
+    case detect_next_iter(node) do
+      {:ok, inner, default} ->
+        emit_next_iter(inner, default, context)
 
-      %{"_type" => "Attribute", "value" => target, "attr" => attr} ->
-        emit_attribute_call(target, attr, node, context)
+      :no ->
+        case node["func"] do
+          %{"_type" => "Name", "id" => id} ->
+            emit_name_call(id, node, context)
 
-      # Chained-call shape: `f(x)(y)`, `make()(arg)`, `(lambda x: x+1)(5)`.
-      # The func is itself a Call/Lambda/Subscript that returns a callable.
-      # Emit `(callable_ast).(args)` — Elixir's anonymous-call invocation.
-      # No-kwargs only (consistent with the in-scope lambda call path).
-      %{"_type" => type} when type in ["Call", "Lambda", "Subscript", "IfExp"] ->
-        emit_dynamic_call(node, context)
+          %{"_type" => "Attribute", "value" => target, "attr" => attr} ->
+            emit_attribute_call(target, attr, node, context)
 
-      _ ->
-        raise UnsupportedNodeError,
-          node_type: "Call",
-          hint:
-            "unsupported call-target shape `#{Map.get(node["func"], "_type")}`; expected `Name` or `Attribute`",
-          lineno: Map.get(node, "lineno"),
-          col_offset: Map.get(node, "col_offset")
+          # Chained-call shape: `f(x)(y)`, `make()(arg)`,
+          # `(lambda x: x+1)(5)`. The func is itself a
+          # Call/Lambda/Subscript that returns a callable. Emit
+          # `(callable_ast).(args)` — Elixir's anonymous-call
+          # invocation. No-kwargs only (consistent with the in-scope
+          # lambda call path).
+          %{"_type" => type} when type in ["Call", "Lambda", "Subscript", "IfExp"] ->
+            emit_dynamic_call(node, context)
+
+          _ ->
+            raise UnsupportedNodeError,
+              node_type: "Call",
+              hint:
+                "unsupported call-target shape `#{Map.get(node["func"], "_type")}`; expected `Name` or `Attribute`",
+              lineno: Map.get(node, "lineno"),
+              col_offset: Map.get(node, "col_offset")
+        end
     end
   end
 
@@ -1494,6 +1504,51 @@ defmodule Pylixir.Converter do
   defp single_starred_args([%{"_type" => "Starred", "value" => v}]), do: {:ok, v}
   defp single_starred_args(_), do: :no
 
+  # `next(iter(x))` and `next(iter(x), default)` — the only iterator-
+  # protocol idiom we lower (general `iter`/`next` is rejected by
+  # `Pylixir.Builtins`). `iter(x)` makes an iterator; `next(...)` pulls
+  # the first element. We lower the whole pair as a single shape so
+  # arg conversion doesn't first see `iter(x)` and reject. Empty-
+  # iterable behaviour: Python raises `StopIteration`; we raise
+  # `Enum.OutOfBoundsError` (1-arg) or return the default (2-arg).
+  defp detect_next_iter(%{
+         "_type" => "Call",
+         "func" => %{"_type" => "Name", "id" => "next"},
+         "args" => [
+           %{
+             "_type" => "Call",
+             "func" => %{"_type" => "Name", "id" => "iter"},
+             "args" => [x],
+             "keywords" => []
+           }
+           | rest
+         ],
+         "keywords" => []
+       })
+       when rest == [] or length(rest) == 1 do
+    default = case rest do
+      [] -> :no_default
+      [d] -> d
+    end
+
+    {:ok, x, default}
+  end
+
+  defp detect_next_iter(_), do: :no
+
+  defp emit_next_iter(x_node, :no_default, context) do
+    {x_ast, context} = convert(x_node, context)
+    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :fetch!]}, [], [x_ast, 0]}
+    {ast, context}
+  end
+
+  defp emit_next_iter(x_node, default_node, context) do
+    {x_ast, context} = convert(x_node, context)
+    {d_ast, context} = convert(default_node, context)
+    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :at]}, [], [x_ast, 0, d_ast]}
+    {ast, context}
+  end
+
   # Match `type(x).__name__` precisely: Attribute(value=Call(func=Name("type"),
   # args=[x], no kwargs/star), attr="__name__"). The shape that comes up in
   # real code; anything else (`type(x).__mro__`, `obj.__class__.__name__`, ...)
@@ -1976,10 +2031,11 @@ defmodule Pylixir.Converter do
 
   defp emit_class(class, context) do
     %{name: class_name, init: init, methods: methods} = class
+    mutating = class_mutating_methods(class)
 
     {init_ast, context} = emit_method(class_name, init, :init, context)
     {method_asts, context} = Enum.map_reduce(methods, context, fn m, ctx ->
-      kind = if method_mutates_self?(m.body), do: :mutating, else: :read_only
+      kind = if MapSet.member?(mutating, m.name), do: :mutating, else: :read_only
       emit_method(class_name, m, kind, ctx)
     end)
 
@@ -2103,6 +2159,62 @@ defmodule Pylixir.Converter do
   defp method_mutates_self?(body) do
     Enum.any?(body, &walk_for_self_mutation/1)
   end
+
+  # Per-class mutating-method set. Direct mutators (those with
+  # `self.x = ...` / `self.x[...] = ...` / `self.x op= ...` in their
+  # bodies) seed the set; then we fixpoint, marking any method whose
+  # body calls `self.<mutator>(...)` as mutating too. Without the
+  # transitive step, a `def add(self, ...): self.range_add(...)`
+  # wrapper would be classified `:read_only` even though the wrapped
+  # call mutates — the caller would skip the rebind and lose the
+  # mutation.
+  defp class_mutating_methods(class) do
+    methods = class.methods
+
+    initial =
+      methods
+      |> Enum.filter(&method_mutates_self?(&1.body))
+      |> Enum.map(& &1.name)
+      |> MapSet.new()
+
+    fixpoint_mutating(methods, initial)
+  end
+
+  defp fixpoint_mutating(methods, current) do
+    new =
+      Enum.reduce(methods, current, fn m, acc ->
+        cond do
+          MapSet.member?(acc, m.name) -> acc
+          method_calls_self_method?(m.body, acc) -> MapSet.put(acc, m.name)
+          true -> acc
+        end
+      end)
+
+    if MapSet.equal?(new, current), do: current, else: fixpoint_mutating(methods, new)
+  end
+
+  defp method_calls_self_method?(body, mutating_set) do
+    Enum.any?(body, fn node ->
+      Pylixir.AST.Walk.walk_scope(node, false, fn n, acc ->
+        acc or self_calls_mutating_method?(n, mutating_set)
+      end)
+    end)
+  end
+
+  defp self_calls_mutating_method?(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => "self"},
+             "attr" => method
+           }
+         },
+         mutating_set
+       ),
+       do: MapSet.member?(mutating_set, method)
+
+  defp self_calls_mutating_method?(_, _), do: false
 
   defp walk_for_self_mutation(node) do
     Pylixir.AST.Walk.walk_scope(node, false, fn n, acc -> acc or self_mutating?(n) end)

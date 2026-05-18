@@ -21,7 +21,7 @@ defmodule Pylixir.Nodes.Mutations do
 
   alias Pylixir.{Converter, Naming, UnsupportedNodeError}
 
-  @methods ~w(append sort reverse insert extend remove clear pop popleft add discard update setdefault
+  @methods ~w(append appendleft sort reverse insert extend remove clear pop popleft add discard update setdefault
               intersection_update difference_update symmetric_difference_update)
 
   @doc """
@@ -215,6 +215,11 @@ defmodule Pylixir.Nodes.Mutations do
 
   defp mutation_rhs("append", target, [x], _kw, _node),
     do: {:++, [], [target, [x]]}
+
+  # `q.appendleft(x)` — deque prepend; Pylixir's deque rep is a plain
+  # Elixir list, so `[x | q]` matches Python's O(1) leftward append.
+  defp mutation_rhs("appendleft", target, [x], _kw, _node),
+    do: [{:|, [], [x, target]}]
 
   defp mutation_rhs("sort", target, [], kw, _node) do
     # Python's sort is stable; `reverse=True` is stable-descending

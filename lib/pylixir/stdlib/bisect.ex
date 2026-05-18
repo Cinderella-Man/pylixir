@@ -78,6 +78,9 @@ defmodule Pylixir.Stdlib.Bisect do
   def call(["bisect_left"], [a, x], _kwargs, _node),
     do: {:ok, {:py_bisect_left, [], [a, x]}}
 
+  def call(["bisect_left"], [a, x, lo], _kwargs, _node),
+    do: {:ok, {:py_bisect_left, [], [a, x, lo]}}
+
   def call(["bisect_left"], [a, x, lo, hi], _kwargs, _node),
     do: {:ok, {:py_bisect_left, [], [a, x, lo, hi]}}
 
@@ -85,11 +88,17 @@ defmodule Pylixir.Stdlib.Bisect do
   def call(["bisect"], [a, x], _kwargs, _node),
     do: {:ok, {:py_bisect_right, [], [a, x]}}
 
+  def call(["bisect"], [a, x, lo], _kwargs, _node),
+    do: {:ok, {:py_bisect_right, [], [a, x, lo]}}
+
   def call(["bisect"], [a, x, lo, hi], _kwargs, _node),
     do: {:ok, {:py_bisect_right, [], [a, x, lo, hi]}}
 
   def call(["bisect_right"], [a, x], _kwargs, _node),
     do: {:ok, {:py_bisect_right, [], [a, x]}}
+
+  def call(["bisect_right"], [a, x, lo], _kwargs, _node),
+    do: {:ok, {:py_bisect_right, [], [a, x, lo]}}
 
   def call(["bisect_right"], [a, x, lo, hi], _kwargs, _node),
     do: {:ok, {:py_bisect_right, [], [a, x, lo, hi]}}
