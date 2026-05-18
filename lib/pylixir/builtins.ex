@@ -170,7 +170,13 @@ defmodule Pylixir.Builtins do
   end
 
   def emit("str", [x], kw, [t]) do
-    if TypeInfer.is_str?(t), do: {:ok, x}, else: emit("str", [x], kw)
+    cond do
+      TypeInfer.is_str?(t) -> {:ok, x}
+      # P1 — container args route to py_repr directly (semantically equal
+      # to py_str for containers; lets P3 shake py_str's container clauses).
+      container_type?(t) -> {:ok, {:py_repr, [], [x]}}
+      true -> emit("str", [x], kw)
+    end
   end
 
   def emit("bool", [x], kw, [t]) do
@@ -325,11 +331,27 @@ defmodule Pylixir.Builtins do
         # recursively (cap at depth 3) and emits an inline-formatter
         # call site, bypassing `py_str` / `py_repr_*` entirely.
         case inline_repr_call(type, arg, 0) do
-          nil -> {:py_str, [], [arg]}
+          nil -> fallback_stringify(arg, type)
           ast -> ast
         end
     end
   end
+
+  # P1 — fall back to `py_repr` for container types (so py_str's
+  # is_list/is_tuple/%MapSet/is_map clauses can be tree-shaken by P3).
+  # Non-container types still go through `py_str` (its scalar clauses
+  # handle them).
+  defp fallback_stringify(arg, type) do
+    if container_type?(type),
+      do: {:py_repr, [], [arg]},
+      else: {:py_str, [], [arg]}
+  end
+
+  defp container_type?({:list, _}), do: true
+  defp container_type?({:tuple, _}), do: true
+  defp container_type?({:dict, _, _}), do: true
+  defp container_type?({:set}), do: true
+  defp container_type?(_), do: false
 
   # Returns an Elixir AST that formats `arg_ast` (a value of the given
   # lattice type) into a Python-repr-compatible binary, or `nil` if no

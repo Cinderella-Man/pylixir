@@ -195,6 +195,15 @@ defmodule Pylixir.HelpersCodegen do
                  :drop_trailing_zero_decimal
                ])
 
+  # Helpers that internally call `py_str(v)` with an arg that could
+  # be a container at runtime. If any of these are in the pulled set,
+  # py_str's container clauses must stay (P3 soundness).
+  @polymorphic_py_str_callers MapSet.new([
+                                :format_percent_typed,
+                                :py_format_value,
+                                :py_str_format_map
+                              ])
+
   @spec helpers_ast_for([Macro.t()], keyword()) :: [Macro.t()]
   def helpers_ast_for(emitted_asts, opts \\ []) when is_list(emitted_asts) do
     roots = collect_helper_refs(emitted_asts)
@@ -208,16 +217,33 @@ defmodule Pylixir.HelpersCodegen do
     # only after `ModuleAnalysis.uses_float` returned false.
     needed = if drop_float, do: MapSet.difference(needed, @float_chain), else: needed
 
+    # P3 — drop py_str's container clauses (is_list/is_tuple/%MapSet/
+    # is_map) when no path reaches py_str with a container arg. Two
+    # sufficient conditions, both must hold:
+    #   1. User code emits no direct `{:py_str, _, _}` ref (so all
+    #      user-typed call sites routed containers through py_repr
+    #      per P1).
+    #   2. No pulled helper internally calls `py_str(maybe_container)`
+    #      — gated on @polymorphic_py_str_callers ∩ needed = ∅.
+    # py_repr's own catch-all to py_str is safe: it only fires for
+    # non-containers (py_repr's container clauses match first).
+    drop_containers =
+      not MapSet.member?(roots, :py_str) and
+        MapSet.disjoint?(@polymorphic_py_str_callers, needed)
+
     for name <- @helper_order,
         MapSet.member?(needed, name),
         def_ast <- Map.fetch!(@helpers_by_name, name),
-        keep_clause?(name, def_ast, drop_float),
+        keep_clause?(name, def_ast, drop_float, drop_containers),
         do: def_ast
   end
 
-  defp keep_clause?(_name, _def_ast, false), do: true
-  defp keep_clause?(:py_str, def_ast, true), do: not is_float_guarded?(def_ast)
-  defp keep_clause?(_name, _def_ast, true), do: true
+  defp keep_clause?(:py_str, def_ast, drop_float, drop_containers) do
+    not (drop_float and is_float_guarded?(def_ast)) and
+      not (drop_containers and is_container_clause?(def_ast))
+  end
+
+  defp keep_clause?(_name, _def_ast, _drop_float, _drop_containers), do: true
 
   defp is_float_guarded?({:def, _, [{:when, _, [_head, guard]}, _body]}),
     do: contains_is_float?(guard)
@@ -230,6 +256,34 @@ defmodule Pylixir.HelpersCodegen do
     do: Enum.any?(args, &contains_is_float?/1)
 
   defp contains_is_float?(_), do: false
+
+  # py_str container clauses: heads guarded by is_list / is_tuple /
+  # is_map, plus the `%MapSet{} = s` struct-match clause.
+  defp is_container_clause?({:def, _, [{:when, _, [_head, guard]}, _body]}),
+    do: contains_container_guard?(guard)
+
+  defp is_container_clause?({:def, _, [head, _body]}),
+    do: matches_mapset_struct?(head)
+
+  defp is_container_clause?(_), do: false
+
+  defp contains_container_guard?({op, _, _})
+       when op in [:is_list, :is_tuple, :is_map],
+       do: true
+
+  defp contains_container_guard?({_op, _meta, args}) when is_list(args),
+    do: Enum.any?(args, &contains_container_guard?/1)
+
+  defp contains_container_guard?(_), do: false
+
+  defp matches_mapset_struct?({_name, _, args}) when is_list(args) do
+    Enum.any?(args, fn
+      {:=, _, [{:%, _, [{:__aliases__, _, [:MapSet]}, _]}, _]} -> true
+      _ -> false
+    end)
+  end
+
+  defp matches_mapset_struct?(_), do: false
 
   defp collect_helper_refs(asts) do
     Enum.reduce(asts, MapSet.new(), fn ast, acc ->

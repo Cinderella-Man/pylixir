@@ -16,48 +16,8 @@ defmodule TranslatedCode do
     Atom.to_string(x)
   end
 
-  def py_str(x) when is_list(x) do
-    py_repr_list(x)
-  end
-
-  def py_str(x) when is_tuple(x) do
-    py_repr_tuple(x)
-  end
-
-  def py_str(%MapSet{} = s) do
-    py_repr_set(s)
-  end
-
-  def py_str(x) when is_map(x) and not is_struct(x) do
-    py_repr_map(x)
-  end
-
   def py_str(x) do
     to_string(x)
-  end
-
-  def py_repr_list(items) do
-    "[" <> Enum.map_join(items, ", ", &py_repr/1) <> "]"
-  end
-
-  def py_repr_tuple(t) do
-    items = Tuple.to_list(t)
-
-    case items do
-      [single] -> "(" <> py_repr(single) <> ",)"
-      _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
-    end
-  end
-
-  def py_repr_map(m) do
-    "{" <> Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
-  end
-
-  def py_repr_set(%MapSet{} = s) do
-    case MapSet.to_list(s) do
-      [] -> "set()"
-      items -> "{" <> Enum.map_join(items, ", ", &py_repr/1) <> "}"
-    end
   end
 
   def py_repr(x) when is_binary(x) do
@@ -66,6 +26,30 @@ defmodule TranslatedCode do
     else
       "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
     end
+  end
+
+  def py_repr(x) when is_list(x) do
+    "[" <> Enum.map_join(x, ", ", &py_repr/1) <> "]"
+  end
+
+  def py_repr(x) when is_tuple(x) do
+    items = Tuple.to_list(x)
+
+    case items do
+      [single] -> "(" <> py_repr(single) <> ",)"
+      _ -> "(" <> Enum.map_join(items, ", ", &py_repr/1) <> ")"
+    end
+  end
+
+  def py_repr(%MapSet{} = s) do
+    case MapSet.to_list(s) do
+      [] -> "set()"
+      items -> "{" <> Enum.map_join(items, ", ", &py_repr/1) <> "}"
+    end
+  end
+
+  def py_repr(x) when is_map(x) and not is_struct(x) do
+    "{" <> Enum.map_join(x, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
   end
 
   def py_repr(x) do
@@ -136,7 +120,7 @@ defmodule TranslatedCode do
       cFour = churchFromInt.(4)
 
       IO.write(
-        py_str(
+        py_repr(
           Enum.map(
             [
               churchAdd(cThree).(cFour),

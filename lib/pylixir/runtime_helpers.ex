@@ -496,13 +496,10 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str(false), do: "False"
   def py_str(nil), do: "None"
   def py_str(x) when is_atom(x), do: Atom.to_string(x)
-  def py_str(x) when is_list(x), do: py_repr_list(x)
-  def py_str(x) when is_tuple(x), do: py_repr_tuple(x)
-  # Python set repr: `{1, 2, 3}` or `set()` for empty. (Python can't
-  # write `{}` for empty set because that's a dict literal; the repr
-  # uses `set()` to disambiguate.)
-  def py_str(%MapSet{} = s), do: py_repr_set(s)
-  def py_str(x) when is_map(x) and not is_struct(x), do: py_repr_map(x)
+  def py_str(x) when is_list(x), do: py_repr(x)
+  def py_str(x) when is_tuple(x), do: py_repr(x)
+  def py_str(%MapSet{} = s), do: py_repr(s)
+  def py_str(x) when is_map(x) and not is_struct(x), do: py_repr(x)
   def py_str(x) when is_float(x), do: py_str_float(x)
   def py_str(x), do: to_string(x)
 
@@ -601,10 +598,17 @@ defmodule Pylixir.RuntimeHelpers do
     sign <> formatted
   end
 
-  def py_repr_list(items), do: "[" <> Enum.map_join(items, ", ", &py_repr/1) <> "]"
+  def py_repr(x) when is_binary(x) do
+    if String.contains?(x, "'") and not String.contains?(x, "\""),
+      do: "\"" <> x <> "\"",
+      else: "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
+  end
 
-  def py_repr_tuple(t) do
-    items = Tuple.to_list(t)
+  def py_repr(x) when is_list(x),
+    do: "[" <> Enum.map_join(x, ", ", &py_repr/1) <> "]"
+
+  def py_repr(x) when is_tuple(x) do
+    items = Tuple.to_list(x)
 
     case items do
       [single] -> "(" <> py_repr(single) <> ",)"
@@ -612,25 +616,16 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
-  def py_repr_map(m) do
-    "{" <>
-      Enum.map_join(m, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
-  end
-
-  # `{1, 2, 3}` or `set()`. The empty form disambiguates from `{}`
-  # (which Python parses as a dict). MapSet has no insertion-order
-  # guarantee — output element order may differ from Python.
-  def py_repr_set(%MapSet{} = s) do
+  def py_repr(%MapSet{} = s) do
     case MapSet.to_list(s) do
       [] -> "set()"
       items -> "{" <> Enum.map_join(items, ", ", &py_repr/1) <> "}"
     end
   end
 
-  def py_repr(x) when is_binary(x) do
-    if String.contains?(x, "'") and not String.contains?(x, "\""),
-      do: "\"" <> x <> "\"",
-      else: "'" <> String.replace(String.replace(x, "\\", "\\\\"), "'", "\\'") <> "'"
+  def py_repr(x) when is_map(x) and not is_struct(x) do
+    "{" <>
+      Enum.map_join(x, ", ", fn {k, v} -> py_repr(k) <> ": " <> py_repr(v) end) <> "}"
   end
 
   def py_repr(x), do: py_str(x)
