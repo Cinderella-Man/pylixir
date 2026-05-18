@@ -378,12 +378,79 @@ defmodule Pylixir.TypeInfer do
           true -> stdlib_return_type(id, Map.get(node, "args", []), ctx)
         end
 
+      %{"_type" => "Attribute", "attr" => method} ->
+        method_return_type(method)
+
       _ ->
         :any
     end
   end
 
   def infer_expr(_other, _ctx), do: :any
+
+  # Return-type table for the common Python method calls (`s.startswith()`,
+  # `xs.append()`, etc.). Ducktyped — we trust the source. Methods not
+  # listed return `:any`.
+  defp method_return_type(method) do
+    case method do
+      m
+      when m in [
+             "startswith",
+             "endswith",
+             "isdigit",
+             "isalpha",
+             "isalnum",
+             "islower",
+             "isupper",
+             "isspace",
+             "isdecimal",
+             "isnumeric",
+             "isascii",
+             "issubset",
+             "issuperset",
+             "isdisjoint"
+           ] ->
+        {:bool}
+
+      m
+      when m in [
+             "lower",
+             "upper",
+             "title",
+             "capitalize",
+             "swapcase",
+             "casefold",
+             "strip",
+             "lstrip",
+             "rstrip",
+             "replace",
+             "removeprefix",
+             "removesuffix",
+             "zfill",
+             "ljust",
+             "rjust",
+             "center",
+             "format",
+             "join"
+           ] ->
+        {:str}
+
+      m when m in ["count", "find", "rfind", "index", "bit_length"] ->
+        {:int_lit_nonneg}
+
+      m when m in ["split", "rsplit", "splitlines"] ->
+        {:list, {:str}}
+
+      m when m in ["keys", "values"] ->
+        {:list, :any}
+
+      m when m in ["items"] ->
+        {:list, {:tuple, :any_arity}}
+
+      _ ->
+        :any
+    end
+  end
 
   defp constant_type(v) do
     cond do

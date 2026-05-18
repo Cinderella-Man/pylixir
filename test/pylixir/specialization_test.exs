@@ -175,22 +175,66 @@ defmodule Pylixir.SpecializationTest do
       refute out =~ "py_int("
     end
 
-    test "str(str_literal) becomes a no-op" do
-      # `print` itself wraps its arg in py_str — that's expected. Assert
-      # `str(...)` is dropped by checking the inner `str(` call shape
-      # doesn't appear and that py_str shows up only once (from print).
+    test "str(str_literal) becomes a no-op AND print drops py_str (PR-print-spec)" do
+      # `str("hi")` returns "hi" (PR 4); `print("hi")` with the {:str}
+      # arg drops the py_str wrap entirely (print-arg specialization).
+      # Result: no `py_str` anywhere in the output — the helper isn't
+      # even emitted because the tree-shaker drops it.
       out = Pylixir.transpile(~s|print(str("hi"))\n|)
-      occurrences = out |> String.split("py_str") |> length() |> Kernel.-(1)
-      # Helper defs reference py_str several times; only one CALL site
-      # in py_main is from print. Validate by checking the call is the
-      # print wrapping, not a redundant str(...) one.
-      assert out =~ ~s|IO.write(py_str("hi") <> "\\n")|
-      _ = occurrences
+      refute out =~ "py_str"
+      assert out =~ ~s|IO.write("hi" <> "\\n")|
     end
 
     test "bool(bool_literal) becomes a no-op" do
       out = Pylixir.transpile("print(bool(True))\n")
       refute out =~ "truthy?(true)"
+    end
+  end
+
+  describe "print() arg-type specialization" do
+    test "print({:int}) drops py_str and emits Integer.to_string" do
+      out = Pylixir.transpile("print(len([1, 2, 3]))\n")
+      refute out =~ "py_str"
+      assert out =~ "Integer.to_string"
+    end
+
+    test "print({:str}) drops py_str entirely" do
+      out = Pylixir.transpile(~s|print("hello")\n|)
+      refute out =~ "py_str"
+      assert out =~ ~s|IO.write("hello" <> "\\n")|
+    end
+
+    test "print({:bool}) inlines if-then-else" do
+      out = Pylixir.transpile(~s|print("a" == "b")\n|)
+      refute out =~ "py_str"
+      assert out =~ "True"
+      assert out =~ "False"
+    end
+
+    test "print(unknown) keeps py_str (polymorphic fallback)" do
+      src = """
+      def f(x):
+          return x
+      print(f(1))
+      print(f("hi"))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "py_str"
+    end
+  end
+
+  describe "method-call specialization" do
+    test ".startswith(literal_str) emits String.starts_with? directly" do
+      out = Pylixir.transpile(~s|print("hello".startswith("hel"))\n|)
+      refute out =~ "py_str_startswith"
+      assert out =~ "String.starts_with?"
+    end
+
+    test ".endswith(literal_str) emits String.ends_with? directly" do
+      out = Pylixir.transpile(~s|print("file.txt".endswith(".txt"))\n|)
+      refute out =~ "py_str_endswith"
+      assert out =~ "String.ends_with?"
     end
   end
 

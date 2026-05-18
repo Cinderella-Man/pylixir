@@ -272,7 +272,57 @@ defmodule Pylixir.Builtins do
      {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [TypeInfer.coerce_iter(x, t)]}}
   end
 
+  # `print(...)` with typed args — drop the `py_str` wrap for already-
+  # stringy args, and inline `Integer.to_string/1` for known-int args.
+  # Bool / float / unknown stays polymorphic because the formatting
+  # rules differ from `to_string/1` (e.g. `True` capitalization,
+  # `py_str_float`'s sci-notation handling).
+  def emit("print", args, kw, arg_types) do
+    if Map.has_key?(kw, "file") do
+      {:error,
+       "print(file=...) is not supported (RFC §6.7 — redirecting stdout requires IO.puts(device, ...))"}
+    else
+      sep_ast = Map.get(kw, "sep", " ")
+      end_ast = Map.get(kw, "end", "\n")
+      str_args = Enum.zip(args, arg_types) |> Enum.map(&stringify_for_print/1)
+
+      joined =
+        case str_args do
+          [] -> ""
+          [only] -> only
+          _ -> {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [str_args, sep_ast]}
+        end
+
+      full =
+        case end_ast do
+          "" -> joined
+          _ -> {:<>, [], [joined, end_ast]}
+        end
+
+      {:ok, {{:., [], [{:__aliases__, [], [:IO]}, :write]}, [], [full]}}
+    end
+  end
+
   def emit(id, args, kw, _arg_types), do: emit(id, args, kw)
+
+  defp stringify_for_print({arg, type}) do
+    cond do
+      TypeInfer.is_str?(type) ->
+        arg
+
+      type == {:int} or type == {:int_lit_nonneg} ->
+        {{:., [], [{:__aliases__, [], [:Integer]}, :to_string]}, [], [arg]}
+
+      # `print(<bool>)` — Python prints `True`/`False` (capitalised).
+      # Elixir's `to_string(true) == "true"`, so inline the conditional
+      # to match Python output without needing py_str.
+      type == {:bool} ->
+        {:if, [], [arg, [do: "True", else: "False"]]}
+
+      true ->
+        {:py_str, [], [arg]}
+    end
+  end
 
   @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) ::
           Pylixir.Lowering.result()

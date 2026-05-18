@@ -346,9 +346,18 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # `startswith`/`endswith` accept a single string OR a tuple of
   # strings in Python; Elixir's `String.starts_with?/2` accepts a
   # string or a LIST. Route through runtime helpers that coerce a
-  # tuple to a list when needed.
+  # tuple to a list when needed. When the prefix/suffix is statically
+  # a string literal (a BEAM binary at this point — the Constant
+  # clause emits the binary directly), drop the helper and emit the
+  # Elixir BIF — the tuple-coercion branch is unreachable.
+  defp do_dispatch("startswith", target, [prefix], _kw, _node) when is_binary(prefix),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :starts_with?]}, [], [target, prefix]}
+
   defp do_dispatch("startswith", target, [prefix], _kw, _node),
     do: {:py_str_startswith, [], [target, prefix]}
+
+  defp do_dispatch("endswith", target, [suffix], _kw, _node) when is_binary(suffix),
+    do: {{:., [], [{:__aliases__, [], [:String]}, :ends_with?]}, [], [target, suffix]}
 
   defp do_dispatch("endswith", target, [suffix], _kw, _node),
     do: {:py_str_endswith, [], [target, suffix]}
