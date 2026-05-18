@@ -440,6 +440,18 @@ defmodule Pylixir.RuntimeHelpers do
   def py_in(x, %MapSet{} = c), do: MapSet.member?(c, x)
   def py_in(x, c) when is_map(c), do: Map.has_key?(c, x)
   def py_in(x, c) when is_tuple(c), do: py_in(x, Tuple.to_list(c))
+
+  # Iterator handle (positive int returned by `py_iter_make/1`). Check
+  # process dict to disambiguate from a regular int (where `x in 5`
+  # would raise TypeError in Python anyway; we return false here for
+  # the rare misuse).
+  def py_in(x, c) when is_integer(c) do
+    case Process.get({:pylixir_iter, c}) do
+      nil -> false
+      _ -> py_iter_in(x, c)
+    end
+  end
+
   def py_in(x, c), do: Enum.member?(c, x)
 
   # === Type conversion ===
@@ -1372,6 +1384,179 @@ defmodule Pylixir.RuntimeHelpers do
       :eof -> ""
       {:error, reason} -> raise RuntimeError, "stdin readline failed: #{inspect(reason)}"
       line -> line
+    end
+  end
+
+  # === JSON encoder / decoder ===
+  #
+  # `json.dumps` / `json.loads`. Custom encoder because Erlang's
+  # `:json.encode` (OTP 28) doesn't know about Elixir tuples or MapSets
+  # and emits its own escape semantics that disagree with Python's
+  # (`/` is not escaped by us; Python's default escapes nothing either).
+  # Decoder routes through `:json.decode` and post-processes (binary
+  # keys, json `null` → nil).
+
+  def py_json_dumps(value), do: py_json_dumps(value, nil)
+
+  def py_json_dumps(value, nil), do: py_json_enc(value, nil, 0) |> IO.iodata_to_binary()
+
+  def py_json_dumps(value, indent) when is_integer(indent) and indent >= 0,
+    do: py_json_enc(value, indent, 0) |> IO.iodata_to_binary()
+
+  def py_json_enc(nil, _indent, _depth), do: "null"
+  def py_json_enc(true, _indent, _depth), do: "true"
+  def py_json_enc(false, _indent, _depth), do: "false"
+
+  def py_json_enc(x, _indent, _depth) when is_integer(x),
+    do: Integer.to_string(x)
+
+  def py_json_enc(x, _indent, _depth) when is_float(x) do
+    # Python prints `1.0` (not `1.0e0`); Elixir's :short matches that.
+    :erlang.float_to_binary(x, [:short])
+  end
+
+  def py_json_enc(x, _indent, _depth) when is_binary(x),
+    do: [?", py_json_escape(x, []), ?"]
+
+  def py_json_enc(x, indent, depth) when is_tuple(x),
+    do: py_json_enc(Tuple.to_list(x), indent, depth)
+
+  def py_json_enc(%MapSet{} = s, indent, depth),
+    do: py_json_enc(MapSet.to_list(s), indent, depth)
+
+  def py_json_enc([], _indent, _depth), do: "[]"
+
+  def py_json_enc(xs, indent, depth) when is_list(xs) do
+    {item_sep, inner_pad, close_pad} = py_json_seps(indent, depth)
+    inner = Enum.map_intersperse(xs, item_sep, &py_json_enc(&1, indent, depth + 1))
+    [?[, inner_pad, inner, close_pad, ?]]
+  end
+
+  def py_json_enc(m, indent, depth) when is_map(m) and not is_struct(m) do
+    case map_size(m) do
+      0 ->
+        "{}"
+
+      _ ->
+        # Python preserves insertion order; an Elixir map doesn't, but
+        # for `json.dumps` Python sorts dict-of-string-keys by insertion.
+        # We don't track insertion — fall back to key sort for stable
+        # output. Numeric keys forbidden in JSON; stringify them like
+        # CPython does (which always stringifies, with `sort_keys=False`
+        # default).
+        {item_sep, inner_pad, close_pad} = py_json_seps(indent, depth)
+        kvs = m |> Map.to_list() |> Enum.sort_by(fn {k, _} -> py_json_key_str(k) end)
+
+        inner =
+          Enum.map_intersperse(kvs, item_sep, fn {k, v} ->
+            [?", py_json_escape(py_json_key_str(k), []), ?", ": ", py_json_enc(v, indent, depth + 1)]
+          end)
+
+        [?{, inner_pad, inner, close_pad, ?}]
+    end
+  end
+
+  # Python's defaults: no indent → `", "` between items, `": "` between
+  # key/value, no leading newlines. Indented → `",\n<pad>"` between
+  # items, items themselves prefixed with a newline + padding.
+  def py_json_seps(nil, _depth), do: {", ", "", ""}
+
+  def py_json_seps(indent, depth) when is_integer(indent) do
+    item_sep = [",\n", String.duplicate(" ", indent * (depth + 1))]
+    inner_pad = ["\n", String.duplicate(" ", indent * (depth + 1))]
+    close_pad = ["\n", String.duplicate(" ", indent * depth)]
+    {item_sep, inner_pad, close_pad}
+  end
+
+  def py_json_key_str(k) when is_binary(k), do: k
+  def py_json_key_str(k) when is_integer(k), do: Integer.to_string(k)
+  def py_json_key_str(k) when is_float(k), do: Float.to_string(k)
+  def py_json_key_str(true), do: "true"
+  def py_json_key_str(false), do: "false"
+  def py_json_key_str(nil), do: "null"
+
+  def py_json_escape(<<>>, acc), do: acc |> Enum.reverse()
+  def py_json_escape(<<?"::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\\"" | acc])
+  def py_json_escape(<<?\\::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\\\" | acc])
+  def py_json_escape(<<?\n::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\n" | acc])
+  def py_json_escape(<<?\r::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\r" | acc])
+  def py_json_escape(<<?\t::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\t" | acc])
+  def py_json_escape(<<?\b::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\b" | acc])
+  def py_json_escape(<<?\f::utf8, rest::binary>>, acc), do: py_json_escape(rest, ["\\f" | acc])
+
+  def py_json_escape(<<c::utf8, rest::binary>>, acc) when c < 0x20,
+    do: py_json_escape(rest, [:io_lib.format("\\u~4.16.0b", [c]) | acc])
+
+  def py_json_escape(<<c::utf8, rest::binary>>, acc),
+    do: py_json_escape(rest, [<<c::utf8>> | acc])
+
+  def py_json_loads(s) when is_binary(s) do
+    :json.decode(s) |> py_json_normalize()
+  end
+
+  # `:json.decode` returns `:null` for JSON null; Pylixir uses nil (the
+  # Python None equivalent). Booleans already match.
+  def py_json_normalize(:null), do: nil
+  def py_json_normalize(x) when is_list(x), do: Enum.map(x, &py_json_normalize/1)
+
+  def py_json_normalize(x) when is_map(x) do
+    Enum.into(x, %{}, fn {k, v} -> {k, py_json_normalize(v)} end)
+  end
+
+  def py_json_normalize(x), do: x
+
+  # === Iterator protocol (`iter` / `next` / `c in it`) ===
+  #
+  # Pylixir doesn't model Python's full iterator protocol — but the
+  # common shape `it = iter(xs); … (c in it) …` is widely used for
+  # subsequence checks. The handle returned by `py_iter_make/1` is a
+  # unique positive integer; the actual remaining-elements list lives
+  # in the process dict under `{:pylixir_iter, ref}`. `py_in/2` has a
+  # clause that recognises iterator refs and dispatches to the
+  # advance-on-find semantics; `py_iter_next/1` / `py_iter_next/2`
+  # cover bare `next(it)` calls.
+
+  def py_iter_make(xs) do
+    ref = :erlang.unique_integer([:positive])
+    Process.put({:pylixir_iter, ref}, py_iter_to_list(xs))
+    ref
+  end
+
+  def py_iter_in(c, ref) when is_integer(ref) do
+    case Process.get({:pylixir_iter, ref}) do
+      nil ->
+        false
+
+      list ->
+        case Enum.split_while(list, fn x -> x != c end) do
+          {_, []} ->
+            Process.put({:pylixir_iter, ref}, [])
+            false
+
+          {_, [_ | rest]} ->
+            Process.put({:pylixir_iter, ref}, rest)
+            true
+        end
+    end
+  end
+
+  # `next(it)` / `next(it, default)` — pop the head element. Raises
+  # `Pylixir.StopIteration` (a plain RuntimeError) when exhausted to
+  # mirror Python's StopIteration; the 2-arg form returns `default`
+  # instead.
+  def py_iter_next(ref) when is_integer(ref) do
+    case Process.get({:pylixir_iter, ref}) do
+      nil -> raise RuntimeError, "StopIteration: not an iterator (ref=#{ref})"
+      [] -> raise RuntimeError, "StopIteration"
+      [h | t] -> Process.put({:pylixir_iter, ref}, t); h
+    end
+  end
+
+  def py_iter_next(ref, default) when is_integer(ref) do
+    case Process.get({:pylixir_iter, ref}) do
+      nil -> default
+      [] -> default
+      [h | t] -> Process.put({:pylixir_iter, ref}, t); h
     end
   end
 

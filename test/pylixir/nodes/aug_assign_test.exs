@@ -94,21 +94,26 @@ defmodule Pylixir.Nodes.AugAssignTest do
     end
   end
 
-  describe "AST shape — unsupported targets" do
-    test "Attribute target with non-Name receiver still raises" do
-      # `<obj>.<attr> += value` is now lowered (instance-map field
-      # set), but only when the receiver is a bare Name. A nested
-      # Attribute chain (`a.b.c += 1`) still falls through to the
-      # generic AugAssign rejection.
+  describe "AST shape — depth-2 attribute" do
+    test "`a.b.c += 1` lowers to a Map.put through Map.put chain" do
+      # `<obj>.<outer>.<inner> += value` is supported: rebinds `obj`
+      # to a copy where `obj.outer.inner` is the updated value.
+      # Aliasing semantics (Python objects sharing `obj.outer`) aren't
+      # modelled — see the depth-2 AugAssign clause in Converter.
       target = %{
         "_type" => "Attribute",
         "value" => %{"_type" => "Attribute", "value" => name("a"), "attr" => "b"},
         "attr" => "c"
       }
 
-      assert_raise UnsupportedNodeError, ~r/AugAssign/, fn ->
+      {ast, _ctx} =
         Converter.convert(aug_assign(target, "Add", const(1)), Context.new())
-      end
+
+      src = Macro.to_string(ast)
+      assert src =~ "Map.put"
+      assert src =~ "Map.fetch!"
+      assert src =~ ":b"
+      assert src =~ ":c"
     end
   end
 

@@ -12,8 +12,8 @@ defmodule Pylixir.StdlibTest do
     test "supported?/1 — math + sys ship by default, unknown names are out" do
       assert Stdlib.supported?("math")
       assert Stdlib.supported?("sys")
+      assert Stdlib.supported?("json")
       refute Stdlib.supported?("os")
-      refute Stdlib.supported?("json")
       refute Stdlib.supported?("")
     end
 
@@ -24,7 +24,7 @@ defmodule Pylixir.StdlibTest do
     end
 
     test "names/0 — sorted list of registered module names" do
-      assert Stdlib.names() == ["bisect", "collections", "heapq", "itertools", "math", "re", "sys"]
+      assert Stdlib.names() == ["bisect", "collections", "heapq", "itertools", "json", "math", "re", "sys"]
     end
   end
 

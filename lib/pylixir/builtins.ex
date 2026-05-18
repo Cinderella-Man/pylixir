@@ -24,7 +24,12 @@ defmodule Pylixir.Builtins do
   @t25b ~w(sum min max abs map filter)
   @t26_conversions ~w(int float str bool list tuple set frozenset dict)
   @t26_type_checks ~w(isinstance)
-  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow format repr)
+  @t27_io_format ~w(print input chr ord hex oct bin round divmod any all exit pow format repr iter next)
+  # `bytearray(...)` — mutable bytes. Pylixir lowers to a plain list
+  # of ints; subscript reads/writes and slice-assign work via the
+  # existing list machinery. Behaves correctly for the sieve-of-
+  # Eratosthenes idiom (bytearray([1]) * (n+1) + sieve[i*i::i] = b'\x00' * k).
+  @t_bytes ~w(bytearray bytes)
 
   # `collections.deque` is technically not a builtin — it's imported
   # via `from collections import deque`. But the import is a no-op in
@@ -36,7 +41,9 @@ defmodule Pylixir.Builtins do
 
   @supported MapSet.new(
                @t25a ++
-                 @t25b ++ @t26_conversions ++ @t26_type_checks ++ @t27_io_format ++ @t_collections
+                 @t25b ++
+                 @t26_conversions ++
+                 @t26_type_checks ++ @t27_io_format ++ @t_collections ++ @t_bytes
              )
 
   @isinstance_map %{
@@ -62,8 +69,6 @@ defmodule Pylixir.Builtins do
   # transpile-time `unsupported--Call` with a precise reason, so eval
   # buckets are informative.
   @unsupported %{
-    "iter" => "iterator protocol (`iter`/`next`) is not supported",
-    "next" => "iterator protocol (`iter`/`next`) is not supported",
     "eval" => "`eval` (runtime code evaluation) is not supported",
     "exec" => "`exec` (runtime code evaluation) is not supported",
     "compile" => "`compile` (runtime code evaluation) is not supported",
@@ -328,6 +333,17 @@ defmodule Pylixir.Builtins do
   def emit("deque", [x], _kw),
     do: {:ok, {:py_iter_to_list, [], [x]}}
 
+  # `bytearray()` / `bytearray(iter)` / `bytes(iter)` — mutable
+  # (immutable for `bytes`) sequence of unsigned 8-bit ints. Pylixir
+  # backing is a plain list of ints; subscript reads/writes and
+  # slice-assign already work over lists. Bytes literals (`b'\x00'`)
+  # arrive as Python `Constant` nodes with a `bytes`-typed value,
+  # which serialise into list-of-int form via `serialize.py`.
+  def emit("bytearray", [], _kw), do: {:ok, []}
+  def emit("bytearray", [x], _kw), do: {:ok, {:py_iter_to_list, [], [x]}}
+  def emit("bytes", [], _kw), do: {:ok, []}
+  def emit("bytes", [x], _kw), do: {:ok, {:py_iter_to_list, [], [x]}}
+
   # `Counter(iter)` → dict-of-counts. Elixir's `Enum.frequencies/1` is
   # the exact equivalent. (Counter's other features — most_common,
   # arithmetic — aren't supported yet; standard `.get`/`.items` work
@@ -412,6 +428,20 @@ defmodule Pylixir.Builtins do
   # py_main's try/catch wrapper (see `Pylixir.Converter.py_main_def/1`)
   # catches the throw and returns the code so the BEAM survives —
   # `System.halt` would kill the test VM during the golden-corpus run.
+  # `iter(x)` and `next(it)` — partial iterator protocol. `iter(x)`
+  # wraps the iterable in a process-dict-backed cursor (returns an
+  # integer handle); subsequent `c in it`-style checks dispatch to
+  # the iterator-aware `py_in` clause and advance the cursor; bare
+  # `next(it)` pops the head element. The shortcut `next(iter(x))`
+  # is intercepted earlier (Converter.detect_next_iter) and lowered
+  # without going through the cursor — same observable behaviour,
+  # cheaper.
+  def emit("iter", [x], _kw), do: {:ok, {:py_iter_make, [], [x]}}
+
+  def emit("next", [it], _kw), do: {:ok, {:py_iter_next, [], [it]}}
+
+  def emit("next", [it, default], _kw), do: {:ok, {:py_iter_next, [], [it, default]}}
+
   def emit("exit", [], _kw), do: {:ok, Pylixir.ControlFlow.throw_exit(0)}
 
   def emit("exit", [code], _kw), do: {:ok, Pylixir.ControlFlow.throw_exit(code)}

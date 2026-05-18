@@ -66,6 +66,7 @@ defmodule Pylixir.Stdlib do
     "collections" => Pylixir.Stdlib.Collections,
     "heapq" => Pylixir.Stdlib.Heapq,
     "itertools" => Pylixir.Stdlib.Itertools,
+    "json" => Pylixir.Stdlib.Json,
     "math" => Pylixir.Stdlib.Math,
     "re" => Pylixir.Stdlib.Re,
     "sys" => Pylixir.Stdlib.Sys

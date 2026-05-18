@@ -114,14 +114,14 @@ defmodule Pylixir.TranspileTest do
       end
     end
 
-    test "non-UTF-8 bytes literal still raises (decode fallback)" do
+    test "bytes literal lowers to a list of ints" do
       if python_available?() do
-        err =
-          assert_raise UnsupportedNodeError, fn ->
-            Pylixir.transpile("b\"\\xff\\xfe\"\n")
-          end
-
-        assert err.hint =~ "bytes"
+        # Bytes constants are now serialised as `list(obj)` (a list of
+        # uint8 ints) — same backing rep `bytearray(iter)` uses. This
+        # transpiles cleanly and `b"\\xff\\xfe"` reads as `[255, 254]`
+        # in the generated module.
+        out = Pylixir.transpile("print(b\"\\xff\\xfe\")\n")
+        assert out =~ "[255, 254]"
       end
     end
 
@@ -145,28 +145,11 @@ defmodule Pylixir.TranspileTest do
     # hint (eval-corpus bucket `compile_error--compile_quoted_raised`).
     # `Pylixir.Builtins.unsupported_hint/1` now flags them at transpile.
 
-    test "`iter(xs)` raises with `iter`/`next` hint" do
+    test "`iter(xs)` lowers to py_iter_make (handle-backed cursor)" do
       if python_available?() do
-        err =
-          assert_raise UnsupportedNodeError, fn ->
-            Pylixir.transpile("iter([1, 2, 3])\n")
-          end
-
-        assert err.node_type == "Call"
-        assert err.hint =~ "iter"
-        assert err.lineno == 1
-      end
-    end
-
-    test "`next(it)` raises with `iter`/`next` hint" do
-      if python_available?() do
-        err =
-          assert_raise UnsupportedNodeError, fn ->
-            Pylixir.transpile("next(x)\n")
-          end
-
-        assert err.node_type == "Call"
-        assert err.hint =~ "next"
+        out = Pylixir.transpile("it = iter([1, 2, 3])\nprint(next(it))\n")
+        assert out =~ "py_iter_make"
+        assert out =~ "py_iter_next"
       end
     end
 

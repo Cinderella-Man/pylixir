@@ -124,6 +124,16 @@ defmodule Pylixir.Converter do
 
   def convert(%{"_type" => "Pass"}, context), do: {:ok, context}
 
+  # `global x` / `nonlocal x` declarations — pure scope hints to
+  # Python's name resolution. Pylixir's `global` shape is supported
+  # via `Context.mutable_module_dicts` (the Process dict routing
+  # handles cross-scope mutation regardless of where the declaration
+  # appears). `nonlocal` is supported via the same dictionary when
+  # the captured outer-binding name has been promoted. The bare
+  # statement itself emits `:ok` (a no-op Elixir atom).
+  def convert(%{"_type" => "Global"}, context), do: {:ok, context}
+  def convert(%{"_type" => "Nonlocal"}, context), do: {:ok, context}
+
   # `raise ExceptionClass(args)` / `raise ExceptionClass` / bare
   # `raise` — Python's exception-raising. Pylixir doesn't model
   # exception classes, so we route everything through
@@ -450,7 +460,12 @@ defmodule Pylixir.Converter do
 
             cond do
               MapSet.size(context.class_names) > 0 and
-                  value_type == "Name" ->
+                  value_type in ["Name", "Attribute"] ->
+                # Depth-N attribute read: `obj.outer.inner.…` lowers to
+                # `Map.fetch!(Map.fetch!(obj, :outer), :inner)`. Recursive
+                # via the inner Attribute case. Pylixir doesn't track
+                # aliasing — chained reads return the field values as
+                # of the most recent rebind of the root.
                 {value_ast, context} = convert(value, context)
                 attr_atom = String.to_atom(attr)
 
@@ -856,6 +871,15 @@ defmodule Pylixir.Converter do
       value when is_boolean(value) or is_nil(value) ->
         {value, context}
 
+      # Bytes literals (`b'\x00'` / `b'abc'`) serialise as a list of
+      # unsigned 8-bit ints — the same shape `bytearray(iter)` produces.
+      # The Elixir AST literal for a list of ints is just the list,
+      # which `Macro.escape/1` would also produce. Emit directly so
+      # subscript reads/writes / slice-assign work uniformly with
+      # the list-backed bytearray rep.
+      value when is_list(value) ->
+        {value, context}
+
       other ->
         raise UnsupportedNodeError,
           node_type: "Constant",
@@ -1250,12 +1274,71 @@ defmodule Pylixir.Converter do
   # --- AugAssign dispatch -----------------------------------------------
 
   defp aug_assign(%{"_type" => "Name", "id" => id}, op, value, node, context) do
+    cond do
+      MapSet.member?(context.mutable_module_dicts, id) ->
+        # `time += 1` on a module-level mutable var (Python `global
+        # time`). Read+combine+write through process dict so the
+        # mutation persists in any caller's view.
+        {value_ast, context} = convert(value, context)
+        old = process_dict_get(id)
+        combined = bin_op_ast(op, old, value_ast, node)
+        {process_dict_put_ast(id, combined), context}
+
+      true ->
+        {value_ast, context} = convert(value, context)
+        context = bind_name(context, id)
+        target_atom = id |> Naming.rewrite() |> String.to_atom()
+        target_ref = {target_atom, [], nil}
+        rhs = bin_op_ast(op, target_ref, value_ast, node)
+        {{:=, [], [target_ref, rhs]}, context}
+    end
+  end
+
+  # `<obj>.<outer>.<inner> += value` — depth-2 attribute AugAssign.
+  # Reads `obj.outer.inner`, combines with `value`, writes back
+  # through both map layers. Python's aliasing semantics aren't
+  # modelled (Pylixir's instances are immutable maps), so for code
+  # that relies on multiple references to `obj.outer` observing the
+  # update via aliasing this will silently produce wrong results.
+  # For non-aliased usage (the common case in single-owner data
+  # structures) the result matches Python.
+  defp aug_assign(
+         %{
+           "_type" => "Attribute",
+           "value" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => obj_name},
+             "attr" => outer_attr
+           },
+           "attr" => inner_attr
+         },
+         op,
+         value,
+         node,
+         context
+       ) do
     {value_ast, context} = convert(value, context)
-    context = bind_name(context, id)
-    target_atom = id |> Naming.rewrite() |> String.to_atom()
-    target_ref = {target_atom, [], nil}
-    rhs = bin_op_ast(op, target_ref, value_ast, node)
-    {{:=, [], [target_ref, rhs]}, context}
+    obj_atom = obj_name |> Naming.rewrite() |> String.to_atom()
+    obj_ref = {obj_atom, [], nil}
+    outer_atom = String.to_atom(outer_attr)
+    inner_atom = String.to_atom(inner_attr)
+
+    outer_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [obj_ref, outer_atom]}
+
+    inner_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [outer_read, inner_atom]}
+
+    combined = bin_op_ast(op, inner_read, value_ast, node)
+
+    new_outer =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [outer_read, inner_atom, combined]}
+
+    new_obj =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [obj_ref, outer_atom, new_outer]}
+
+    context = bind_name(context, obj_name)
+    {{:=, [], [obj_ref, new_obj]}, context}
   end
 
   # `<obj>.<attr> += value` — read+write an instance-map attribute.
@@ -1470,6 +1553,19 @@ defmodule Pylixir.Converter do
             atom = id |> Naming.rewrite() |> String.to_atom()
             ref = {atom, [], nil}
             {{{:., [], [ref]}, [], arg_asts}, context}
+
+          # User `def name` shadows a Python builtin (`def len(xs): …`,
+          # `def next(seq, d): …`). Python's local-by-default name
+          # resolution means the user's function takes precedence;
+          # without this check, the builtin lowering would steal the
+          # call site. Place BEFORE `Builtins.supported?` for that
+          # reason. Hoisted-import names land in `known_functions` too,
+          # so a `from itertools import reduce` alias also wins.
+          MapSet.member?(context.known_functions, id) and
+              not MapSet.member?(context.demoted_functions, id) ->
+            no_kwargs!(kwargs, id, node)
+            atom = id |> Naming.rewrite() |> String.to_atom()
+            {{atom, [], arg_asts}, context}
 
           Builtins.supported?(id) ->
             Lowering.dispatch(

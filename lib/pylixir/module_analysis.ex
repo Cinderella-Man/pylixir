@@ -827,38 +827,44 @@ defmodule Pylixir.ModuleAnalysis do
   # pass state explicitly through return values (the only shape
   # Pylixir's immutable lowering can model correctly).
   # Identify module-level names whose:
-  #   1. initial assign is a literal *dict* (`memo = {}` / `memo = {0: 1}`)
-  #   2. and which are mutated via `name[k] = v` inside a top-level def
-  # These are the memoization shape — the Converter lowers reads to
-  # `Process.get/1` and subscript-writes to `Process.put/2` so the
-  # mutation persists across calls. Other mutable patterns (int
-  # counters, list `.append`, etc.) still fall through to
-  # `reject_mutated_in_top_defs!`.
+  #   1. initial assign is a simple literal — dict (`memo = {}`), int
+  #      (`time = 0`), float, string, bool, or None
+  #   2. and which are mutated inside a top-level def — either
+  #      `name[k] = v` (dict shape) or `name op= v` (int counter shape,
+  #      which Python requires a `global name` declaration for).
+  # Both routes through the Erlang process dict at codegen time so the
+  # mutation persists. List `.append` and similar method-style mutations
+  # still fall through to `reject_mutated_in_top_defs!` (they'd need
+  # method-call rewriting we haven't built).
   defp mutable_module_dict_names(body, promotable) do
     body_index = Enum.with_index(body)
 
     promotable
     |> Enum.filter(fn name ->
-      dict_init_assign?(body_index, name) and mutated_inside_top_def?(body, name)
+      simple_literal_init_assign?(body_index, name) and mutated_inside_top_def?(body, name)
     end)
     |> MapSet.new()
   end
 
-  defp dict_init_assign?(body_index, name) do
+  defp simple_literal_init_assign?(body_index, name) do
     Enum.any?(body_index, fn {node, _} ->
       case node do
         %{
           "_type" => "Assign",
           "targets" => [%{"_type" => "Name", "id" => ^name}],
-          "value" => %{"_type" => "Dict"}
+          "value" => value
         } ->
-          true
+          mutable_init_literal?(value)
 
         _ ->
           false
       end
     end)
   end
+
+  defp mutable_init_literal?(%{"_type" => "Dict"}), do: true
+  defp mutable_init_literal?(%{"_type" => "Constant"}), do: true
+  defp mutable_init_literal?(_), do: false
 
   defp reject_mutated_in_top_defs!(body, promotable) do
     promotable

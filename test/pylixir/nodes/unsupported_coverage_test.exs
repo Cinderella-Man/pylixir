@@ -71,22 +71,34 @@ defmodule Pylixir.Nodes.UnsupportedCoverageTest do
     end
   end
 
-  describe "RFC §4.4 — scope keywords" do
-    test "Global" do
-      assert_raises_unsupported("def f():\n    global x\n    x = 1\n", "Global")
+  describe "scope keywords" do
+    # `global` + `nonlocal` are no-ops in the converter — `global x`
+    # is a *hint* to Python's name resolution that Pylixir doesn't
+    # need (Process-dict routing already crosses scope), and
+    # `nonlocal x` similarly relies on the outer's mutable-binding
+    # promotion. Both used to raise; now they emit `:ok` so the
+    # surrounding code can transpile.
+    test "Global (bare declaration) is a no-op" do
+      # `global x` alone (no module-level `x = …` to promote) should
+      # still transpile cleanly. The function does nothing observable.
+      out = Pylixir.transpile("def f():\n    global x\n    return 1\nprint(f())\n")
+      assert out =~ "def py_main"
     end
 
-    test "Nonlocal" do
+    test "Nonlocal (bare declaration) is a no-op" do
       source = """
       def outer():
           x = 1
           def inner():
               nonlocal x
-              x = 2
-          inner()
+              return x
+          return inner()
+
+      print(outer())
       """
 
-      assert_raises_unsupported(source, "Nonlocal")
+      out = Pylixir.transpile(source)
+      assert out =~ "def py_main"
     end
   end
 
