@@ -1,5 +1,31 @@
 # Slim runtime-helper preamble for transpile output
 
+## Phase 2 — landed (T6, T7, T8)
+
+Building on S0–S5:
+
+- **T6** — `isinstance` / `callable` / `hasattr` / `issubclass` added to
+  `TypeInfer.stdlib_return_type/3` → `{:bool}`. Cascades through S1 elision
+  (BoolOp Or of two isinstance calls lubs to `{:bool}`, drops `truthy?`).
+- **T8** — Lambda body inference: `infer_expr` recurses through Python AST
+  `Lambda` nodes, priming params to `:any` and returning the body's type.
+- **T7** — `function_return_type/2` helper + `map(f, xs)` result-type
+  refinement using fn_signatures + lambda inference. `list(typed_list)` now
+  type-passes-through (was `{:list, :any}` regardless).
+
+Corpus impact:
+- avg 4916 → 4880 bytes/fixture (-0.74% additional vs S5-end; -1.0% vs pre-S1)
+- church-numerals: 7846 → 7387 (-6%, truthy? family gone)
+- isinstance-narrowed slimming fixture: 985 → 526 (-47%)
+- new slimming fixtures: `08_isinstance_or.py` 484 bytes; `09_typed_map.py` 5757
+- pass rate retained at 998/1000 (99.8%)
+- 952 tests, 0 failures
+
+**T7's full impact deferred** — `PR 9`'s fixed-point doesn't yet treat
+`map(f, xs)` as a call to `f` with `elem_of(xs)` arg, so user functions
+used only via HOF args keep `fn_signatures` return = `:any`. The
+infrastructure (`function_return_type/2`) is in place for follow-up.
+
 ## Landed state (as of implementation)
 
 S0–S3 and S5 shipped. S4 deferred — full per-clause tree-shaking needs

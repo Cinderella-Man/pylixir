@@ -10,9 +10,7 @@ defmodule Pylixir.TypeInfer do
   this module is purely additive on top of the polymorphic helpers.
   """
 
-  alias Pylixir.{AST.Walk, Context}
-
-  @max_fixpoint_rounds 5
+  alias Pylixir.Context
 
   @type t ::
           :any
@@ -136,11 +134,26 @@ defmodule Pylixir.TypeInfer do
   def elem_of({:set}), do: :any
   def elem_of(_), do: :any
 
-  defp lub_all([]), do: :any
-  defp lub_all(ts), do: Enum.reduce(ts, :bottom, &lub/2) |> demote_bottom()
+  @doc """
+  `lub` over a list of types. Empty list → `:any` (the conservative
+  catch-all; the lattice `:bottom` is internal and should never reach
+  callers — see `demote_bottom/1`). Used by inference paths that
+  accumulate types across a variable-arity arg list (`min(a, b, c)`,
+  `lub_param_types/3` in the fixed-point pass, container-literal
+  element inference).
+  """
+  @spec lub_all([t()]) :: t()
+  def lub_all([]), do: :any
+  def lub_all(ts), do: Enum.reduce(ts, :bottom, &lub/2) |> demote_bottom()
 
-  defp demote_bottom(:bottom), do: :any
-  defp demote_bottom(t), do: t
+  @doc """
+  `:bottom → :any`, otherwise identity. Public so consumers of the
+  lattice (`Pylixir.TypeInfer.Signatures`, `BuiltinSignatures`) never
+  expose `:bottom` to callers — only the lattice itself manipulates it.
+  """
+  @spec demote_bottom(t()) :: t()
+  def demote_bottom(:bottom), do: :any
+  def demote_bottom(t), do: t
 
   # ---------------------------------------------------------------------
   # Bind — record a name's type in the current scope (`ctx.types`).
@@ -375,82 +388,32 @@ defmodule Pylixir.TypeInfer do
           # User-defined signatures (PR 9 fixed-point) win over the
           # stdlib table — `def len(xs): return "always"` should shadow.
           sig = Map.get(ctx.fn_signatures, id) -> elem(sig, 1)
-          true -> stdlib_return_type(id, Map.get(node, "args", []), ctx)
+          true ->
+            Pylixir.TypeInfer.BuiltinSignatures.return_type(id, Map.get(node, "args", []), ctx)
         end
 
       %{"_type" => "Attribute", "attr" => method} ->
-        method_return_type(method)
+        Pylixir.TypeInfer.BuiltinSignatures.method_return_type(method)
 
       _ ->
         :any
     end
+  end
+
+  # T8 — Lambda body inference. Python `lambda a, b: <expr>`. Params are
+  # primed to `:any` (no call-site info at this point); the body's
+  # inferred type becomes the lambda's "return type." Used by
+  # `BuiltinSignatures.function_return_type/2` (HOF arg propagation) AND
+  # by `infer_expr` when a Lambda appears in expression position.
+  def infer_expr(%{"_type" => "Lambda", "args" => args, "body" => body}, ctx) do
+    param_names =
+      (Map.get(args, "args") || []) |> Enum.map(&Map.get(&1, "arg"))
+
+    primed = Enum.reduce(param_names, ctx, fn n, c -> bind(c, n, :any) end)
+    infer_expr(body, primed)
   end
 
   def infer_expr(_other, _ctx), do: :any
-
-  # Return-type table for the common Python method calls (`s.startswith()`,
-  # `xs.append()`, etc.). Ducktyped — we trust the source. Methods not
-  # listed return `:any`.
-  defp method_return_type(method) do
-    case method do
-      m
-      when m in [
-             "startswith",
-             "endswith",
-             "isdigit",
-             "isalpha",
-             "isalnum",
-             "islower",
-             "isupper",
-             "isspace",
-             "isdecimal",
-             "isnumeric",
-             "isascii",
-             "issubset",
-             "issuperset",
-             "isdisjoint"
-           ] ->
-        {:bool}
-
-      m
-      when m in [
-             "lower",
-             "upper",
-             "title",
-             "capitalize",
-             "swapcase",
-             "casefold",
-             "strip",
-             "lstrip",
-             "rstrip",
-             "replace",
-             "removeprefix",
-             "removesuffix",
-             "zfill",
-             "ljust",
-             "rjust",
-             "center",
-             "format",
-             "join"
-           ] ->
-        {:str}
-
-      m when m in ["count", "find", "rfind", "index", "bit_length"] ->
-        {:int_lit_nonneg}
-
-      m when m in ["split", "rsplit", "splitlines"] ->
-        {:list, {:str}}
-
-      m when m in ["keys", "values"] ->
-        {:list, :any}
-
-      m when m in ["items"] ->
-        {:list, {:tuple, :any_arity}}
-
-      _ ->
-        :any
-    end
-  end
 
   defp constant_type(v) do
     cond do
@@ -543,69 +506,9 @@ defmodule Pylixir.TypeInfer do
   defp bool_tainted?({:union, set}), do: MapSet.member?(set, {:bool})
   defp bool_tainted?(_), do: false
 
-  # ---------------------------------------------------------------------
-  # stdlib_return_type — PR 8. Hardcoded return-type table for Python
-  # built-in calls. Argument types feed into iterator-aware returns
-  # (sorted preserves element type, enumerate yields {idx, elt}
-  # tuples, etc.). Returns `:any` for builtins we don't model.
-  # ---------------------------------------------------------------------
-
-  @spec stdlib_return_type(String.t(), [map()], Context.t()) :: t()
-  def stdlib_return_type(id, args, ctx) do
-    case {id, args} do
-      # String/int conversions
-      {"int", _} -> {:int}
-      {"str", _} -> {:str}
-      {"bool", _} -> {:bool}
-      {"float", _} -> {:float}
-      {"hex", _} -> {:str}
-      {"oct", _} -> {:str}
-      {"bin", _} -> {:str}
-      {"chr", _} -> {:str}
-      {"repr", _} -> {:str}
-      {"format", _} -> {:str}
-      {"ord", _} -> {:int}
-      {"abs", _} -> :any
-      {"round", _} -> :any
-      {"input", _} -> {:str}
-      # `len` always returns a non-negative int.
-      {"len", _} -> {:int_lit_nonneg}
-      # `range(...)` always yields a list of ints (lowered as Enum.to_list of a Range).
-      {"range", _} -> {:list, {:int}}
-      # `sorted(xs)` preserves the element type.
-      {"sorted", [xs | _]} -> {:list, elem_of(infer_expr(xs, ctx))}
-      {"sorted", []} -> {:list, :any}
-      # `reversed(xs)` likewise.
-      {"reversed", [xs]} -> {:list, elem_of(infer_expr(xs, ctx))}
-      # `enumerate(xs)` → list of (int, elt) tuples.
-      {"enumerate", [xs | _]} -> {:list, {:tuple, [{:int}, elem_of(infer_expr(xs, ctx))]}}
-      # `zip(a, b, ...)` → list of tuples (arity = len(args)).
-      {"zip", _} -> {:list, {:tuple, :any_arity}}
-      # `map`/`filter` — return list with elem from arg.
-      {"map", _} -> {:list, :any}
-      {"filter", [_, xs]} -> {:list, elem_of(infer_expr(xs, ctx))}
-      {"filter", _} -> {:list, :any}
-      # `sum` keeps :any (could be int or float; arg-dependent).
-      {"sum", _} -> :any
-      {"min", [xs]} -> elem_of(infer_expr(xs, ctx))
-      {"max", [xs]} -> elem_of(infer_expr(xs, ctx))
-      {"min", args_list} -> lub_all(Enum.map(args_list, &infer_expr(&1, ctx)))
-      {"max", args_list} -> lub_all(Enum.map(args_list, &infer_expr(&1, ctx)))
-      # Container constructors with no args → empty value of that type.
-      {"list", []} -> {:list, :any}
-      {"list", _} -> {:list, :any}
-      {"tuple", _} -> {:tuple, :any_arity}
-      {"set", _} -> {:set}
-      {"frozenset", _} -> {:set}
-      {"dict", _} -> {:dict, :any, :any}
-      {"deque", _} -> {:list, :any}
-      {"bytearray", _} -> {:list, :any}
-      {"bytes", _} -> {:list, :any}
-      {"any", _} -> {:bool}
-      {"all", _} -> {:bool}
-      _ -> :any
-    end
-  end
+  # Return-type tables for Python builtins, methods, and function-valued
+  # AST nodes live in `Pylixir.TypeInfer.BuiltinSignatures`. The Call
+  # dispatch in `infer_expr/2` above routes there.
 
   # ---------------------------------------------------------------------
   # coerce_iter — used by PR 6 iter-consuming sites to drop the
@@ -644,113 +547,9 @@ defmodule Pylixir.TypeInfer do
 
   defp seed_heap_type(_other, ctx), do: ctx
 
-  # ---------------------------------------------------------------------
-  # infer_signatures — PR 9 inter-procedural fixed-point. Iterates
-  # `fn_signatures` until stable (capped at MAX_ROUNDS). External
-  # callers pin param types; recursive self-calls contribute `:bottom`
-  # (excluded from the lub). The body's return type is inferred under
-  # the round's primed param bindings.
-  # ---------------------------------------------------------------------
-
-  @spec infer_signatures([map()], [map()], Context.t()) :: Context.t()
-  def infer_signatures(function_defs, runtime_statements, %Context{} = ctx) do
-    typeable_defs = Enum.filter(function_defs, &typeable_def?/1)
-    external_sources = build_external_sources(typeable_defs, runtime_statements)
-
-    final_sigs =
-      Enum.reduce_while(1..@max_fixpoint_rounds, ctx.fn_signatures, fn _round, sigs ->
-        next = compute_round(typeable_defs, external_sources, %{ctx | fn_signatures: sigs})
-        if next == sigs, do: {:halt, next}, else: {:cont, next}
-      end)
-
-    %{ctx | fn_signatures: final_sigs}
-  end
-
-  # Skip variadic / kwarg-bearing defs — caller-arg-position inference
-  # doesn't generalize cleanly without param/arity alignment.
-  defp typeable_def?(%{"args" => args}) do
-    Map.get(args, "vararg") == nil and Map.get(args, "kwarg") == nil
-  end
-
-  defp typeable_def?(_), do: false
-
-  defp build_external_sources(function_defs, runtime_statements) do
-    Map.new(function_defs, fn %{"name" => name} ->
-      others_bodies =
-        function_defs
-        |> Enum.reject(&(&1["name"] == name))
-        |> Enum.flat_map(&(&1["body"] || []))
-
-      {name, others_bodies ++ runtime_statements}
-    end)
-  end
-
-  defp compute_round(function_defs, external_sources, ctx) do
-    Enum.reduce(function_defs, %{}, fn fn_def, acc ->
-      name = fn_def["name"]
-      param_names = (fn_def["args"]["args"] || []) |> Enum.map(&Map.get(&1, "arg"))
-      body = fn_def["body"] || []
-      sources = Map.get(external_sources, name, [])
-
-      call_arg_lists = collect_call_args(sources, name)
-      param_types = lub_param_types(call_arg_lists, length(param_names), ctx)
-      body_ctx = prime_params(ctx, param_names, param_types)
-      # Override `name`'s signature to `:bottom` return so recursive
-      # calls in the body don't poison the return-type lub. Round (k+1)
-      # picks up the proper signature from round k's `acc` snapshot.
-      body_ctx = %{
-        body_ctx
-        | fn_signatures: Map.put(body_ctx.fn_signatures, name, {param_types, :bottom})
-      }
-
-      return_type = lub_of_returns(body, body_ctx)
-
-      Map.put(acc, name, {param_types, return_type})
-    end)
-  end
-
-  defp collect_call_args(nodes, target_name) do
-    Walk.walk_scope(nodes, [], fn
-      %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => callee}} = call, acc
-      when callee == target_name ->
-        [Map.get(call, "args", []) | acc]
-
-      _node, acc ->
-        acc
-    end)
-  end
-
-  defp lub_param_types([], n, _ctx), do: List.duplicate(:any, n)
-
-  defp lub_param_types(arg_lists, n, ctx) do
-    for i <- 0..(n - 1)//1 do
-      arg_lists
-      |> Enum.map(fn args -> Enum.at(args, i) end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.map(&infer_expr(&1, ctx))
-      |> Enum.reduce(:bottom, &lub/2)
-      |> demote_bottom()
-    end
-  end
-
-  defp prime_params(ctx, names, types) do
-    pairs = Enum.zip(names, types)
-    Enum.reduce(pairs, ctx, fn {name, type}, c -> bind(c, name, type) end)
-  end
-
-  defp lub_of_returns(body, ctx) do
-    Walk.walk_scope(body, :bottom, fn
-      %{"_type" => "Return", "value" => value}, acc when not is_nil(value) ->
-        lub(acc, infer_expr(value, ctx))
-
-      %{"_type" => "Return", "value" => nil}, acc ->
-        lub(acc, {:none})
-
-      _node, acc ->
-        acc
-    end)
-    |> demote_bottom()
-  end
+  # The bounded fixed-point pass that populates `Context.fn_signatures`
+  # lives in `Pylixir.TypeInfer.Signatures`. Entry point:
+  # `Pylixir.TypeInfer.Signatures.infer/3`.
 
   defp demote_container_elements({:list, _}), do: {:list, :any}
   defp demote_container_elements({:dict, _, _}), do: {:dict, :any, :any}

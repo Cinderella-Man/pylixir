@@ -81,7 +81,7 @@ defmodule Pylixir.Converter do
     # state) are typed during the lub. Recursive calls contribute
     # `:bottom`; convergence usually in 2–3 rounds.
     context =
-      TypeInfer.infer_signatures(analysis.function_defs, analysis.runtime_statements, context)
+      TypeInfer.Signatures.infer(analysis.function_defs, analysis.runtime_statements, context)
 
     {class_asts, context} = convert_class_defs(analysis.class_defs, context)
     {hoisted_asts, context} = emit_hoisted_imports(analysis.hoisted_imports, context)

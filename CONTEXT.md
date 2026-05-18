@@ -155,6 +155,39 @@ on `Pylixir.Converter` as `@doc false` public functions because every
 node module calls back through them. Mirrors the long-standing
 `test/pylixir/nodes/<x>_test.exs` layout.
 
+**Type inference** — `Pylixir.TypeInfer` owns the static lattice + the
+per-expression `infer_expr/2` walk. Lattice algebra (`lub/2`, `elem_of/1`,
+predicates `is_int?` / `is_str?` / `is_list?` / `is_dict?` / `is_set?` /
+`is_tuple_tag?`), bind/demote on `Context.types`, `bind_pattern/3` for
+destructure, and `infer_expr/2`'s Python-AST dispatch live here. Read-only:
+`infer_expr/2` never mutates Context. Bind/demote happen at the conversion
+clause that *follows* the inference — Assign/Mutation/Delete sites in
+node modules. Two related concerns deliberately live in submodules instead:
+
+  * **`Pylixir.TypeInfer.BuiltinSignatures`** — static lookup tables for
+    Python builtin return types (`len → {:int_lit_nonneg}`,
+    `range → {:list, {:int}}`, `isinstance → {:bool}`, …) and method
+    return types (`.startswith → {:bool}`, `.split → {:list, {:str}}`, …).
+    Also owns `function_return_type/2` — given a function-valued AST
+    node (`Name(id)` consulting `Context.fn_signatures`, or `Lambda`
+    recursing through `infer_expr/2`), recovers its return type for use
+    in HOF stdlib inference (`map(f, xs)` → `{:list, return_type_of(f)}`).
+    Data + dispatch surface only; no lattice state. Adding a new
+    builtin's return type = one new clause here, nothing in the
+    dispatcher.
+
+  * **`Pylixir.TypeInfer.Signatures`** — the bounded fixed-point pass
+    that produces `Context.fn_signatures`. Runs once from the Module
+    clause in `Pylixir.Converter`, iterates `module_summary`-style for
+    up to 5 rounds until stable. Recursive call sites contribute
+    `:bottom` (excluded from the param-type lub) so the iteration
+    actually converges — see `docs/02_type-inference-monomorphization.md`
+    Q3-C. Public entry point: `Pylixir.TypeInfer.Signatures.infer/3`.
+
+`Pylixir.TypeInfer.demote_bottom/1` is part of TypeInfer's public lattice
+API (`:bottom → :any`) so consumers — including `Signatures` — never
+expose `:bottom` to callers; only the lattice itself manipulates it.
+
 **Control-flow protocol** — `Pylixir.ControlFlow` owns the throw/catch
 shapes that Pylixir uses to implement Python's early-exit constructs:
 
