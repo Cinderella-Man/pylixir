@@ -206,11 +206,20 @@ defmodule Pylixir.Builtins do
   def emit("min", [a, b | rest], _kw), do: {:ok, minmax_variadic(:min, [a, b | rest])}
   def emit("max", [a, b | rest], _kw), do: {:ok, minmax_variadic(:max, [a, b | rest])}
 
+  # `map(f, xs)` / `filter(f, xs)` — wrap iterable in py_iter_to_list
+  # so strings/tuples/dicts/sets all work; see the iter-consumers note
+  # above `reversed`.
   def emit("map", [f, xs], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [xs, f]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [],
+        [{:py_iter_to_list, [], [xs]}, f]}}
 
   def emit("filter", [f, xs], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [xs, f]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [],
+        [{:py_iter_to_list, [], [xs]}, f]}}
 
   # --- T26 conversions ---------------------------------------------------
 
@@ -281,14 +290,16 @@ defmodule Pylixir.Builtins do
   def emit("tuple", [x], _kw) do
     {:ok,
      {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [],
-      [{{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}]}}
+      [{:py_iter_to_list, [], [x]}]}}
   end
 
   def emit("set", [], _kw),
     do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], []}}
 
   def emit("set", [x], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [x]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [{:py_iter_to_list, [], [x]}]}}
 
   # `frozenset()` / `frozenset(iter)` — Elixir has no separate frozen vs
   # mutable set; MapSet already has value semantics + immutability. Both
@@ -586,7 +597,8 @@ defmodule Pylixir.Builtins do
 
   defp enum_truthy_call(op, xs) do
     fn_ast = {:fn, [], [{:->, [], [[{:x, [], nil}], {:truthy?, [], [{:x, [], nil}]}]}]}
-    {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [xs, fn_ast]}
+    coerced = {:py_iter_to_list, [], [xs]}
+    {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [coerced, fn_ast]}
   end
 
   defp emit_print(args, kw) do
