@@ -353,9 +353,13 @@ defmodule Pylixir.Nodes.AttributeMethods do
   defp do_dispatch("endswith", target, [suffix], _kw, _node),
     do: {:py_str_endswith, [], [target, suffix]}
 
-  # sep.join(items) — RFC §10.1 arg-swap (Python: sep.join(items); Elixir: Enum.join(items, sep))
+  # sep.join(items) — RFC §10.1 arg-swap (Python: sep.join(items); Elixir: Enum.join(items, sep)).
+  # `py_iter_to_list/1` keeps strings/tuples/dicts/sets iterating
+  # Python-style (Enum.join on a BitString crashes).
   defp do_dispatch("join", sep, [items], _kw, _node),
-    do: {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [], [items, sep]}
+    do:
+      {{:., [], [{:__aliases__, [], [:Enum]}, :join]}, [],
+       [{:py_iter_to_list, [], [items]}, sep]}
 
   # --- T29b string methods: search / split / replace / classification ---
 

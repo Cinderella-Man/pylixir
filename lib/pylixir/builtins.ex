@@ -321,10 +321,12 @@ defmodule Pylixir.Builtins do
     do: {:ok, {{:., [], [{:__aliases__, [], [:Map]}, :new]}, [], [x]}}
 
   # `deque()` / `deque(iter)` — backing rep is a plain Elixir list.
+  # `py_iter_to_list/1` keeps string/tuple/dict args working (`Enum.to_list`
+  # alone crashes on tuples).
   def emit("deque", [], _kw), do: {:ok, []}
 
   def emit("deque", [x], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [x]}}
+    do: {:ok, {:py_iter_to_list, [], [x]}}
 
   # `Counter(iter)` → dict-of-counts. Elixir's `Enum.frequencies/1` is
   # the exact equivalent. (Counter's other features — most_common,
