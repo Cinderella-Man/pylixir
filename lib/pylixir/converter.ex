@@ -69,6 +69,20 @@ defmodule Pylixir.Converter do
     # these names so reads through `process_dict_get` see the type.
     context = TypeInfer.module_summary(analysis.runtime_statements, context)
 
+    # PR 7 — seed ctx.types from promoted module attributes. Each
+    # `@var_x value` has a `LiteralFold`-derived BEAM term; route
+    # through `type_of_term/1` so subsequent reads of `Name("x")`
+    # return the inferred type and downstream BinOp / call / subscript
+    # sites can specialize.
+    context = seed_module_attr_types(analysis.module_attrs, context)
+
+    # PR 9 — inter-procedural fixed-point. Runs AFTER PR 3/7 seeding
+    # so external callers' args (which may read module attrs / heap
+    # state) are typed during the lub. Recursive calls contribute
+    # `:bottom`; convergence usually in 2–3 rounds.
+    context =
+      TypeInfer.infer_signatures(analysis.function_defs, analysis.runtime_statements, context)
+
     {class_asts, context} = convert_class_defs(analysis.class_defs, context)
     {hoisted_asts, context} = emit_hoisted_imports(analysis.hoisted_imports, context)
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
@@ -608,6 +622,10 @@ defmodule Pylixir.Converter do
     orelse = Map.get(node, "orelse", [])
     finalbody = Map.get(node, "finalbody", [])
 
+    # PR 11 — Try branches type-isolated like If: snapshot pre-Try
+    # types, let inner converters specialize, restore on exit.
+    saved_types = context.types
+
     # Compute the set of names assigned inside the try body (and
     # `else`) BEFORE conversion — this is the set of bindings that
     # need to escape the Elixir `try do ... end` scope. Without
@@ -689,21 +707,24 @@ defmodule Pylixir.Converter do
 
     try_expr = {:try, [], [try_args]}
 
-    case assigned do
-      [] ->
-        {try_expr, context}
+    {result_ast, context} =
+      case assigned do
+        [] ->
+          {try_expr, context}
 
-      _ ->
-        # Pattern-match the try expression's result into the outer
-        # scope so the assigned names survive the try boundary.
-        # `_try_value` discards the body's tail expression value (we
-        # only care about the bindings). Bind each name in the
-        # surrounding context too.
-        names = Enum.map(assigned, &name_atom_ref/1)
-        pattern = tuple_pattern([{:_try_value, [], nil} | names])
-        context = Enum.reduce(assigned, context, fn n, ctx -> bind_name(ctx, n) end)
-        {{:=, [], [pattern, try_expr]}, context}
-    end
+        _ ->
+          # Pattern-match the try expression's result into the outer
+          # scope so the assigned names survive the try boundary.
+          # `_try_value` discards the body's tail expression value (we
+          # only care about the bindings). Bind each name in the
+          # surrounding context too.
+          names = Enum.map(assigned, &name_atom_ref/1)
+          pattern = tuple_pattern([{:_try_value, [], nil} | names])
+          context = Enum.reduce(assigned, context, fn n, ctx -> bind_name(ctx, n) end)
+          {{:=, [], [pattern, try_expr]}, context}
+      end
+
+    {result_ast, %{context | types: saved_types}}
   end
 
   # Expr: drop the result unless the inner value is a recognised
@@ -728,11 +749,35 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
-    case orelse do
-      [] -> Nodes.If.emit_only(test, body, context)
-      [%{"_type" => "If"} = _elif | _] -> Nodes.If.emit_cond_chain(test, body, orelse, context)
-      _ -> Nodes.If.emit_else(test, body, orelse, context)
-    end
+    # PR 11 — branch-isolated types. Type bindings introduced inside an
+    # If body / orelse leak into the surrounding scope as `:any` (the
+    # lub of "set in this branch" + "untouched in the other" is the
+    # safe conservative type since we don't know which branch ran).
+    # We snapshot before conversion, let the inner conversions update
+    # types as they go (so within-branch specialization fires), and
+    # restore on exit. Names typed *before* the If keep their type.
+    saved_types = context.types
+
+    # PR 12 — isinstance narrowing for the body-only case. Detect
+    # `if isinstance(x, T):` and prime `ctx.types[x]` to `T`'s lattice
+    # type before body conversion. emit_else's per-branch isolation is
+    # left to future work (the body and orelse share a `convert_test`
+    # call site so narrowing one without affecting the other is more
+    # intrusive than current scope permits).
+    body_context =
+      case orelse do
+        [] -> apply_isinstance_narrowing(test, context)
+        _ -> context
+      end
+
+    {ast, context} =
+      case orelse do
+        [] -> Nodes.If.emit_only(test, body, body_context)
+        [%{"_type" => "If"} = _elif | _] -> Nodes.If.emit_cond_chain(test, body, orelse, context)
+        _ -> Nodes.If.emit_else(test, body, orelse, context)
+      end
+
+    {ast, %{context | types: saved_types}}
   end
 
   def convert(%{"_type" => "IfExp", "test" => test, "body" => body, "orelse" => orelse}, context) do
@@ -1823,8 +1868,9 @@ defmodule Pylixir.Converter do
   end
 
   defp emit_starred_call(id, star_node, node, context) do
+    arg_type = TypeInfer.infer_expr(star_node, context)
     {arg_ast, context} = convert(star_node, context)
-    arg_list = {:py_iter_to_list, [], [arg_ast]}
+    arg_list = TypeInfer.coerce_iter(arg_ast, arg_type)
 
     cond do
       name_in_scope?(context, id) ->
@@ -2496,6 +2542,62 @@ defmodule Pylixir.Converter do
   @doc false
   def method_fn_name(class_name, method_name) do
     String.to_atom("__cls_" <> class_name <> "_" <> method_name)
+  end
+
+  # PR 12 — recognize `isinstance(x, T)` and `isinstance(x, (T1, T2, …))`
+  # in If-test position and narrow the lattice type of `x` to the
+  # matched class(es). Returns the (possibly updated) context.
+
+  defp apply_isinstance_narrowing(
+         %{
+           "_type" => "Call",
+           "func" => %{"_type" => "Name", "id" => "isinstance"},
+           "args" => [%{"_type" => "Name", "id" => var_name}, type_spec]
+         },
+         context
+       ) do
+    case lattice_of_isinstance_spec(type_spec) do
+      :any -> context
+      lattice -> TypeInfer.bind(context, var_name, lattice)
+    end
+  end
+
+  defp apply_isinstance_narrowing(_test, context), do: context
+
+  defp lattice_of_isinstance_spec(%{"_type" => "Name", "id" => name}) do
+    case name do
+      "int" -> {:int}
+      "float" -> {:float}
+      "str" -> {:str}
+      "bool" -> {:bool}
+      "list" -> {:list, :any}
+      "dict" -> {:dict, :any, :any}
+      "set" -> {:set}
+      "frozenset" -> {:set}
+      "tuple" -> {:tuple, :any_arity}
+      _ -> :any
+    end
+  end
+
+  defp lattice_of_isinstance_spec(%{"_type" => "Tuple", "elts" => elts}) do
+    elts
+    |> Enum.map(&lattice_of_isinstance_spec/1)
+    |> Enum.reduce(:bottom, fn t, acc -> TypeInfer.lub(acc, t) end)
+    |> case do
+      :bottom -> :any
+      t -> t
+    end
+  end
+
+  defp lattice_of_isinstance_spec(_), do: :any
+
+  defp seed_module_attr_types(attrs, context) do
+    Enum.reduce(attrs, context, fn {name, value_node}, ctx ->
+      case Pylixir.LiteralFold.fold(value_node) do
+        {:ok, value} -> TypeInfer.bind(ctx, name, TypeInfer.type_of_term(value))
+        _ -> ctx
+      end
+    end)
   end
 
   defp convert_module_attrs([], context), do: {[], context}

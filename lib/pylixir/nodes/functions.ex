@@ -171,14 +171,30 @@ defmodule Pylixir.Nodes.Functions do
     saved_scopes = context.scopes
     saved_def_position = context.def_position
     saved_return_mode = context.return_mode
+    saved_types = context.types
 
     new_scope = MapSet.new(param_names)
+
+    # PR 9 — prime param types from `fn_signatures` so the body's
+    # converter clauses see typed params. Falls back to `:any` when no
+    # signature was inferred (variadic / first-pass / etc.).
+    param_types =
+      case Map.get(context.fn_signatures, py_name) do
+        {pts, _} when is_list(pts) and length(pts) == length(param_names) -> pts
+        _ -> List.duplicate(:any, length(param_names))
+      end
+
+    primed_types =
+      param_names
+      |> Enum.zip(param_types)
+      |> Enum.reduce(context.types, fn {name, t}, acc -> Map.put(acc, name, t) end)
 
     context = %{
       context
       | scopes: [new_scope | context.scopes],
         def_position: :nested_fn,
-        return_mode: return_mode
+        return_mode: return_mode,
+        types: primed_types
     }
 
     {doc, stripped_body} = extract_docstring(body)
@@ -188,7 +204,8 @@ defmodule Pylixir.Nodes.Functions do
       context
       | scopes: saved_scopes,
         def_position: saved_def_position,
-        return_mode: saved_return_mode
+        return_mode: saved_return_mode,
+        types: saved_types
     }
 
     body_block =

@@ -10,7 +10,7 @@ defmodule Pylixir.Nodes.Comprehension do
   are reused as-is.
   """
 
-  alias Pylixir.Converter
+  alias Pylixir.{Converter, TypeInfer}
 
   @type kind :: :list | :set | :gen | :dict
 
@@ -37,10 +37,13 @@ defmodule Pylixir.Nodes.Comprehension do
   # `[y for x in xs if (y := f(x)) > 0]` shape. With two separate fns
   # (filter's vs map's), `y` was undefined when the map reads it.
   defp build_comp([%{"target" => target, "iter" => iter, "ifs" => ifs}], elt_node, kind, context) do
+    iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
-    iter_ast = {:py_iter_to_list, [], [iter_ast]}
+    iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
     saved_scopes = context.scopes
+    saved_types = context.types
     {target_ast, _, context} = Converter.convert_loop_target(target, context)
+    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
 
     {pipeline, context} =
       case ifs do
@@ -65,7 +68,7 @@ defmodule Pylixir.Nodes.Comprehension do
           {ast, context}
       end
 
-    context = %{context | scopes: saved_scopes}
+    context = %{context | scopes: saved_scopes, types: saved_types}
     {pipeline, context}
   end
 
@@ -76,10 +79,13 @@ defmodule Pylixir.Nodes.Comprehension do
          kind,
          context
        ) do
+    iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
-    iter_ast = {:py_iter_to_list, [], [iter_ast]}
+    iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
     saved_scopes = context.scopes
+    saved_types = context.types
     {target_ast, _, context} = Converter.convert_loop_target(target, context)
+    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
     {filtered_iter, context} = apply_filter(iter_ast, target_ast, ifs, context)
     {inner, context} = build_comp(rest, elt_node, kind, context)
 
@@ -87,7 +93,7 @@ defmodule Pylixir.Nodes.Comprehension do
       {{:., [], [{:__aliases__, [], [:Enum]}, :flat_map]}, [],
        [filtered_iter, {:fn, [], [{:->, [], [[target_ast], inner]}]}]}
 
-    context = %{context | scopes: saved_scopes}
+    context = %{context | scopes: saved_scopes, types: saved_types}
     {pipeline, context}
   end
 

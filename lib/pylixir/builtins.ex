@@ -177,6 +177,101 @@ defmodule Pylixir.Builtins do
     if t == {:bool}, do: {:ok, x}, else: emit("bool", [x], kw)
   end
 
+  # PR 6 — drop `py_iter_to_list/1` wrap when the arg is statically a
+  # list. The polymorphic helper is otherwise needed because Python
+  # iterates strings/tuples/dicts/sets too. `TypeInfer.coerce_iter/2`
+  # returns either the raw ast or the wrapped form.
+
+  def emit("sorted", [xs], kw, [t]) do
+    coerced = TypeInfer.coerce_iter(xs, t)
+    base = {{:., [], [{:__aliases__, [], [:Enum]}, :sort]}, [], [coerced]}
+    {:ok, apply_sorted_kw(base, coerced, kw)}
+  end
+
+  def emit("reversed", [xs], _kw, [t]) do
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [TypeInfer.coerce_iter(xs, t)]}}
+  end
+
+  def emit("enumerate", [xs], kw, [t]) do
+    enumerate_call(TypeInfer.coerce_iter(xs, t), Map.get(kw, "start"))
+  end
+
+  def emit("enumerate", [xs, start], _kw, [t, _]) do
+    enumerate_call(TypeInfer.coerce_iter(xs, t), start)
+  end
+
+  def emit("zip", [a, b], _kw, [ta, tb]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [],
+      [TypeInfer.coerce_iter(a, ta), TypeInfer.coerce_iter(b, tb)]}}
+  end
+
+  def emit("zip", [a, b | rest], _kw, types) when length(types) == length([a, b | rest]) do
+    args = Enum.zip([a, b | rest], types) |> Enum.map(fn {arg, t} -> TypeInfer.coerce_iter(arg, t) end)
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [args]}}
+  end
+
+  def emit("min", [xs], kw, [t]) do
+    {:ok, minmax_call(:min, TypeInfer.coerce_iter(xs, t), kw)}
+  end
+
+  def emit("max", [xs], kw, [t]) do
+    {:ok, minmax_call(:max, TypeInfer.coerce_iter(xs, t), kw)}
+  end
+
+  def emit("map", [f, xs], _kw, [_ft, t]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [TypeInfer.coerce_iter(xs, t), f]}}
+  end
+
+  def emit("filter", [f, xs], _kw, [_ft, t]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:Enum]}, :filter]}, [], [TypeInfer.coerce_iter(xs, t), f]}}
+  end
+
+  def emit("list", [x], _kw, [t]) do
+    case t do
+      {:list, _} -> {:ok, x}
+      _ -> {:ok, {:py_iter_to_list, [], [x]}}
+    end
+  end
+
+  def emit("set", [x], _kw, [t]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
+  end
+
+  def emit("frozenset", [x], _kw, [t]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:MapSet]}, :new]}, [], [TypeInfer.coerce_iter(x, t)]}}
+  end
+
+  def emit("deque", [x], _kw, [t]) do
+    case t do
+      {:list, _} -> {:ok, x}
+      _ -> {:ok, {:py_iter_to_list, [], [x]}}
+    end
+  end
+
+  def emit("bytearray", [x], _kw, [t]) do
+    case t do
+      {:list, _} -> {:ok, x}
+      _ -> {:ok, {:py_iter_to_list, [], [x]}}
+    end
+  end
+
+  def emit("bytes", [x], _kw, [t]) do
+    case t do
+      {:list, _} -> {:ok, x}
+      _ -> {:ok, {:py_iter_to_list, [], [x]}}
+    end
+  end
+
+  def emit("tuple", [x], _kw, [t]) do
+    {:ok,
+     {{:., [], [{:__aliases__, [], [:List]}, :to_tuple]}, [], [TypeInfer.coerce_iter(x, t)]}}
+  end
+
   def emit(id, args, kw, _arg_types), do: emit(id, args, kw)
 
   @spec emit(String.t(), [Macro.t()], %{optional(String.t()) => Macro.t()}) ::

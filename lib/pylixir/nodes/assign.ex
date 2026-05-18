@@ -821,18 +821,20 @@ defmodule Pylixir.Nodes.Assign do
   end
 
   defp emit_starred_destructure([], star_name, [], value, context) do
+    value_type = TypeInfer.infer_expr(value, context)
     {value_ast, context} = Converter.convert(value, context)
     star_atom = star_name |> Naming.rewrite() |> String.to_atom()
     context = Converter.bind_name(context, star_name)
-    rhs = {:py_iter_to_list, [], [value_ast]}
+    rhs = TypeInfer.coerce_iter(value_ast, value_type)
     {{:=, [], [{star_atom, [], nil}, rhs]}, context}
   end
 
   defp emit_starred_destructure(before, star_name, [], value, context) do
+    value_type = TypeInfer.infer_expr(value, context)
     {value_ast, context} = Converter.convert(value, context)
     {temp_atom, context} = Converter.next_temp(context)
     temp_ref = {temp_atom, [], nil}
-    to_list = {:py_iter_to_list, [], [value_ast]}
+    to_list = TypeInfer.coerce_iter(value_ast, value_type)
     bind_temp = {:=, [], [temp_ref, to_list]}
 
     n_before = length(before)
@@ -856,10 +858,11 @@ defmodule Pylixir.Nodes.Assign do
   end
 
   defp emit_starred_destructure(before, star_name, after_elts, value, context) do
+    value_type = TypeInfer.infer_expr(value, context)
     {value_ast, context} = Converter.convert(value, context)
     {temp_atom, context} = Converter.next_temp(context)
     temp_ref = {temp_atom, [], nil}
-    to_list = {:py_iter_to_list, [], [value_ast]}
+    to_list = TypeInfer.coerce_iter(value_ast, value_type)
     bind_temp = {:=, [], [temp_ref, to_list]}
 
     n_before = length(before)

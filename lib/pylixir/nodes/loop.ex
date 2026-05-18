@@ -35,6 +35,7 @@ defmodule Pylixir.Nodes.Loop do
     Converter,
     LoopAnalysis,
     Naming,
+    TypeInfer,
     UnsupportedNodeError
   }
 
@@ -402,10 +403,14 @@ defmodule Pylixir.Nodes.Loop do
   defp emit_for_else(target, iter, body, orelse, context) do
     saved_scopes = context.scopes
     pre_loop_context = context
+    saved_types = context.types
 
+    iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
-    iter_ast = wrap_for_iter(iter_ast)
+    iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
     {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
+
+    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
 
     analysis = LoopAnalysis.analyze(body)
 
@@ -451,8 +456,8 @@ defmodule Pylixir.Nodes.Loop do
         _multi -> {:=, [], [threaded_bind_pattern, state_var]}
       end
 
-    # Restore scopes; re-bind threaded vars for the post-loop env.
-    context = %{context | scopes: saved_scopes}
+    # Restore scopes / types; re-bind threaded vars for the post-loop env.
+    context = %{context | scopes: saved_scopes, types: saved_types}
     context = Enum.reduce(threaded, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
 
     # Convert else body in the post-loop scope (sees threaded vars).
@@ -528,8 +533,9 @@ defmodule Pylixir.Nodes.Loop do
   defp emit_for(%{"target" => target, "iter" => iter, "body" => body}, context) do
     pre_loop_context = context
 
+    iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
-    iter_ast = wrap_for_iter(iter_ast)
+    iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
 
     # Save scopes BEFORE convert_loop_target (which binds the target)
     # so we can drop the target binding after the loop. Pylixir's
@@ -538,7 +544,13 @@ defmodule Pylixir.Nodes.Loop do
     # callback, so the context-level binding mustn't outlive the loop
     # either. Body-assigned threaded vars get re-bound below.
     saved_scopes = context.scopes
+    saved_types = context.types
     {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
+
+    # PR 10 — bind the for-target's type via `elem_of(iter_type)` so the
+    # body's converter sees `x: elem_t`. `Pattern` binding handles
+    # destructure (`for i, x in enumerate(xs)`).
+    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
 
     analysis = LoopAnalysis.analyze(body)
 
@@ -555,6 +567,7 @@ defmodule Pylixir.Nodes.Loop do
     context = %{context | loop_break_payload: payload_ast}
     {body_asts, context} = Converter.convert_each(body, context)
     context = %{context | loop_break_payload: saved}
+    context = %{context | types: saved_types}
 
     {result_ast, context} =
       case {threaded, flow} do
@@ -741,13 +754,4 @@ defmodule Pylixir.Nodes.Loop do
     end
   end
 
-  # Wrap a for-loop's iter expression in `py_iter_to_list/1` so Python
-  # iteration semantics match. Without it: `for k in some_dict:` yields
-  # `{k, v}` tuples (Elixir's Map Enumerable), not `k` (Python's dict
-  # iter). `py_iter_to_list/1` is a no-op pass-through for lists,
-  # converts maps to their keys, tuples to lists, strings to graphemes,
-  # and falls back to `Enum.to_list/1` for anything else (ranges, etc.).
-  # Cheap for the common list-iter case; the materialization cost on
-  # ranges is bounded by the iteration itself.
-  defp wrap_for_iter(iter_ast), do: {:py_iter_to_list, [], [iter_ast]}
 end
