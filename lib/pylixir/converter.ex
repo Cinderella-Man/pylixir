@@ -76,16 +76,18 @@ defmodule Pylixir.Converter do
     {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
     context = %{context | def_position: :module_top}
 
-    helpers = HelpersCodegen.helpers_ast()
+    py_main = py_main_def(stmt_asts)
+
+    emitted =
+      attr_asts ++
+        hoisted_asts ++
+        class_asts ++ fn_asts ++ context.while_helpers ++ [py_main]
+
+    helpers = HelpersCodegen.helpers_ast_for(emitted)
 
     moduledoc = moduledoc_ast(analysis.module_doc)
 
-    body_block =
-      moduledoc ++
-        helpers ++
-        attr_asts ++
-        hoisted_asts ++
-        class_asts ++ fn_asts ++ context.while_helpers ++ [py_main_def(stmt_asts)]
+    body_block = moduledoc ++ helpers ++ emitted
 
     defmodule_ast =
       {:defmodule, [],

@@ -16,6 +16,23 @@ defmodule Pylixir.HelpersCodegen do
   The slice approach (between sentinel comments) is intentionally text-based
   rather than AST-based — robust to additions, no need to filter `def` vs
   module attributes vs anything else inside the helpers module.
+
+  ## Tree-shaking (`helpers_ast_for/1`)
+
+  Splicing every helper into every generated module bloated the output by
+  several KB of `def`s that the user's code never called. `helpers_ast_for/1`
+  takes the *emitted user code AST* (everything that will be spliced after
+  the helpers in `TranslatedCode`), walks it for helper-name references,
+  computes the transitive closure against a compile-time dependency map,
+  and returns just the clauses needed.
+
+  Returned clauses stay as `def` (not `defp`): tree-shaking strips unused
+  *whole helpers*, but a kept helper like `truthy?` still has 9 clauses
+  the user code never matches against, and the Elixir compiler emits
+  per-clause "this clause is never used" warnings for `defp` based on
+  call-site pattern coverage. `def` suppresses those — the same reason
+  implementation.md §"Reason helpers are `def` not `defp`" gave for
+  pre-tree-shaking emission.
   """
 
   # The core helpers file plus per-topic submodule files. Each topic
@@ -62,6 +79,86 @@ defmodule Pylixir.HelpersCodegen do
                  end
                )
 
+  # Compile-time index: every `def` head unwrapped to `{name, args}`.
+  # Used to feed the by-name / order / deps tables below. Mirrors the
+  # `head` extraction shape that `@helper_names` already relied on.
+  @helper_heads (
+                  Enum.map(@helpers_ast, fn {:def, _, [head, _body_kw]} ->
+                    case head do
+                      {:when, _, [{n, _, a}, _guard]} -> {n, a || []}
+                      {n, _, a} -> {n, a || []}
+                    end
+                  end)
+                )
+
+  # `name -> [def_ast]`. Multi-clause helpers (e.g. `py_add` has 8
+  # clauses) must be spliced together; this map keeps them grouped.
+  @helpers_by_name (
+                    @helpers_ast
+                    |> Enum.zip(@helper_heads)
+                    |> Enum.reduce(%{}, fn {def_ast, {name, _args}}, acc ->
+                      Map.update(acc, name, [def_ast], &[def_ast | &1])
+                    end)
+                    |> Enum.into(%{}, fn {k, v} -> {k, Enum.reverse(v)} end)
+                  )
+
+  # First-seen order of helper names across the parsed source. Preserves
+  # the canonical emission order so output diffs after tree-shaking only
+  # show *removals*, not reorderings.
+  @helper_order (
+                  @helper_heads
+                  |> Enum.reduce({[], MapSet.new()}, fn {name, _}, {order, seen} ->
+                    if MapSet.member?(seen, name) do
+                      {order, seen}
+                    else
+                      {[name | order], MapSet.put(seen, name)}
+                    end
+                  end)
+                  |> elem(0)
+                  |> Enum.reverse()
+                )
+
+  @helper_name_set MapSet.new(@helper_order)
+
+  # `name -> [other_helper_name]`. For each clause body, prewalk for
+  # `{atom, _, _}` nodes whose atom is a known helper name. Catches
+  # both direct calls (`py_str(x)` → args is a list) AND capture-form
+  # references (`&py_str/1` → the inner `{:py_str, [], nil}` has nil
+  # as the args slot). Membership in `@helper_name_set` is the filter
+  # — bare local vars never share a helper name (helpers are `py_*`
+  # or end in `?`, neither of which appears in helper-body locals).
+  # Self-references are stripped so the closure walk doesn't churn.
+  # Stored as plain lists (not MapSets) to avoid Dialyzer's opaque-
+  # widening complaints on module attributes.
+  @helper_deps (
+                 helper_set = @helper_name_set
+
+                 for {name, clauses} <- @helpers_by_name, into: %{} do
+                   deps =
+                     clauses
+                     |> Enum.flat_map(fn {:def, _, [_head, kw]} ->
+                       body = Keyword.get(kw, :do)
+
+                       {_, found} =
+                         Macro.prewalk(body, [], fn
+                           {n, _, _} = node, acc when is_atom(n) ->
+                             if MapSet.member?(helper_set, n),
+                               do: {node, [n | acc]},
+                               else: {node, acc}
+
+                           other, acc ->
+                             {other, acc}
+                         end)
+
+                       found
+                     end)
+                     |> Enum.uniq()
+                     |> Enum.reject(&(&1 == name))
+
+                   {name, deps}
+                 end
+               )
+
   @doc """
   The verbatim helper-block source text, sliced between sentinels.
 
@@ -74,22 +171,75 @@ defmodule Pylixir.HelpersCodegen do
   @doc """
   The helper block parsed into a list of `def` AST nodes, ready to splice
   into a generated `defmodule TranslatedCode do ... end` body.
+
+  Used by tests; the Converter calls `helpers_ast_for/1` instead so the
+  output only carries helpers the user code actually reaches.
   """
   @spec helpers_ast() :: [Macro.t()]
   def helpers_ast, do: @helpers_ast
 
-  # Compute the set of `{name, arity}` pairs at Pylixir's compile time so
+  @doc """
+  Tree-shaken helper splice: walks `emitted_asts` for helper-name
+  references, expands transitively against the compile-time dep map,
+  and returns the matching clauses as `defp` ASTs in canonical order.
+
+  `emitted_asts` should be the list of AST nodes that will be spliced
+  into `TranslatedCode` *after* the helpers — module attrs, class
+  bodies, top-level defps, while-helpers, and the `py_main` def.
+  Returns `[]` when nothing references a helper.
+  """
+  @spec helpers_ast_for([Macro.t()]) :: [Macro.t()]
+  def helpers_ast_for(emitted_asts) when is_list(emitted_asts) do
+    roots = collect_helper_refs(emitted_asts)
+    needed = transitive_closure(roots)
+
+    for name <- @helper_order,
+        MapSet.member?(needed, name),
+        def_ast <- Map.fetch!(@helpers_by_name, name),
+        do: def_ast
+  end
+
+  defp collect_helper_refs(asts) do
+    Enum.reduce(asts, MapSet.new(), fn ast, acc ->
+      {_, found} =
+        Macro.prewalk(ast, acc, fn
+          {n, _, _} = node, a when is_atom(n) ->
+            if MapSet.member?(@helper_name_set, n),
+              do: {node, MapSet.put(a, n)},
+              else: {node, a}
+
+          other, a ->
+            {other, a}
+        end)
+
+      found
+    end)
+  end
+
+  defp transitive_closure(roots) do
+    expand(roots, roots)
+  end
+
+  defp expand(current, frontier) do
+    new_frontier =
+      frontier
+      |> Enum.flat_map(fn name -> Map.get(@helper_deps, name, []) end)
+      |> Enum.reject(&MapSet.member?(current, &1))
+      |> MapSet.new()
+
+    if MapSet.size(new_frontier) == 0 do
+      current
+    else
+      expand(MapSet.union(current, new_frontier), new_frontier)
+    end
+  end
+
+# Compute the set of `{name, arity}` pairs at Pylixir's compile time so
   # the linkage check (see `test/pylixir/helpers_linkage_test.exs`) costs
   # nothing at runtime. Helpers with a `when` guard wrap the head in
   # `{:when, _, [{name, _, args}, guard]}` — unwrap before extracting.
-  @helper_names @helpers_ast
-                |> Enum.map(fn {:def, _, [head, _body_kw]} ->
-                  {name, args} =
-                    case head do
-                      {:when, _, [{n, _, a}, _guard]} -> {n, a}
-                      {n, _, a} -> {n, a}
-                    end
-
+  @helper_names @helper_heads
+                |> Enum.map(fn {name, args} ->
                   arity = if is_list(args), do: length(args), else: 0
                   {name, arity}
                 end)
