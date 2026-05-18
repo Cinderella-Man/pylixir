@@ -164,17 +164,33 @@ defmodule Pylixir.Builtins do
     {:ok, apply_sorted_kw(base, coerced, kw)}
   end
 
+  # All iterator-consumers below wrap their iterable arg(s) in
+  # `py_iter_to_list/1` so Python's "strings/tuples/dicts/sets are all
+  # iterable" semantics holds. Otherwise `reversed("ab")` would emit
+  # `Enum.reverse("ab")` and crash with `protocol Enumerable not
+  # implemented for BitString` at runtime — a silent (transpiles-ok)
+  # bug. No-op for lists.
+
   def emit("reversed", [xs], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [xs]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [],
+        [{:py_iter_to_list, [], [xs]}]}}
 
   def emit("enumerate", [xs], kw), do: enumerate_call(xs, Map.get(kw, "start"))
   def emit("enumerate", [xs, start], _kw), do: enumerate_call(xs, start)
 
   def emit("zip", [a, b], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [a, b]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [],
+        [{:py_iter_to_list, [], [a]}, {:py_iter_to_list, [], [b]}]}}
 
   def emit("zip", [a, b | rest], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [[a, b | rest]]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [],
+        [Enum.map([a, b | rest], &{:py_iter_to_list, [], [&1]})]}}
 
   def emit("sum", [xs], _kw), do: emit_sum(xs, 0)
   def emit("sum", [xs, start], _kw), do: emit_sum(xs, start)
@@ -306,7 +322,10 @@ defmodule Pylixir.Builtins do
   def emit("Counter", [], _kw), do: {:ok, {:%{}, [], []}}
 
   def emit("Counter", [x], _kw),
-    do: {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [], [x]}}
+    do:
+      {:ok,
+       {{:., [], [{:__aliases__, [], [:Enum]}, :frequencies]}, [],
+        [{:py_iter_to_list, [], [x]}]}}
 
   # `defaultdict(factory)` — Elixir doesn't track the factory, so we
   # emit a plain `%{}` and rely on `py_getitem` returning `nil` for
@@ -403,7 +422,8 @@ defmodule Pylixir.Builtins do
           [[{:elem, [], nil}, {:acc, [], nil}], {:py_add, [], [{:acc, [], nil}, {:elem, [], nil}]}]}
        ]}
 
-    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [xs, start, reducer]}}
+    coerced = {:py_iter_to_list, [], [xs]}
+    {:ok, {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [coerced, start, reducer]}}
   end
 
   defp classify_float_literal(v) do
@@ -468,11 +488,13 @@ defmodule Pylixir.Builtins do
   # Lowers to `Enum.with_index/1` or `/2` and post-maps {x, i} → {i, x}
   # to match Python's tuple order.
   defp enumerate_call(xs, start) do
+    coerced = {:py_iter_to_list, [], [xs]}
+
     base =
       if start do
-        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs, start]}
+        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [coerced, start]}
       else
-        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [xs]}
+        {{:., [], [{:__aliases__, [], [:Enum]}, :with_index]}, [], [coerced]}
       end
 
     swap_fn =
