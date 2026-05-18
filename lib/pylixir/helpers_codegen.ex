@@ -188,16 +188,48 @@ defmodule Pylixir.HelpersCodegen do
   bodies, top-level defps, while-helpers, and the `py_main` def.
   Returns `[]` when nothing references a helper.
   """
-  @spec helpers_ast_for([Macro.t()]) :: [Macro.t()]
-  def helpers_ast_for(emitted_asts) when is_list(emitted_asts) do
+  @float_chain MapSet.new([
+                 :py_str_float,
+                 :python_sci,
+                 :shift_decimal,
+                 :drop_trailing_zero_decimal
+               ])
+
+  @spec helpers_ast_for([Macro.t()], keyword()) :: [Macro.t()]
+  def helpers_ast_for(emitted_asts, opts \\ []) when is_list(emitted_asts) do
     roots = collect_helper_refs(emitted_asts)
     needed = transitive_closure(roots)
+
+    drop_float = Keyword.get(opts, :drop_float, false)
+
+    # M6 — when no float reaches `py_str`, drop the entire
+    # `py_str_float` chain and post-process py_str to remove its
+    # is_float clause. Soundness: caller passes `drop_float: true`
+    # only after `ModuleAnalysis.uses_float` returned false.
+    needed = if drop_float, do: MapSet.difference(needed, @float_chain), else: needed
 
     for name <- @helper_order,
         MapSet.member?(needed, name),
         def_ast <- Map.fetch!(@helpers_by_name, name),
+        keep_clause?(name, def_ast, drop_float),
         do: def_ast
   end
+
+  defp keep_clause?(_name, _def_ast, false), do: true
+  defp keep_clause?(:py_str, def_ast, true), do: not is_float_guarded?(def_ast)
+  defp keep_clause?(_name, _def_ast, true), do: true
+
+  defp is_float_guarded?({:def, _, [{:when, _, [_head, guard]}, _body]}),
+    do: contains_is_float?(guard)
+
+  defp is_float_guarded?(_), do: false
+
+  defp contains_is_float?({:is_float, _, _args}), do: true
+
+  defp contains_is_float?({_op, _meta, args}) when is_list(args),
+    do: Enum.any?(args, &contains_is_float?/1)
+
+  defp contains_is_float?(_), do: false
 
   defp collect_helper_refs(asts) do
     Enum.reduce(asts, MapSet.new(), fn ast, acc ->

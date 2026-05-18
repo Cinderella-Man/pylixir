@@ -1,45 +1,5 @@
 defmodule TranslatedCode do
   @moduledoc "Church numerals"
-  def truthy?(nil) do
-    false
-  end
-
-  def truthy?(false) do
-    false
-  end
-
-  def truthy?(0) do
-    false
-  end
-
-  def truthy?(+0.0) do
-    false
-  end
-
-  def truthy?(-0.0) do
-    false
-  end
-
-  def truthy?("") do
-    false
-  end
-
-  def truthy?([]) do
-    false
-  end
-
-  def truthy?(%MapSet{} = s) do
-    MapSet.size(s) > 0
-  end
-
-  def truthy?(map) when is_map(map) and map_size(map) == 0 do
-    false
-  end
-
-  def truthy?(_) do
-    true
-  end
-
   def py_bool_to_int(true) do
     1
   end
@@ -339,7 +299,7 @@ defmodule TranslatedCode do
   (
     @doc "The successor of a value.\n       For numeric types, (1 +).\n    "
     def succ(x) do
-      if truthy?(is_integer(x) || is_boolean(x)) do
+      if is_integer(x) || is_boolean(x) do
         py_add(1, x)
       else
         List.to_string([1 + hd(String.to_charlist(x))])

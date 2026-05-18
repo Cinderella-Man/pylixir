@@ -228,8 +228,14 @@ defmodule Pylixir.Nodes.Functions do
         {def_ast, context}
 
       text when is_binary(text) ->
+        # M5 — return @doc + def as a flat list rather than a
+        # `__block__` tuple. `Pylixir.Converter`'s Module clause
+        # flat-maps fn_asts before splicing, so each member appears at
+        # module-top scope (no `(...)` wrapping from `Macro.to_string`
+        # rendering 2-item blocks). Each call site that handles a
+        # `FunctionDef` result must be ready for a list.
         doc_attr = {:@, [], [{:doc, [], [text]}]}
-        {{:__block__, [], [doc_attr, def_ast]}, context}
+        {[doc_attr, def_ast], context}
     end
   end
 

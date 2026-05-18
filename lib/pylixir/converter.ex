@@ -89,6 +89,16 @@ defmodule Pylixir.Converter do
     {attr_asts, context} = convert_module_attrs(analysis.module_attrs, context)
     {fn_asts, context} = convert_each(analysis.function_defs, context)
 
+    # M5 — `Pylixir.Nodes.Functions.emit_function_def/2` returns a list
+    # `[@doc, def]` when a docstring is present. Flatten here so each
+    # member appears at module-top scope (Macro.to_string would
+    # otherwise wrap a 2-item `__block__` in `(...)`).
+    fn_asts =
+      Enum.flat_map(fn_asts, fn
+        list when is_list(list) -> list
+        ast -> [ast]
+      end)
+
     # Runtime statements live inside py_main. FunctionDefs that appear
     # here are either (a) top-level defs demoted by ModuleAnalysis
     # because they close over mutable module state, or (b) Python defs
@@ -100,14 +110,25 @@ defmodule Pylixir.Converter do
     {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
     context = %{context | def_position: :module_top}
 
-    py_main = py_main_def(stmt_asts)
+    # M3 — drop empty `{:__block__, [], []}` and noop sentinels that
+    # surface as stray `nil` lines in the output (e.g. a hoisted
+    # `from functools import reduce` has no runtime alias left to
+    # bind, but currently still returns an empty block).
+    stmt_asts =
+      Enum.reject(stmt_asts, fn
+        {:__block__, _, []} -> true
+        nil -> true
+        _ -> false
+      end)
+
+    py_main = py_main_def(stmt_asts, analysis.uses_exit)
 
     emitted =
       attr_asts ++
         hoisted_asts ++
         class_asts ++ fn_asts ++ context.while_helpers ++ [py_main]
 
-    helpers = HelpersCodegen.helpers_ast_for(emitted)
+    helpers = HelpersCodegen.helpers_ast_for(emitted, drop_float: not analysis.uses_float)
 
     moduledoc = moduledoc_ast(analysis.module_doc)
 
@@ -750,6 +771,18 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "If", "test" => test, "body" => body, "orelse" => orelse}, context) do
+    # M2 — compile-time tautology const-fold. If the test resolves to
+    # a known constant comparison (e.g. `__name__ == "__main__"`, which
+    # is always true in Pylixir's runtime model), emit just the body
+    # or orelse directly. Skips the `if … do … end` wrapper.
+    case const_fold_if_test(test) do
+      {:ok, true} -> convert_body_inline(body, context)
+      {:ok, false} -> convert_body_inline(orelse, context)
+      :unknown -> convert_if_runtime(test, body, orelse, context)
+    end
+  end
+
+  defp convert_if_runtime(test, body, orelse, context) do
     # PR 11 — branch-isolated types. Type bindings introduced inside an
     # If body / orelse leak into the surrounding scope as `:any` (the
     # lub of "set in this branch" + "untouched in the other" is the
@@ -781,10 +814,54 @@ defmodule Pylixir.Converter do
     {ast, %{context | types: saved_types}}
   end
 
+  # M2 helpers — used by the If clause's const-fold pre-check.
+
+  defp convert_body_inline([], context), do: {nil, context}
+
+  defp convert_body_inline(stmts, context) when is_list(stmts) do
+    {asts, context} = convert_each(stmts, context)
+    {body_to_block(asts), context}
+  end
+
+  # Detect a Compare test that folds to a known boolean at convert
+  # time. Handles single-op `Eq`/`NotEq` whose operands both fold via
+  # `LiteralFold.fold/1` (with `__name__` special-cased to "__main__"
+  # to match Pylixir's Name clause).
+  defp const_fold_if_test(%{
+         "_type" => "Compare",
+         "left" => left,
+         "ops" => [%{"_type" => op_type}],
+         "comparators" => [right]
+       })
+       when op_type in ["Eq", "NotEq"] do
+    with {:ok, lv} <- fold_value(left),
+         {:ok, rv} <- fold_value(right) do
+      eq = lv == rv
+      {:ok, if(op_type == "Eq", do: eq, else: not eq)}
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp const_fold_if_test(_), do: :unknown
+
+  defp fold_value(%{"_type" => "Name", "id" => "__name__"}), do: {:ok, "__main__"}
+  defp fold_value(node), do: Pylixir.LiteralFold.fold(node)
+
   def convert(%{"_type" => "IfExp", "test" => test, "body" => body, "orelse" => orelse}, context) do
-    {test_ast, context} = convert_test(test, context)
-    {body_ast, context} = convert(body, context)
+    # M1 — type-narrow the body arm when `test` is an `isinstance(x, T)`
+    # call. Mirrors the If-statement clause's PR 12 path (line ~770).
+    # Save/restore types so the orelse arm doesn't see the body's
+    # narrowing.
+    saved_types = context.types
+    body_context = TypeInfer.IsinstanceNarrowing.narrow(test, context)
+
+    {test_ast, body_context} = convert_test(test, body_context)
+    {body_ast, body_context} = convert(body, body_context)
+
+    context = %{body_context | types: saved_types}
     {orelse_ast, context} = convert(orelse, context)
+
     {{:if, [], [test_ast, [do: body_ast, else: orelse_ast]]}, context}
   end
 
@@ -2232,8 +2309,24 @@ defmodule Pylixir.Converter do
     # `from itertools import permutations` despite our capture being
     # `&py_permutations/1`.
     context = %{context | stdlib_aliases: Map.put(context.stdlib_aliases, alias, {mod, name})}
-    {{:=, [], [alias_ref, rhs]}, context}
+
+    # M3 — skip the runtime binding for imports whose every call site
+    # inlines via `Stdlib.<Mod>.call/4`. Currently only
+    # `from itertools import repeat` (S5 inlined to `List.duplicate/2`
+    # at every call). The empty-block sentinel is filtered out of
+    # runtime statements in the Module clause. Caveat: if the user
+    # uses `repeat` as a value (`f = repeat; f(x, n)`), it'll fail at
+    # runtime — accepted trade-off since the value-form is vanishingly
+    # rare and `f` would have to look up an undefined local.
+    if dead_import_binding?(mod, name) do
+      {{:__block__, [], []}, context}
+    else
+      {{:=, [], [alias_ref, rhs]}, context}
+    end
   end
+
+  defp dead_import_binding?("itertools", "repeat"), do: true
+  defp dead_import_binding?(_, _), do: false
 
   defp reject_starred!(elts, container_type) do
     Enum.each(elts, fn
@@ -2619,23 +2712,26 @@ defmodule Pylixir.Converter do
   # `Pylixir.Nodes.Assign` go through `MutableModuleDict.get_ast/1`
   # and `MutableModuleDict.put_ast/2`.
 
-  defp py_main_def([]) do
+  defp py_main_def([], _uses_exit) do
     {:def, [], [{:py_main, [], nil}, [do: nil]]}
   end
 
-  defp py_main_def([single]) do
-    {:def, [], [{:py_main, [], nil}, [do: wrap_exit_catch(single)]]}
-  end
+  defp py_main_def(stmts, uses_exit) do
+    body =
+      case stmts do
+        [single] -> single
+        many -> {:__block__, [], many}
+      end
 
-  defp py_main_def(many) do
-    {:def, [], [{:py_main, [], nil}, [do: wrap_exit_catch({:__block__, [], many})]]}
+    body = if uses_exit, do: wrap_exit_catch(body), else: body
+    {:def, [], [{:py_main, [], nil}, [do: body]]}
   end
 
   # py_main catches `{:pylixir_exit, code}` so Python's `exit(code)`
-  # (lowered to a throw by `Builtins.emit("exit", ...)`) returns the code
-  # instead of killing the process. Always wrapped — the runtime cost is
-  # one stack frame, and conditional wrapping would need a Module-scope
-  # exit-usage scan.
+  # (lowered to a throw by `Builtins.emit("exit", ...)`) returns the
+  # code instead of killing the process. M4 — only emitted when
+  # `ModuleAnalysis.uses_exit` is true; modules without exit calls
+  # ship a bare `def py_main do ... end`.
   defp wrap_exit_catch(body) do
     code_ref = {:code, [], nil}
     catch_clause = ControlFlow.catch_exit(code_ref, code_ref)

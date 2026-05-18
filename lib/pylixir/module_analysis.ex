@@ -57,7 +57,19 @@ defmodule Pylixir.ModuleAnalysis do
           # `[{alias_name, original_name, mod_name, arity}]` — stdlib
           # imports we hoist to module-top defps. See `hoistable_imports/1`.
           hoisted_imports: [{String.t(), String.t(), String.t(), non_neg_integer()}],
-          module_doc: nil | String.t()
+          module_doc: nil | String.t(),
+          # M4 — true iff the module body contains a call to `exit()`
+          # or `sys.exit()` (or any import alias of `sys.exit`). When
+          # false, py_main's `try ... catch :throw, {:pylixir_exit, …}`
+          # wrapper is dead and the converter emits the body bare.
+          uses_exit: boolean(),
+          # M6 — true iff any Constant float / Div operator / float()
+          # cast / math.* float-returning call appears in the module
+          # body. When false, no Python-float value can reach `py_str`
+          # at runtime, so the `py_str_float` helper chain is dead
+          # weight and `helpers_ast_for/2` drops it + py_str's
+          # is_float clause.
+          uses_float: boolean()
         }
 
   defstruct module_attrs: [],
@@ -69,7 +81,9 @@ defmodule Pylixir.ModuleAnalysis do
             mutable_module_dicts: MapSet.new(),
             class_defs: [],
             hoisted_imports: [],
-            module_doc: nil
+            module_doc: nil,
+            uses_exit: false,
+            uses_float: false
 
   @mutation_methods ~w(append sort update add discard clear pop popleft remove extend insert reverse setdefault
                        intersection_update difference_update symmetric_difference_update)
@@ -195,9 +209,75 @@ defmodule Pylixir.ModuleAnalysis do
       mutable_module_dicts: mutable_module_dicts,
       class_defs: class_defs,
       hoisted_imports: hoisted_imports,
-      module_doc: module_doc
+      module_doc: module_doc,
+      uses_exit: uses_exit?(body),
+      uses_float: uses_float?(body)
     }
   end
+
+  # M4 — walk the whole module body (including nested defs / lambdas /
+  # branches) looking for a Call to `exit` or `sys.exit`. Used to
+  # decide whether `py_main`'s body needs the `try ... catch :throw,
+  # {:pylixir_exit, _}` wrapper.
+  defp uses_exit?(body), do: Enum.any?(body, &exit_call_in?/1)
+
+  defp exit_call_in?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "exit"}}),
+    do: true
+
+  defp exit_call_in?(%{
+         "_type" => "Call",
+         "func" => %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => "sys"},
+           "attr" => "exit"
+         }
+       }),
+       do: true
+
+  defp exit_call_in?(node) when is_map(node) do
+    node
+    |> Map.delete("_type")
+    |> Enum.any?(fn {_k, v} -> exit_call_in?(v) end)
+  end
+
+  defp exit_call_in?(list) when is_list(list), do: Enum.any?(list, &exit_call_in?/1)
+  defp exit_call_in?(_leaf), do: false
+
+  # M6 — does any node in the module produce or carry a Python float
+  # value? Used to decide whether `py_str`'s `is_float` clause + its
+  # `py_str_float` chain can be dropped from the helper preamble.
+  #
+  # Conservative: false-negatives (we miss a float source) would
+  # silently produce wrong stdout when py_str's catch-all hit a float
+  # via `to_string/1`. False-positives just keep the chain.
+  @math_float_returning ~w(sqrt cos sin tan log log2 log10 exp atan asin acos atan2 hypot pow ceil floor sinh cosh tanh asinh acosh atanh degrees radians erf erfc gamma lgamma)
+  defp uses_float?(body), do: Enum.any?(body, &float_node_in?/1)
+
+  defp float_node_in?(%{"_type" => "Constant", "value" => v}) when is_float(v), do: true
+  defp float_node_in?(%{"_type" => "BinOp", "op" => %{"_type" => "Div"}}), do: true
+
+  defp float_node_in?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "float"}}),
+    do: true
+
+  defp float_node_in?(%{
+         "_type" => "Call",
+         "func" => %{
+           "_type" => "Attribute",
+           "value" => %{"_type" => "Name", "id" => "math"},
+           "attr" => attr
+         }
+       })
+       when attr in @math_float_returning,
+       do: true
+
+  defp float_node_in?(node) when is_map(node) do
+    node
+    |> Map.delete("_type")
+    |> Enum.any?(fn {_k, v} -> float_node_in?(v) end)
+  end
+
+  defp float_node_in?(list) when is_list(list), do: Enum.any?(list, &float_node_in?/1)
+  defp float_node_in?(_leaf), do: false
 
   # `from <stdlib> import <name>` cases where the binding is a
   # pure (capture-free) function — hoistable to a module-top defp
