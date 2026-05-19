@@ -84,8 +84,7 @@ defmodule Pylixir.SlimmingTest do
       ],
       must_contain: ["Integer.mod", "Integer.to_string"],
       max_lines: 20,
-      stdout:
-        "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n"
+      stdout: "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n"
     },
     "11_pow_int_specialised.py" => %{
       # Three Pow specialisations all need to fire:

@@ -37,7 +37,12 @@ defmodule Pylixir.TypeInfer.Signatures do
     final_sigs =
       Enum.reduce_while(1..@max_rounds, initial_sigs, fn _round, sigs ->
         next =
-          compute_round(typeable_defs, external_sources, %{ctx | fn_signatures: sigs}, annotated_sigs)
+          compute_round(
+            typeable_defs,
+            external_sources,
+            %{ctx | fn_signatures: sigs},
+            annotated_sigs
+          )
 
         if next == sigs, do: {:halt, next}, else: {:cont, next}
       end)

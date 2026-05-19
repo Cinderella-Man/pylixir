@@ -59,6 +59,14 @@ defmodule Mix.Tasks.Eval.Run do
     Mix.Task.run("app.start")
     Eval.CompilePool.ensure_started()
 
+    # Suppress Python warnings (e.g. `SyntaxWarning: invalid escape
+    # sequence`) from `Pylixir.python_ast/1`'s `python3` subprocess.
+    # They leak through `System.cmd(..., stderr_to_stdout: false)` to
+    # this task's terminal, can't be acted on, and aren't recorded in
+    # the per-sample bucket — pure noise during a 10k-sample run.
+    # `PYTHONWARNINGS` propagates to every child python process.
+    System.put_env("PYTHONWARNINGS", "ignore")
+
     eval_opts =
       opts
       |> Keyword.put(:offset, opts[:skip])
@@ -73,6 +81,7 @@ defmodule Mix.Tasks.Eval.Run do
 
     IO.puts("")
     IO.puts("report: #{run_dir}")
+    IO.puts("elapsed: #{format_elapsed(elapsed_ms(progress))}")
     print_top_buckets(accumulator)
   end
 
@@ -120,6 +129,21 @@ defmodule Mix.Tasks.Eval.Run do
       rem(n, 25) == 0 -> IO.write("\rprocessed: #{n}")
       true -> :ok
     end
+  end
+
+  defp elapsed_ms({_ref, _limit, start}),
+    do: System.monotonic_time(:millisecond) - start
+
+  # Format an elapsed-ms count as `Xm Ys` for runs ≥ 1 minute, `Y.Zs`
+  # for shorter runs. Sub-minute fractional precision helps when
+  # iterating on small `--limit` smoke tests; rounded seconds are
+  # plenty for the 10k-sample full-run case.
+  defp format_elapsed(ms) when ms < 60_000,
+    do: "#{:erlang.float_to_binary(ms / 1000, decimals: 1)}s"
+
+  defp format_elapsed(ms) do
+    total_s = div(ms, 1000)
+    "#{div(total_s, 60)}m #{rem(total_s, 60)}s"
   end
 
   defp print_top_buckets(%{counts: counts}) when map_size(counts) == 0 do

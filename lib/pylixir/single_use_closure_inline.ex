@@ -131,7 +131,7 @@ defmodule Pylixir.SingleUseClosureInline do
          "body" => body
        })
        when is_list(body) and body != [] do
-    if simple_args?(args) and arg_names(args) == [] do
+    if simple_args?(args) and arg_names(args) == [] and not body_has_function_exit?(body) do
       {:ok, name, [], strip_leading_docstring(body), :statement}
     else
       :no
@@ -327,6 +327,32 @@ defmodule Pylixir.SingleUseClosureInline do
        do: true
 
   defp name_eq_main_test?(_), do: false
+
+  # Statement-position inline splices a `def f(): body` body into the
+  # call site. If `body` carries a `Return` (or `Yield` — making it a
+  # generator), the spliced node loses its enclosing function: a
+  # module-scope `Return` is a Python SyntaxError, and `Yield` only
+  # makes sense inside a generator. Walk `body` looking for those at
+  # *this* function's level — descend through control-flow (If/For/
+  # While/Try/With) but stop at nested defs/lambdas/classes, whose
+  # Returns belong to their own enclosing function.
+  defp body_has_function_exit?(node) when is_map(node) do
+    case Map.get(node, "_type") do
+      "Return" -> true
+      "Yield" -> true
+      "YieldFrom" -> true
+      "FunctionDef" -> false
+      "AsyncFunctionDef" -> false
+      "Lambda" -> false
+      "ClassDef" -> false
+      _ -> node |> Map.delete("_type") |> Enum.any?(fn {_k, v} -> body_has_function_exit?(v) end)
+    end
+  end
+
+  defp body_has_function_exit?(list) when is_list(list),
+    do: Enum.any?(list, &body_has_function_exit?/1)
+
+  defp body_has_function_exit?(_), do: false
 
   # PEP 257: a function body's first statement that is a string
   # Constant is the docstring. Mirror `Pylixir.Nodes.Functions`'

@@ -15,7 +15,24 @@ defmodule Pylixir.Stdlib.Math do
 
   @impl true
   def attribute(["pi"], _node), do: {:ok, {{:., [], [:math, :pi]}, [], []}}
-  def attribute(["e"], _node), do: {:ok, {{:., [], [:math, :e]}, [], []}}
+  # Erlang has no `:math.e/0` BIF (only `:math.pi/0`). CPython's
+  # `math.e` is the IEEE-754 double Euler's number 2.718281828459045 —
+  # emit it as a literal float so the runtime value matches byte-for-
+  # byte without a `:math.exp(1)` runtime call.
+  def attribute(["e"], _node), do: {:ok, 2.718281828459045}
+
+  # `math.gcd` used as a value (not a call) — e.g. `reduce(math.gcd,
+  # xs)`. Emit a 2-arg function capture to Elixir's `Integer.gcd/2`;
+  # matches Python's `math.gcd(a, b)` semantics and is what the call
+  # path emits (`Pylixir.Stdlib.Math.call(["gcd"], [a, b], …)`).
+  # `math.gcd` is variadic in Python ≥3.9, but every realistic use as
+  # a value (reduce, sorted-key) calls it with exactly two args.
+  def attribute(["gcd"], _node) do
+    int_gcd =
+      {{:., [], [{:__aliases__, [], [:Integer]}, :gcd]}, [no_parens: true], []}
+
+    {:ok, {:&, [], [{:/, [], [int_gcd, 2]}]}}
+  end
 
   def attribute(["tau"], _node),
     do: {:ok, {:*, [], [2, {{:., [], [:math, :pi]}, [], []}]}}

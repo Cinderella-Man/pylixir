@@ -527,12 +527,15 @@ defmodule Pylixir.Converter do
 
             cond do
               MapSet.size(context.class_names) > 0 and
-                  value_type in ["Name", "Attribute"] ->
+                  value_type in ["Name", "Attribute", "Subscript"] ->
                 # Depth-N attribute read: `obj.outer.inner.…` lowers to
                 # `Map.fetch!(Map.fetch!(obj, :outer), :inner)`. Recursive
                 # via the inner Attribute case. Pylixir doesn't track
                 # aliasing — chained reads return the field values as
-                # of the most recent rebind of the root.
+                # of the most recent rebind of the root. `Subscript` is
+                # included so `xs[i].attr` / `m[i][j].attr` reads work
+                # for adjacency-list / network-flow shapes — the inner
+                # Subscript lowers to `py_getitem(...)`.
                 {value_ast, context} = convert(value, context)
                 attr_atom = String.to_atom(attr)
 
@@ -1136,12 +1139,15 @@ defmodule Pylixir.Converter do
   #     fold to `{:ok, true}`. The orelse-elision case (`{:ok, false}`)
   #     stays out of scope until call-graph-driven monomorphization
   #     lands.
-  defp const_fold_if_test(%{
-         "_type" => "Compare",
-         "left" => left,
-         "ops" => [%{"_type" => op_type}],
-         "comparators" => [right]
-       }, _context)
+  defp const_fold_if_test(
+         %{
+           "_type" => "Compare",
+           "left" => left,
+           "ops" => [%{"_type" => op_type}],
+           "comparators" => [right]
+         },
+         _context
+       )
        when op_type in ["Eq", "NotEq"] do
     with {:ok, lv} <- fold_value(left),
          {:ok, rv} <- fold_value(right) do
@@ -1243,6 +1249,18 @@ defmodule Pylixir.Converter do
             Nodes.Mutations.emit_subscript(
               coll_name,
               slice,
+              method,
+              args,
+              kwargs,
+              source_node,
+              context
+            )
+
+          {:subscript2, coll_name, slice_outer, slice_inner, method, args, kwargs, source_node} ->
+            Nodes.Mutations.emit_subscript2(
+              coll_name,
+              slice_outer,
+              slice_inner,
               method,
               args,
               kwargs,
@@ -1523,7 +1541,8 @@ defmodule Pylixir.Converter do
 
   defp bin_op_ast(%{"_type" => "FloorDiv"}, l, r, _node, lt, rt) do
     cond do
-      bool_tainted_pair?(lt, rt) -> {:py_floor_div, [], [l, r]}
+      bool_tainted_pair?(lt, rt) ->
+        {:py_floor_div, [], [l, r]}
 
       TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) ->
         {{:., [], [{:__aliases__, [], [:Integer]}, :floor_div]}, [], [l, r]}
@@ -1544,7 +1563,8 @@ defmodule Pylixir.Converter do
   # in Elixir.
   defp bin_op_ast(%{"_type" => "Mod"}, l, r, _node, lt, rt) do
     cond do
-      bool_tainted_pair?(lt, rt) -> {:py_mod, [], [l, r]}
+      bool_tainted_pair?(lt, rt) ->
+        {:py_mod, [], [l, r]}
 
       TypeInfer.is_int?(lt) and TypeInfer.is_int?(rt) ->
         {{:., [], [{:__aliases__, [], [:Integer]}, :mod]}, [], [l, r]}
@@ -1553,6 +1573,7 @@ defmodule Pylixir.Converter do
         {:py_mod, [], [l, r]}
     end
   end
+
   defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsl, l, r)
   defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsr, l, r)
   # Python's `|` / `&` / `^` are overloaded: bitwise on ints, set ops
@@ -1729,6 +1750,60 @@ defmodule Pylixir.Converter do
 
     context = bind_name(context, obj_name)
     {{:=, [], [obj_ref, map_put]}, context}
+  end
+
+  # `<coll>[<slice>].<attr> += value` — AugAssign on an Attribute whose
+  # receiver is a depth-1 Subscript on a Name. Common in network-flow /
+  # adjacency-list code: `edges[i].cap -= flow`. Lowers by rebinding
+  # the coll: `coll = py_setitem(coll, i, Map.put(py_getitem(coll, i),
+  # :attr, Map.fetch!(py_getitem(coll, i), :attr) <op> value))`.
+  # `slice` is temp-bound when non-trivial (it appears twice in the
+  # output, once in `py_getitem`, once in `py_setitem`).
+  defp aug_assign(
+         %{
+           "_type" => "Attribute",
+           "value" => %{
+             "_type" => "Subscript",
+             "value" => %{"_type" => "Name", "id" => coll_name},
+             "slice" => slice
+           },
+           "attr" => attr
+         },
+         op,
+         value,
+         node,
+         context
+       ) do
+    {value_ast, context} = convert(value, context)
+    {slice_ref, slice_binding, context} = maybe_temp_bind(slice, context)
+
+    coll_atom = coll_name |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+    attr_atom = String.to_atom(attr)
+
+    elem_get = {:py_getitem, [], [coll_ref, slice_ref]}
+
+    attr_read =
+      {{:., [], [{:__aliases__, [], [:Map]}, :fetch!]}, [], [elem_get, attr_atom]}
+
+    combined = bin_op_ast(op, attr_read, value_ast, node)
+
+    new_elem =
+      {{:., [], [{:__aliases__, [], [:Map]}, :put]}, [], [elem_get, attr_atom, combined]}
+
+    setitem = {:py_setitem, [], [coll_ref, slice_ref, new_elem]}
+    assign = {:=, [], [coll_ref, setitem]}
+
+    context = TypeInfer.demote(context, coll_name)
+    context = bind_name(context, coll_name)
+
+    ast =
+      case slice_binding do
+        nil -> assign
+        b -> {:__block__, [], [b, assign]}
+      end
+
+    {ast, context}
   end
 
   # `<obj>.<attr>[<slice>] += value` — common FenwickTree / SegmentTree

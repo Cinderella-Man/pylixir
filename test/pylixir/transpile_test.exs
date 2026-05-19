@@ -245,6 +245,38 @@ defmodule Pylixir.TranspileTest do
       end
     end
 
+    test "runtime-init list (`list(range(n+1))`) mutated inside a def is rejected" do
+      # Sibling of the literal-init rejection. A non-literal Call init
+      # (`parent = list(range(n + 1))`) used to slip past the promotable
+      # path — `mutation_free_literal_names` filters non-literals out —
+      # and emerged as broken Elixir: the def closed over `parent` but
+      # the demoted closure couldn't write the mutation back to py_main's
+      # binding. Catch it loudly with the same hint surface.
+      if python_available?() do
+        src = """
+        n = 4
+        parent = list(range(n + 1))
+
+        def find(u):
+            while parent[u] != u:
+                parent[u] = parent[parent[u]]
+                u = parent[u]
+            return u
+
+        print(find(2))
+        """
+
+        err =
+          assert_raise UnsupportedNodeError, fn ->
+            Pylixir.transpile(src)
+          end
+
+        assert err.node_type == "Module"
+        assert err.hint =~ "parent"
+        assert err.hint =~ "closures capture by value"
+      end
+    end
+
     test "method-call mutation (.append) of a module list inside a def is also rejected" do
       if python_available?() do
         src = """

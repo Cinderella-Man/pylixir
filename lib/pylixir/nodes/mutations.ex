@@ -5,18 +5,20 @@ defmodule Pylixir.Nodes.Mutations do
 
   Pylixir treats Python's mutable containers as Elixir immutables: the
   statement `xs.append(x)` lowers to `xs = xs ++ [x]` rather than a true
-  in-place mutation. The classifier `detect/1` recognises two target
+  in-place mutation. The classifier `detect/1` recognises three target
   shapes:
 
-    * `xs.method(args)`      — bare Name target; `{:name, …}` tuple.
-    * `coll[i].method(args)` — depth-1 Subscript target rooted at a
-      bare Name; `{:subscript, …}` tuple. Caller dispatches to
-      `emit/6` or `emit_subscript/7` accordingly.
+    * `xs.method(args)`         — bare Name target; `{:name, …}` tuple.
+    * `coll[i].method(args)`    — depth-1 Subscript target rooted at a
+      bare Name; `{:subscript, …}` tuple.
+    * `coll[i][j].method(args)` — depth-2 Subscript rooted at a bare
+      Name; `{:subscript2, …}` tuple. Common in `adj[i][j].append(…)`
+      adjacency-list shapes.
 
-  The Subscript form rebinds the root: `coll[i].append(x)` lowers to
+  The Subscript forms rebind the root: `coll[i].append(x)` lowers to
   `coll = py_setitem(coll, i, py_getitem(coll, i) ++ [x])`. The slice
   is temp-bound when non-trivial to preserve single-eval semantics.
-  Deeper chains (`m[i][j].method(args)`) are not yet supported.
+  Chains deeper than two are not yet supported.
   """
 
   alias Pylixir.{Converter, Naming, TypeInfer, UnsupportedNodeError}
@@ -33,6 +35,7 @@ defmodule Pylixir.Nodes.Mutations do
           :none
           | {:name, String.t(), String.t(), [map()], [map()], map()}
           | {:subscript, String.t(), map(), String.t(), [map()], [map()], map()}
+          | {:subscript2, String.t(), map(), map(), String.t(), [map()], [map()], map()}
           | {:obj_attr_subscript, String.t(), String.t(), map(), String.t(), [map()], [map()],
              map()}
   def detect(
@@ -74,6 +77,37 @@ defmodule Pylixir.Nodes.Mutations do
     if attr in @methods do
       kwargs_raw = Map.get(source, "keywords", [])
       {:subscript, name, slice, attr, args, kwargs_raw, source}
+    else
+      :none
+    end
+  end
+
+  # `name[outer][inner].method(args)` — depth-2 Subscript rooted at a
+  # bare Name. Common in `adj[i][j].append(x)` adjacency-list patterns
+  # produced by `adj = [[[] for _ in range(n)] for _ in range(n)]`.
+  def detect(
+        %{
+          "_type" => "Call",
+          "func" => %{
+            "_type" => "Attribute",
+            "value" => %{
+              "_type" => "Subscript",
+              "value" => %{
+                "_type" => "Subscript",
+                "value" => %{"_type" => "Name", "id" => name},
+                "slice" => slice_outer
+              },
+              "slice" => slice_inner
+            },
+            "attr" => attr
+          },
+          "args" => args
+        } = source
+      )
+      when attr != nil do
+    if attr in @methods do
+      kwargs_raw = Map.get(source, "keywords", [])
+      {:subscript2, name, slice_outer, slice_inner, attr, args, kwargs_raw, source}
     else
       :none
     end
@@ -163,6 +197,59 @@ defmodule Pylixir.Nodes.Mutations do
       case slice_binding do
         nil -> assign
         b -> {:__block__, [], [b, assign]}
+      end
+
+    {ast, context}
+  end
+
+  # `coll[outer][inner].method(args)` — depth-2 Subscript form. Lowers
+  # to a nested py_setitem: rebind `coll[outer]`'s inner slot with the
+  # mutated value, then rebind `coll` with the updated inner slot.
+  # Both slices are temp-bound when non-trivial (each appears twice).
+  @spec emit_subscript2(
+          String.t(),
+          map(),
+          map(),
+          String.t(),
+          [map()],
+          [map()],
+          map(),
+          Pylixir.Context.t()
+        ) :: {Macro.t(), Pylixir.Context.t()}
+  def emit_subscript2(
+        coll_name,
+        slice_outer,
+        slice_inner,
+        method,
+        args,
+        kwargs_raw,
+        source,
+        context
+      ) do
+    {arg_asts, context} = Converter.convert_each(args, context)
+    {kwargs, context} = Converter.convert_keywords(kwargs_raw, context)
+    {outer_ref, outer_binding, context} = Converter.maybe_temp_bind(slice_outer, context)
+    {inner_ref, inner_binding, context} = Converter.maybe_temp_bind(slice_inner, context)
+
+    coll_atom = coll_name |> Naming.rewrite() |> String.to_atom()
+    coll_ref = {coll_atom, [], nil}
+
+    outer_get = {:py_getitem, [], [coll_ref, outer_ref]}
+    inner_get = {:py_getitem, [], [outer_get, inner_ref]}
+    new_inner_value = mutation_rhs(method, inner_get, arg_asts, kwargs, source)
+    new_outer = {:py_setitem, [], [outer_get, inner_ref, new_inner_value]}
+    setitem = {:py_setitem, [], [coll_ref, outer_ref, new_outer]}
+    assign = {:=, [], [coll_ref, setitem]}
+
+    context = TypeInfer.demote(context, coll_name)
+    context = Converter.bind_name(context, coll_name)
+
+    bindings = Enum.reject([outer_binding, inner_binding], &is_nil/1)
+
+    ast =
+      case bindings do
+        [] -> assign
+        bs -> {:__block__, [], bs ++ [assign]}
       end
 
     {ast, context}

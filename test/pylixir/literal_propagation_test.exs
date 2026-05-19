@@ -258,7 +258,9 @@ defmodule Pylixir.LiteralPropagationTest do
     test "\"%s and %s\" % (a, b) folds with tuple-arg" do
       [stmt] =
         LiteralPropagation.rewrite([
-          expr_stmt(binop("Mod", constant("%s and %s"), tuple_lit([constant("foo"), constant("bar")])))
+          expr_stmt(
+            binop("Mod", constant("%s and %s"), tuple_lit([constant("foo"), constant("bar")]))
+          )
         ])
 
       assert stmt["value"] == %{
@@ -273,18 +275,16 @@ defmodule Pylixir.LiteralPropagationTest do
     test "\"{} {}\".format(a, b) folds with two literal args" do
       [stmt] =
         LiteralPropagation.rewrite([
-          expr_stmt(
-            %{
-              "_type" => "Call",
-              "func" => %{
-                "_type" => "Attribute",
-                "value" => constant("{} and {}"),
-                "attr" => "format"
-              },
-              "args" => [constant("foo"), constant(42)],
-              "keywords" => []
-            }
-          )
+          expr_stmt(%{
+            "_type" => "Call",
+            "func" => %{
+              "_type" => "Attribute",
+              "value" => constant("{} and {}"),
+              "attr" => "format"
+            },
+            "args" => [constant("foo"), constant(42)],
+            "keywords" => []
+          })
         ])
 
       assert stmt["value"] == %{"_type" => "Constant", "value" => "foo and 42", "kind" => nil}
@@ -293,18 +293,16 @@ defmodule Pylixir.LiteralPropagationTest do
     test "{!r} converts via repr" do
       [stmt] =
         LiteralPropagation.rewrite([
-          expr_stmt(
-            %{
-              "_type" => "Call",
-              "func" => %{
-                "_type" => "Attribute",
-                "value" => constant("{!r}"),
-                "attr" => "format"
-              },
-              "args" => [constant("foo")],
-              "keywords" => []
-            }
-          )
+          expr_stmt(%{
+            "_type" => "Call",
+            "func" => %{
+              "_type" => "Attribute",
+              "value" => constant("{!r}"),
+              "attr" => "format"
+            },
+            "args" => [constant("foo")],
+            "keywords" => []
+          })
         ])
 
       assert stmt["value"] == %{"_type" => "Constant", "value" => "'foo'", "kind" => nil}

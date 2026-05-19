@@ -178,6 +178,16 @@ defmodule Pylixir.ModuleAnalysis do
       # closure), so they don't need to drive demotion.
       |> MapSet.difference(mutable_module_dicts)
 
+    # Runtime-valued (non-literal) module-level bindings that get
+    # *mutated* inside a top-level def are a silent semantic gap.
+    # The promotable path already rejects literal counterparts via
+    # `reject_mutated_in_top_defs!/2`; the same shape with a Call
+    # init (`parent = list(range(n+1))`) used to slip through and
+    # produce broken Elixir (the def closed over a name that the
+    # demoted closure couldn't write back to). Catch it loudly with
+    # the same hint surface.
+    reject_mutated_runtime_bindings!(body_no_classes, mutable_module_names)
+
     {fns, demoted_fns} = demote_closures(fns, mutable_module_names)
 
     # N1 — dead-demoted-fn elim. A demoted-fn becomes a `name = fn ...
@@ -630,16 +640,16 @@ defmodule Pylixir.ModuleAnalysis do
 
   defp collect_assigned_names(%{"_type" => "Assign", "targets" => targets}, acc) do
     Enum.reduce(targets, acc, fn t, a ->
-      Enum.reduce(target_names(t), a, &MapSet.put(&2, &1))
+      Enum.reduce(binding_target_names(t), a, &MapSet.put(&2, &1))
     end)
   end
 
   defp collect_assigned_names(%{"_type" => "AugAssign", "target" => t}, acc) do
-    Enum.reduce(target_names(t), acc, &MapSet.put(&2, &1))
+    Enum.reduce(binding_target_names(t), acc, &MapSet.put(&2, &1))
   end
 
   defp collect_assigned_names(%{"_type" => "For", "target" => t, "body" => b, "orelse" => o}, acc) do
-    acc = Enum.reduce(target_names(t), acc, &MapSet.put(&2, &1))
+    acc = Enum.reduce(binding_target_names(t), acc, &MapSet.put(&2, &1))
     acc = collect_assigned_names(b, acc)
     collect_assigned_names(o || [], acc)
   end
@@ -669,7 +679,7 @@ defmodule Pylixir.ModuleAnalysis do
       Enum.reduce(items, acc, fn item, a ->
         case item["optional_vars"] do
           nil -> a
-          tgt -> Enum.reduce(target_names(tgt), a, &MapSet.put(&2, &1))
+          tgt -> Enum.reduce(binding_target_names(tgt), a, &MapSet.put(&2, &1))
         end
       end)
 
@@ -680,6 +690,28 @@ defmodule Pylixir.ModuleAnalysis do
     do: MapSet.put(acc, name)
 
   defp collect_assigned_names(_, acc), do: acc
+
+  # `target_names/1` returns the root Name for Subscript/Attribute
+  # targets — useful for mutation tracking at module level (a
+  # `parent[i] = ...` flags `parent` as needing closure capture). For
+  # function-local detection it's the *opposite*: `parent[i] = ...`
+  # does NOT rebind `parent`; Python keeps it as a free reference to
+  # an outer-scope name. Collecting the Subscript root here would
+  # falsely shadow the closure and skip the demotion that turns a
+  # `defp` caller into a closure inside `py_main`. So restrict to
+  # Name / Tuple-of-Name / List-of-Name / Starred-of-Name targets.
+  defp binding_target_names(%{"_type" => "Name", "id" => id}), do: [id]
+
+  defp binding_target_names(%{"_type" => "Tuple", "elts" => elts}),
+    do: Enum.flat_map(elts, &binding_target_names/1)
+
+  defp binding_target_names(%{"_type" => "List", "elts" => elts}),
+    do: Enum.flat_map(elts, &binding_target_names/1)
+
+  defp binding_target_names(%{"_type" => "Starred", "value" => v}),
+    do: binding_target_names(v)
+
+  defp binding_target_names(_), do: []
 
   # Does this node reference any of `names` as a free variable (not
   # shadowed by `locals`)? Pre-order recursive over the AST; descends
@@ -1114,6 +1146,34 @@ defmodule Pylixir.ModuleAnalysis do
     end
   end
 
+  # Same shape as `reject_mutated_in_top_defs!/2` but for runtime-
+  # valued (non-literal) module-level Assigns — `parent = list(range(n+1))`,
+  # `seen = set()`, etc. The promotable path can't catch these because
+  # `literal_assign_name/1` filters non-literals out. Demoting the
+  # closing-def to a `name = fn -> ... end` inside py_main moves the
+  # binding into the closure's scope but Elixir closures can't write
+  # back to a captured variable across calls — so a `parent[u] = v`
+  # inside the closure silently drops on the floor between invocations.
+  defp reject_mutated_runtime_bindings!(body, mutable_names) do
+    mutable_names
+    |> Enum.find(fn name -> mutated_inside_top_def?(body, name) end)
+    |> case do
+      nil ->
+        :ok
+
+      name ->
+        raise Pylixir.UnsupportedNodeError,
+          node_type: "Module",
+          hint:
+            "module-level `#{name} = ...` is mutated inside a top-level `def` " <>
+              "(e.g. `#{name}[x] = ...` or `#{name}.append(...)`). Pylixir would " <>
+              "demote the def to a closure inside py_main, but Elixir closures " <>
+              "capture by value — the mutation cannot persist across calls. " <>
+              "Refactor to pass `#{name}` explicitly through return values, or " <>
+              "thread it as a function argument."
+    end
+  end
+
   defp mutated_inside_top_def?(body, name) do
     Enum.any?(body, fn
       %{"_type" => type, "body" => def_body}
@@ -1189,6 +1249,31 @@ defmodule Pylixir.ModuleAnalysis do
                "value" => %{
                  "_type" => "Subscript",
                  "value" => %{"_type" => "Name", "id" => target_name}
+               },
+               "attr" => method
+             }
+           }
+         },
+         name
+       )
+       when method in @mutation_methods,
+       do: target_name == name
+
+  # `coll[i][j].method(args)` — depth-2 form. Same rebind shape via
+  # `Mutations.emit_subscript2`.
+  defp mutates_name?(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{
+               "_type" => "Attribute",
+               "value" => %{
+                 "_type" => "Subscript",
+                 "value" => %{
+                   "_type" => "Subscript",
+                   "value" => %{"_type" => "Name", "id" => target_name}
+                 }
                },
                "attr" => method
              }
