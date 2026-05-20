@@ -2,36 +2,41 @@ defmodule Eval do
   @moduledoc """
   Orchestrates the dataset evaluation pipeline:
 
-      Eval.Stream.stream/1
+      Eval.Corpus.build/1                          # joined seed_sft + seed_testcase
         ↳ Task.async_stream(&attempt/2)
-            ↳ Python preflight (cached) → Pylixir.transpile → compile (+ execute)
-            ↳ Eval.Bucket.classify/2
+            ↳ Pylixir.transpile  →  Compile.check_and_execute_testcases
+                ↳ per testcase: Python preflight (cached) + Elixir run + 4-way classify
+            ↳ Eval.Bucket.classify/2 (worst-of rollup)
                 ↳ accumulator that holds counts + first K samples per bucket
 
   `run/1` returns the accumulator. `Eval.Report.write/2` consumes it.
 
-  ## Behavioral equivalence (`:execute` opt, default `true`)
+  ## Per-testcase semantics
 
-  When enabled, each sample is run through CPython first (twice, for a
-  determinism check) and the resulting stdout cached at
-  `tools/eval/cache/python.jsonl`. Then the transpiled Elixir's
-  `py_main/0` runs under `Eval.Execute.run_elixir/2`; its stdout is
-  byte-compared against the cached Python stdout. See `Eval.Bucket`
-  for the resulting bucket keys.
+  Each sample carries a list of `%{stdin, expected}` testcases drawn
+  from `seed_testcase`. For each testcase, we run CPython with that
+  stdin (cached by `sha256(source <> \"\\0\" <> stdin)`) and compare:
 
-  When disabled (`--no-execute`), the pipeline matches v1: transpile
-  + compile only.
+    * Python actual ⟷ dataset expected — lenient (trailing-newline
+      tolerant). A mismatch flags the *sample*, not Pylixir.
+    * Elixir actual ⟷ Python actual — strict (byte-equal modulo CRLF).
+      A mismatch flags Pylixir.
+
+  Per-sample bucket is the worst-of across all testcases. See
+  `Eval.Bucket` for the severity ladder and bucket keys.
   """
 
-  alias Eval.{Bucket, Compile, Execute, PythonCache}
+  alias Eval.{Bucket, Compile, Corpus, Execute, PythonCache}
 
   @type accumulator :: %{
           counts: %{Bucket.bucket_key() => non_neg_integer()},
           samples: %{Bucket.bucket_key() => [sample_entry()]},
           totals: %{
             processed: non_neg_integer(),
-            skipped: non_neg_integer(),
-            transpiled: non_neg_integer()
+            transpiled: non_neg_integer(),
+            testcases_run: non_neg_integer(),
+            testcases_passed: non_neg_integer(),
+            testcase_shard_missing: non_neg_integer()
           }
         }
 
@@ -39,16 +44,16 @@ defmodule Eval do
 
   @type opts :: [
           {:limit, pos_integer()}
+          | {:skip, non_neg_integer()}
           | {:concurrency, pos_integer()}
           | {:samples_per_bucket, pos_integer()}
-          | {:dataset, String.t()}
-          | {:split, String.t()}
-          | {:field, String.t()}
-          | {:name, String.t()}
-          | {:execute, boolean()}
+          | {:save_ok, non_neg_integer()}
+          | {:testcase_shards, pos_integer()}
           | {:python_timeout_ms, pos_integer()}
           | {:elixir_timeout_ms, pos_integer()}
           | {:on_sample, (map() -> any())}
+          | {:samples, Enumerable.t()}
+          | {:corpus_stats, map()}
         ]
 
   @default_concurrency_multiplier 2
@@ -58,17 +63,26 @@ defmodule Eval do
 
   @spec run(opts()) :: accumulator()
   def run(opts \\ []) do
-    stream_opts = Keyword.take(opts, [:limit, :offset, :dataset, :split, :field, :name, :cache])
-    enumerable = opts[:samples] || Eval.Stream.stream(stream_opts)
-    process(enumerable, opts)
+    {enumerable, corpus_stats} =
+      case Keyword.fetch(opts, :samples) do
+        {:ok, samples} ->
+          {samples, Keyword.get(opts, :corpus_stats, %{})}
+
+        :error ->
+          testcase_shards = Keyword.get(opts, :testcase_shards, 1)
+          Corpus.build(testcase_shards: testcase_shards)
+      end
+
+    enumerable = apply_limit_skip(enumerable, opts)
+    process(enumerable, Keyword.put(opts, :corpus_stats, corpus_stats))
   end
 
   @doc """
-  Run the classification pipeline against any enumerable of decoded
-  Python-side lines (`%{"id" => _, "source" => _}` or `%{"_skip" => _}`).
+  Run the classification pipeline against any enumerable of corpus
+  records (`%{id: _, source: _, testcases: _}`).
 
   Exposed so tests can drive the harness without booting the real
-  dataset stream.
+  corpus build.
   """
   @spec process(Enumerable.t(), opts()) :: accumulator()
   def process(enumerable, opts \\ []) do
@@ -80,15 +94,11 @@ defmodule Eval do
     # showcase workflow wants more clean transpiles than failures.
     save_ok = opts[:save_ok] || 0
     on_sample = opts[:on_sample] || fn _ -> :ok end
-    # Library default is OFF — execute mode requires `Eval.PythonCache`
-    # to be running. The Mix task explicitly opts in (defaulting to ON
-    # at the CLI level) after ensuring the cache is up.
-    execute? = Keyword.get(opts, :execute, false)
     python_timeout = opts[:python_timeout_ms] || @default_python_timeout_ms
     elixir_timeout = opts[:elixir_timeout_ms] || @default_elixir_timeout_ms
+    corpus_stats = opts[:corpus_stats] || %{}
 
     attempt_opts = [
-      execute: execute?,
       python_timeout_ms: python_timeout,
       elixir_timeout_ms: elixir_timeout
     ]
@@ -96,31 +106,32 @@ defmodule Eval do
     initial = %{
       counts: %{},
       samples: %{},
-      totals: %{processed: 0, skipped: 0, transpiled: 0}
+      totals: %{
+        processed: 0,
+        transpiled: 0,
+        testcases_run: 0,
+        testcases_passed: 0,
+        testcase_shard_missing: Map.get(corpus_stats, :testcase_shard_missing, 0)
+      }
     }
 
     enumerable
     |> Stream.each(on_sample)
     |> Task.async_stream(
-      fn line ->
-        case line do
-          %{"_skip" => _} = skip -> {:skip, skip}
-          %{"id" => id, "source" => source} -> attempt(%{id: id, source: source}, attempt_opts)
-        end
-      end,
+      fn record -> attempt(record, attempt_opts) end,
       max_concurrency: concurrency,
       ordered: false,
       timeout: :infinity
     )
     |> Enum.reduce(initial, fn
-      {:ok, {:skip, _}}, acc ->
-        update_in(acc.totals.skipped, &(&1 + 1))
-
       {:ok, {sample, bucket_key, metadata}}, acc ->
         cap = if bucket_key == :ok, do: save_ok, else: samples_per_bucket
+        per_tc = Map.get(metadata, :per_testcase, [])
 
         acc
         |> update_in([:totals, :processed], &(&1 + 1))
+        |> update_in([:totals, :testcases_run], &(&1 + length(per_tc)))
+        |> update_in([:totals, :testcases_passed], &(&1 + count_passed(per_tc)))
         |> maybe_count_transpiled(bucket_key)
         |> bump_count(bucket_key)
         |> maybe_store_sample(bucket_key, sample, metadata, cap)
@@ -131,29 +142,32 @@ defmodule Eval do
     end)
   end
 
-  @spec attempt(Bucket.sample(), keyword()) ::
+  @spec attempt(map(), keyword()) ::
           {Bucket.sample(), Bucket.bucket_key(), map()}
-  def attempt(%{source: source} = sample, opts) do
-    outcome =
-      if Keyword.get(opts, :execute, false) do
-        attempt_with_execution(source, opts)
-      else
-        attempt_compile_only(source)
-      end
-
+  def attempt(%{id: id, source: source, testcases: testcases}, opts) do
+    sample = %{id: id, source: source}
+    outcome = run_attempt(source, testcases, opts)
     {bucket, metadata} = Bucket.classify(sample, outcome)
     {sample, bucket, metadata}
   end
 
-  # --- Compile-only path (--no-execute) -----------------------------
+  defp run_attempt(source, testcases, opts) do
+    elixir_timeout = Keyword.fetch!(opts, :elixir_timeout_ms)
 
-  defp attempt_compile_only(source) do
     try do
       elixir_source = Pylixir.transpile(source)
 
-      case Compile.check(elixir_source) do
-        {:ok, diagnostics} ->
-          {:transpile_ok, elixir_source, {:compile_ok, diagnostics}}
+      result =
+        Compile.check_and_execute_testcases(
+          elixir_source,
+          testcases,
+          elixir_timeout,
+          fn module, tc -> testcase_outcome(module, tc, source, opts) end
+        )
+
+      case result do
+        {:executed_testcases, _diagnostics, _per_tc} = ok ->
+          {:transpile_ok, elixir_source, ok}
 
         {:error, exception} ->
           {:transpile_ok, elixir_source, {:compile_raised, exception}}
@@ -163,30 +177,93 @@ defmodule Eval do
     end
   end
 
-  # --- Execute path (default) ---------------------------------------
+  # --- Per-testcase classification (4-way truth table) -----------------
 
-  defp attempt_with_execution(source, opts) do
+  defp testcase_outcome(module, %{stdin: stdin, expected: expected}, source, opts) do
     python_timeout = Keyword.fetch!(opts, :python_timeout_ms)
     elixir_timeout = Keyword.fetch!(opts, :elixir_timeout_ms)
 
-    case python_outcome(source, python_timeout) do
+    case python_outcome(source, stdin, python_timeout) do
       {:python_ok, py_stdout} ->
-        transpile_and_execute(source, py_stdout, elixir_timeout)
+        run_elixir_and_classify(module, stdin, expected, py_stdout, elixir_timeout)
 
-      {:python_failed, _kind, _meta} = failure ->
-        failure
+      {:python_failed, kind, meta} ->
+        {:python_failed, kind, Map.merge(meta, %{stdin: stdin, expected: expected})}
     end
   end
 
-  defp python_outcome(source, timeout_ms) do
-    sha = PythonCache.key(source)
+  defp run_elixir_and_classify(module, stdin, expected, py_stdout, elixir_timeout) do
+    case Execute.run_elixir(module, elixir_timeout, stdin: stdin) do
+      {:ok, ex_stdout} ->
+        classify_4way(ex_stdout, py_stdout, expected, stdin)
+
+      {:raised, exception} ->
+        {:elixir_runtime_error, exception_module(exception),
+         %{
+           message: exception_message(exception),
+           stdin: stdin,
+           expected: expected,
+           python_stdout: py_stdout
+         }}
+
+      :timeout ->
+        {:elixir_timeout,
+         %{stdin: stdin, expected: expected, python_stdout: py_stdout}}
+    end
+  end
+
+  # 4-way truth table:
+  #   py == expected | ex == py | tc_outcome
+  #   ✓              | ✓        | :ok / :ok_empty
+  #   ✓              | ✗        | {:output_mismatch, fp, _}
+  #   ✗              | ✓        | {:python_disagrees_expected, fp, _}
+  #   ✗              | ✗        | {:output_mismatch, fp, _}  (ex-vs-py dominates)
+  defp classify_4way(ex_stdout, py_stdout, expected, stdin) do
+    py_vs_expected = Execute.compare_lenient(py_stdout, expected)
+    ex_vs_py = Execute.compare_outputs(py_stdout, ex_stdout)
+
+    base = %{
+      stdin: stdin,
+      expected: expected,
+      python_stdout: py_stdout,
+      elixir_stdout: ex_stdout
+    }
+
+    case {match_ok?(py_vs_expected), match_ok?(ex_vs_py)} do
+      {true, true} ->
+        if ex_vs_py == :equal_empty,
+          do: {:ok_empty, base},
+          else: {:ok, base}
+
+      {true, false} ->
+        {:differ, fp, summary} = ex_vs_py
+        {:output_mismatch, fp, Map.put(base, :diff_summary, summary)}
+
+      {false, true} ->
+        {:differ, fp, summary} = py_vs_expected
+        {:python_disagrees_expected, fp, Map.put(base, :diff_summary, summary)}
+
+      {false, false} ->
+        {:differ, fp, summary} = ex_vs_py
+        {:output_mismatch, fp, Map.put(base, :diff_summary, summary)}
+    end
+  end
+
+  defp match_ok?(:equal), do: true
+  defp match_ok?(:equal_empty), do: true
+  defp match_ok?({:differ, _, _}), do: false
+
+  # --- Python preflight (per (source, stdin)) --------------------------
+
+  defp python_outcome(source, stdin, timeout_ms) do
+    sha = PythonCache.key(source, stdin)
 
     case PythonCache.lookup(sha) do
       {:hit, entry} ->
         entry_to_outcome(entry)
 
       :miss ->
-        entry = run_python_twice(source, timeout_ms)
+        entry = run_python_twice(source, stdin, timeout_ms)
         PythonCache.put(sha, entry)
         entry_to_outcome(entry)
     end
@@ -197,10 +274,10 @@ defmodule Eval do
   # stdout. Any divergence (different output, second-run failure
   # after first-run success, etc.) becomes `:nondeterministic`. A
   # first-run failure short-circuits without a second run.
-  defp run_python_twice(source, timeout_ms) do
-    case Execute.run_python(source, timeout_ms: timeout_ms) do
+  defp run_python_twice(source, stdin, timeout_ms) do
+    case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
       {:ok, stdout1} ->
-        case Execute.run_python(source, timeout_ms: timeout_ms) do
+        case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
           {:ok, ^stdout1} ->
             %{"outcome" => "ok", "stdout" => stdout1}
 
@@ -238,16 +315,18 @@ defmodule Eval do
     do: {:python_failed, :syntax_error, %{stderr_tail: e["stderr_tail"]}}
 
   defp entry_to_outcome(%{"outcome" => "import_error"} = e),
-    do: {:python_failed, :import_error,
-         %{missing_module: e["missing_module"], stderr_tail: e["stderr_tail"]}}
+    do:
+      {:python_failed, :import_error,
+       %{missing_module: e["missing_module"], stderr_tail: e["stderr_tail"]}}
 
   defp entry_to_outcome(%{"outcome" => "error"} = e),
-    do: {:python_failed, {:error, e["exception_class"] || "Unknown"},
-         %{
-           exception_class: e["exception_class"],
-           exit_code: e["exit_code"],
-           stderr_tail: e["stderr_tail"]
-         }}
+    do:
+      {:python_failed, {:error, e["exception_class"] || "Unknown"},
+       %{
+         exception_class: e["exception_class"],
+         exit_code: e["exit_code"],
+         stderr_tail: e["stderr_tail"]
+       }}
 
   defp entry_to_outcome(%{"outcome" => "timeout"}),
     do: {:python_failed, :timeout, %{}}
@@ -260,29 +339,6 @@ defmodule Eval do
   # filter on cache load.
   defp entry_to_outcome(_),
     do: {:python_failed, {:error, "Unknown"}, %{exception_class: "Unknown"}}
-
-  defp transpile_and_execute(source, py_stdout, timeout_ms) do
-    try do
-      elixir_source = Pylixir.transpile(source)
-
-      case Compile.check_and_execute(elixir_source, timeout_ms) do
-        {:ok, diagnostics, ex_stdout} ->
-          {:transpile_ok, elixir_source,
-           {:execute_ok, diagnostics, py_stdout, ex_stdout}}
-
-        {:raised, diagnostics, exception} ->
-          {:transpile_ok, elixir_source, {:execute_raised, diagnostics, exception}}
-
-        {:timeout, diagnostics} ->
-          {:transpile_ok, elixir_source, {:execute_timeout, diagnostics}}
-
-        {:error, exception} ->
-          {:transpile_ok, elixir_source, {:compile_raised, exception}}
-      end
-    rescue
-      e -> {:transpile_raised, e}
-    end
-  end
 
   # Parse the *last* non-empty line of a Python traceback to determine
   # the exception class. Lines like `SyntaxError: invalid syntax` or
@@ -306,6 +362,7 @@ defmodule Eval do
 
           import_class?(line) ->
             class = extract_class(line) || "ImportError"
+
             {"import_error",
              %{"exception_class" => class, "missing_module" => extract_missing_module(line)}}
 
@@ -348,6 +405,25 @@ defmodule Eval do
     binary_part(s, skip, n)
   end
 
+  # --- Exception helpers -----------------------------------------------
+
+  defp exception_module(e) when is_struct(e), do: e.__struct__
+  defp exception_module(e) when is_atom(e), do: e
+  defp exception_module(_), do: RuntimeError
+
+  defp exception_message(e) when is_struct(e), do: Exception.message(e)
+  defp exception_message(other), do: inspect(other)
+
+  # --- Accumulator helpers ---------------------------------------------
+
+  defp count_passed(per_tc) do
+    Enum.count(per_tc, &tc_passed?/1)
+  end
+
+  defp tc_passed?({:ok, _}), do: true
+  defp tc_passed?({:ok_empty, _}), do: true
+  defp tc_passed?(_), do: false
+
   defp bump_count(acc, key),
     do: update_in(acc.counts[key], fn n -> (n || 0) + 1 end)
 
@@ -367,6 +443,25 @@ defmodule Eval do
     else
       entry = %{id: sample.id, source: sample.source, metadata: metadata}
       put_in(acc.samples[key], existing ++ [entry])
+    end
+  end
+
+  # --- Limit / skip ----------------------------------------------------
+
+  defp apply_limit_skip(enumerable, opts) do
+    skip = opts[:skip] || 0
+    limit = opts[:limit]
+
+    enumerable =
+      case skip do
+        n when n > 0 -> Stream.drop(enumerable, n)
+        _ -> enumerable
+      end
+
+    case limit do
+      nil -> enumerable
+      n when n > 0 -> Stream.take(enumerable, n)
+      _ -> enumerable
     end
   end
 end

@@ -334,15 +334,15 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 4 — Wiring + CLI + reporting
 
-- [ ] T8. `tools/eval/lib/eval.ex`:
+- [x] T8. `tools/eval/lib/eval.ex`:
   - Swap `Eval.Stream.stream/1` → `Eval.Corpus.build/1` in `run/1`.
   - Rewrite `attempt/2` as single testcase-mode path (calls `Compile.check_and_execute_testcases`).
   - Delete `attempt_compile_only/1`, the non-testcase branch of `attempt_with_execution/2`, all `:execute` opt threading, the single-output outcome shapes.
-- [ ] T9. `tools/eval/lib/mix/tasks/eval.run.ex`:
+- [x] T9. `tools/eval/lib/mix/tasks/eval.run.ex`:
   - Drop switches: `--dataset`, `--name`, `--split`, `--field`, `--cache`, `--no-cache`, `--execute`, `--no-execute`.
   - Add: `--testcase-shards K` (default 1).
   - Keep: `--limit`, `--skip`, `--concurrency`, `--samples-per-bucket`, `--save-ok`, `--python-timeout`, `--elixir-timeout`, `--no-python-cache`, `--rebuild-python-cache`, `--out`.
-- [ ] T10. `tools/eval/lib/eval/report.ex`:
+- [x] T10. `tools/eval/lib/eval/report.ex`:
   - Per-testcase artifact layout under `mismatches/<fp>/<NNN>.*` (see Report section above). Omit `<NNN>.testcase_<idx>.elixir.txt` when Elixir didn't run.
   - `summary.json`: add `totals.testcases_run`, `totals.testcases_passed`, `totals.testcase_shard_missing`. Bump `schema_version` → 3.
   - `summary.md`: headline hint line when `testcase_shard_missing > 0`.

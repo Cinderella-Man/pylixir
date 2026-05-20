@@ -3,21 +3,24 @@ defmodule Eval.Report do
   Persist an `Eval.run/1` accumulator to disk under
   `reports/run-<ISO8601>/`:
 
-    * `summary.md` — human-readable per-run summary.
-    * `summary.json` — machine-readable counts (for cross-run diffing).
-      Carries `schema_version: 2` and a run-level `comparison_mode`
-      (`"executed"` for full behavioral checks, `"compile_only"` for
-      `--no-execute` runs).
+    * `summary.md` — human-readable per-run summary. Includes a hint
+      line when `testcase_shard_missing > 0` (passing solutions whose
+      testcases live in a shard not loaded under the current
+      `--testcase-shards K`).
+    * `summary.json` — machine-readable counts. Carries
+      `schema_version: 3` plus `totals.testcases_run`,
+      `totals.testcases_passed`, `totals.testcase_shard_missing`.
     * `failures/<bucket-slug>/<n>.py` — first samples per bucket so
       maintainers can copy promising ones into `test/fixtures/python/`.
-    * `mismatches/<fingerprint>/<n>.{py,ex,expected.txt,actual.txt,diff}`
-      — output-mismatch samples with both stdouts and a diff summary
-      so reviewers can triage without re-running the harness.
+    * `mismatches/<fingerprint>/<n>.{py,ex,summary.md}` plus per-failing-
+      testcase `<n>.testcase_<idx>.{stdin,expected,python,elixir,diff}.txt`
+      — output-mismatch and python-disagrees-expected samples with
+      enough detail to triage without re-running the harness.
   """
 
   alias Eval.Bucket
 
-  @schema_version 2
+  @schema_version 3
 
   @doc """
   Write the report. Returns the absolute path to the run directory.
@@ -26,9 +29,8 @@ defmodule Eval.Report do
 
     * `:out` — explicit output directory. Defaults to
       `reports/run-<ISO8601>/`.
-    * `:comparison_mode` — `:executed | :compile_only`. Embedded in
-      `summary.json` so cross-run comparisons are unambiguous about
-      what `:ok` means.
+    * `:comparison_mode` — currently always `:executed`. Embedded in
+      `summary.json` for forward-compatibility with future modes.
   """
   @spec write(Eval.accumulator(), keyword()) :: Path.t()
   def write(accumulator, opts \\ []) do
@@ -60,6 +62,8 @@ defmodule Eval.Report do
   # reports root sits at tools/eval/reports/, two levels up.
   defp reports_root, do: Path.expand("../../reports", __DIR__)
 
+  # --- summary.json ----------------------------------------------------
+
   defp write_json(run_dir, acc, comparison_mode) do
     derived = derived_totals(acc)
 
@@ -76,23 +80,21 @@ defmodule Eval.Report do
     File.write!(Path.join(run_dir, "summary.json"), Jason.encode!(payload, pretty: true))
   end
 
+  # --- summary.md ------------------------------------------------------
+
   defp write_markdown(run_dir, acc, comparison_mode) do
     sorted = Enum.sort_by(acc.counts, fn {_k, n} -> -n end)
     total = acc.totals.processed
     derived = derived_totals(acc)
 
-    headline_label =
-      case comparison_mode do
-        :executed -> "Behavioral equivalence"
-        :compile_only -> "Compile-success"
-      end
-
-    headline_count = derived.equivalent + derived.compile_only_ok
+    headline_count = derived.equivalent
     headline_pct = format_pct(headline_count, total)
 
     behavior_rows = bucket_rows(sorted, total, &behavior_bucket?/1)
     compile_rows = bucket_rows(sorted, total, &compile_stage_bucket?/1)
     python_rows = bucket_rows(sorted, total, &python_bucket?/1)
+
+    shard_hint = testcase_shard_hint(acc.totals)
 
     body = """
     # Pylixir eval run
@@ -101,12 +103,13 @@ defmodule Eval.Report do
     | --- | --- |
     | comparison mode | `#{comparison_mode}` |
     | processed | #{total} |
-    | skipped (no Python extracted) | #{acc.totals.skipped} |
-    | #{headline_label} | #{headline_count} (#{headline_pct}%) |
+    | behavioral equivalence | #{headline_count} (#{headline_pct}%) |
     | equivalent (`:ok` + `:ok_empty_output`) | #{derived.equivalent} |
     | python preflight failures | #{derived.python_failed} |
     | nondeterministic | #{derived.nondeterministic} |
-
+    | testcases run | #{acc.totals.testcases_run} |
+    | testcases passed | #{acc.totals.testcases_passed} |
+    #{shard_hint}
     ## Behavior buckets
 
     | bucket | count | share |
@@ -132,6 +135,15 @@ defmodule Eval.Report do
     File.write!(Path.join(run_dir, "summary.md"), body)
   end
 
+  defp testcase_shard_hint(%{testcase_shard_missing: 0}), do: ""
+
+  defp testcase_shard_hint(%{testcase_shard_missing: n}) do
+    "\n> #{n} passing solutions have testcases in seed_testcase shards not loaded " <>
+      "(current: see config; total available: 30). Pass `--testcase-shards K'` to include more.\n"
+  end
+
+  defp testcase_shard_hint(_), do: ""
+
   defp bucket_rows(sorted, total, predicate) do
     rows =
       sorted
@@ -146,6 +158,7 @@ defmodule Eval.Report do
   defp behavior_bucket?(:ok), do: true
   defp behavior_bucket?(:ok_empty_output), do: true
   defp behavior_bucket?({:output_mismatch, _}), do: true
+  defp behavior_bucket?({:python_disagrees_expected, _}), do: true
   defp behavior_bucket?({:elixir_runtime_error, _}), do: true
   defp behavior_bucket?(:elixir_timeout), do: true
   defp behavior_bucket?(_), do: false
@@ -168,11 +181,6 @@ defmodule Eval.Report do
 
     equivalent = (counts[:ok] || 0) + (counts[:ok_empty_output] || 0)
 
-    # In compile-only mode there's no behavioral signal — the same
-    # `:ok` count represents "transpile + compile clean", surfaced
-    # under a different headline label in the markdown.
-    compile_only_ok = 0
-
     python_failed =
       Enum.reduce(counts, 0, fn {key, n}, sum ->
         if python_bucket?(key), do: sum + n, else: sum
@@ -182,7 +190,6 @@ defmodule Eval.Report do
 
     %{
       equivalent: equivalent,
-      compile_only_ok: compile_only_ok,
       python_failed: python_failed,
       nondeterministic: nondeterministic
     }
@@ -192,6 +199,8 @@ defmodule Eval.Report do
 
   defp format_pct(n, total),
     do: :erlang.float_to_binary(n / total * 100, decimals: 1)
+
+  # --- failures/<bucket>/ ----------------------------------------------
 
   defp write_failure_samples(run_dir, acc) do
     failures_root = Path.join(run_dir, "failures")
@@ -203,6 +212,7 @@ defmodule Eval.Report do
         bucket_key == :ok -> :ok
         bucket_key == :ok_empty_output -> :ok
         match?({:output_mismatch, _}, bucket_key) -> :ok
+        match?({:python_disagrees_expected, _}, bucket_key) -> :ok
         true -> write_bucket_entries(failures_root, bucket_key, entries)
       end
     end)
@@ -221,17 +231,21 @@ defmodule Eval.Report do
     end)
   end
 
+  # --- mismatches/<fp>/ ------------------------------------------------
+
   defp write_mismatch_samples(run_dir, acc) do
     mismatch_buckets =
       Enum.filter(acc.samples, fn {key, entries} ->
-        match?({:output_mismatch, _}, key) and entries != []
+        entries != [] and
+          (match?({:output_mismatch, _}, key) or match?({:python_disagrees_expected, _}, key))
       end)
 
     if mismatch_buckets != [] do
       root = Path.join(run_dir, "mismatches")
       File.mkdir_p!(root)
 
-      Enum.each(mismatch_buckets, fn {{:output_mismatch, fp}, entries} ->
+      Enum.each(mismatch_buckets, fn {bucket_key, entries} ->
+        fp = bucket_fingerprint(bucket_key)
         bucket_dir = Path.join(root, sanitize_fp(fp))
         File.mkdir_p!(bucket_dir)
 
@@ -239,13 +253,16 @@ defmodule Eval.Report do
         |> Enum.with_index(1)
         |> Enum.each(fn {entry, idx} ->
           padded = String.pad_leading(Integer.to_string(idx), 3, "0")
-          write_mismatch_entry(bucket_dir, padded, entry)
+          write_mismatch_entry(bucket_dir, padded, bucket_key, entry)
         end)
       end)
     end
   end
 
-  defp write_mismatch_entry(dir, padded, entry) do
+  defp bucket_fingerprint({:output_mismatch, fp}), do: fp
+  defp bucket_fingerprint({:python_disagrees_expected, fp}), do: fp
+
+  defp write_mismatch_entry(dir, padded, bucket_key, entry) do
     File.write!(Path.join(dir, "#{padded}.py"), entry.source)
 
     case entry.metadata[:elixir_source] do
@@ -253,21 +270,90 @@ defmodule Eval.Report do
       src -> File.write!(Path.join(dir, "#{padded}.ex"), src)
     end
 
-    File.write!(
-      Path.join(dir, "#{padded}.expected.txt"),
-      entry.metadata[:python_stdout] || ""
-    )
+    per_tc = Map.get(entry.metadata, :per_testcase, [])
 
     File.write!(
-      Path.join(dir, "#{padded}.actual.txt"),
-      entry.metadata[:elixir_stdout] || ""
+      Path.join(dir, "#{padded}.summary.md"),
+      build_testcase_summary(bucket_key, entry, per_tc)
     )
 
-    File.write!(
-      Path.join(dir, "#{padded}.diff"),
-      entry.metadata[:diff_summary] || ""
-    )
+    per_tc
+    |> Enum.with_index()
+    |> Enum.each(fn {tc, idx} ->
+      if failing_tc?(tc), do: write_testcase_artifacts(dir, padded, idx, tc)
+    end)
   end
+
+  defp failing_tc?({:ok, _}), do: false
+  defp failing_tc?({:ok_empty, _}), do: false
+  defp failing_tc?(_), do: true
+
+  defp write_testcase_artifacts(dir, padded, idx, tc) do
+    base = "#{padded}.testcase_#{idx}"
+    meta = tc_meta(tc)
+
+    File.write!(Path.join(dir, "#{base}.stdin.txt"), meta[:stdin] || "")
+    File.write!(Path.join(dir, "#{base}.expected.txt"), meta[:expected] || "")
+
+    case meta[:python_stdout] do
+      nil -> :ok
+      stdout -> File.write!(Path.join(dir, "#{base}.python.txt"), stdout)
+    end
+
+    case meta[:elixir_stdout] do
+      nil -> :ok
+      stdout -> File.write!(Path.join(dir, "#{base}.elixir.txt"), stdout)
+    end
+
+    case meta[:diff_summary] do
+      nil -> :ok
+      summary -> File.write!(Path.join(dir, "#{base}.diff"), summary)
+    end
+  end
+
+  defp tc_meta({:ok, m}), do: m
+  defp tc_meta({:ok_empty, m}), do: m
+  defp tc_meta({:output_mismatch, _, m}), do: m
+  defp tc_meta({:python_disagrees_expected, _, m}), do: m
+  defp tc_meta({:elixir_runtime_error, _, m}), do: m
+  defp tc_meta({:elixir_timeout, m}), do: m
+  defp tc_meta({:python_failed, _, m}), do: m
+
+  defp build_testcase_summary(bucket_key, entry, per_tc) do
+    rows =
+      per_tc
+      |> Enum.with_index()
+      |> Enum.map_join("\n", fn {tc, idx} -> "| #{idx} | #{tc_label(tc)} |" end)
+
+    passed = Enum.count(per_tc, fn tc -> not failing_tc?(tc) end)
+    total = length(per_tc)
+
+    """
+    # sample #{entry.id}
+
+    Bucket: `#{Bucket.slug(bucket_key)}`
+    Testcases: #{passed}/#{total} passed
+
+    | idx | outcome |
+    | --- | --- |
+    #{rows}
+    """
+  end
+
+  defp tc_label({:ok, _}), do: ":ok"
+  defp tc_label({:ok_empty, _}), do: ":ok_empty"
+  defp tc_label({:output_mismatch, fp, _}), do: "{:output_mismatch, #{inspect(fp)}}"
+
+  defp tc_label({:python_disagrees_expected, fp, _}),
+    do: "{:python_disagrees_expected, #{inspect(fp)}}"
+
+  defp tc_label({:elixir_runtime_error, mod, _}),
+    do: "{:elixir_runtime_error, #{inspect(mod)}}"
+
+  defp tc_label({:elixir_timeout, _}), do: ":elixir_timeout"
+
+  defp tc_label({:python_failed, kind, _}),
+    do: "{:python_failed, #{inspect(kind)}}"
 
   defp sanitize_fp(fp) do
     fp
@@ -276,12 +362,13 @@ defmodule Eval.Report do
     |> String.slice(0, 80)
   end
 
+  # --- ok samples ------------------------------------------------------
+  #
   # `--save-ok N` populates `accumulator.samples[:ok]` (capped by N).
   # For each entry, write the Python source and the generated Elixir
-  # side-by-side under `reports/<ts>/ok/`. Browse the directory to see
-  # real Python → Elixir pairs; pair well with `mix eval.show` for
-  # one-off pretty-print. Skipped silently when no OK samples were
-  # collected (the default, since `--save-ok` defaults to 0).
+  # side-by-side under `reports/<ts>/ok/`. Pair well with `mix
+  # eval.show` for one-off pretty-print. Skipped silently when no OK
+  # samples were collected (the default, since `--save-ok` defaults to 0).
   defp write_ok_samples(run_dir, acc) do
     entries = Map.get(acc.samples, :ok, []) ++ Map.get(acc.samples, :ok_empty_output, [])
 
