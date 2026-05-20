@@ -31,10 +31,20 @@ defmodule Pylixir.AlistAnalysis do
       non-allowlisted call (`f(xs)`), `return xs`, `xs + y`, `xs in
       something_else`, etc.
 
-    * Nested-scope mention: even a read-only reference to `xs`
-      inside a nested `def`/`lambda`/`class`/comprehension
-      disqualifies, because we can't prove the closure doesn't
-      mutate.
+    * Nested-scope mutation or leak: the leak and mutation walks
+      descend into nested `def`/`lambda`/`class`/comprehension
+      bodies and apply the same rules — a `.append(...)` inside a
+      lambda is still a mutation, a `return xs` inside a nested def
+      is still a leak. Read-only mentions (e.g. `L[i]` inside a list
+      comprehension) are SAFE under this rule.
+
+      Corner case: a nested scope that shadows the candidate name as
+      a parameter or loop variable gets analysed as if it referred
+      to the outer name. In practice this is harmless — either the
+      shadowed binding is unused outside the nested scope (the wrap
+      is wasted but not wrong) or the over-conservative mutation
+      check bails. `nonlocal`/`global` rebinds are not handled
+      (rare in competitive code).
 
   ## Debug knobs
 
@@ -63,14 +73,6 @@ defmodule Pylixir.AlistAnalysis do
   # `.copy()` is here because P0 made it produce a fresh regular
   # list (the helper unwraps an alist receiver).
   @read_only_methods ~w(index count copy)
-
-  # AST node types that open a new lexical scope. Walking past these
-  # boundaries is the nested-scope detector's job, not the leak
-  # detector's.
-  @scope_boundary_types ~w(
-    FunctionDef AsyncFunctionDef Lambda ClassDef
-    ListComp SetComp DictComp GeneratorExp
-  )
 
   @doc """
   Compute the set of freezable names in a scope's statement list.
@@ -143,10 +145,6 @@ defmodule Pylixir.AlistAnalysis do
         log_decision(scope_name, name, :bailed, "leak_or_alias")
         false
 
-      mentioned_in_nested_scope?(body, name) ->
-        log_decision(scope_name, name, :bailed, "nested_scope")
-        false
-
       true ->
         log_decision(scope_name, name, :froze, nil)
         true
@@ -155,23 +153,32 @@ defmodule Pylixir.AlistAnalysis do
 
   # === Mutation check ================================================
 
-  # Walks each top-level statement scope-aware (stops at nested
-  # scopes — those are the nested-scope detector's concern) and
-  # delegates to `ModuleAnalysis.mutates_name?/2` for the per-node
-  # check. The candidate's own `xs = list(...)` Assign is the only
-  # binding (we already rejected names with >1 binding); skip it so
-  # the initial bind isn't counted as a reassignment.
+  # Walks each top-level statement, descending through every node
+  # (including nested-scope boundaries: `def`/`lambda`/comp/etc.),
+  # and delegates to `ModuleAnalysis.mutates_name?/2` for the
+  # per-node check. The descent IS the point — a mutation inside a
+  # nested def or lambda still disqualifies the outer candidate.
+  # The candidate's own `xs = list(...)` Assign is the only
+  # binding (multi-binds are rejected upstream); skip it so the
+  # initial bind isn't counted as a reassignment.
   defp mutated_anywhere?(body, name, binding_node) do
-    Enum.any?(body, fn stmt ->
-      Walk.walk_scope(stmt, false, fn node, acc ->
-        cond do
-          acc -> acc
-          node == binding_node -> acc
-          true -> ModuleAnalysis.mutates_name?(node, name)
-        end
-      end)
-    end)
+    Enum.any?(body, &mutates_deep?(&1, name, binding_node))
   end
+
+  defp mutates_deep?(node, _name, binding_node) when node == binding_node, do: false
+
+  defp mutates_deep?(%{"_type" => _} = node, name, binding_node) do
+    ModuleAnalysis.mutates_name?(node, name) or
+      node
+      |> Map.delete("_type")
+      |> Enum.any?(fn {_k, v} -> mutates_deep?(v, name, binding_node) end)
+  end
+
+  defp mutates_deep?(list, name, binding_node) when is_list(list) do
+    Enum.any?(list, &mutates_deep?(&1, name, binding_node))
+  end
+
+  defp mutates_deep?(_leaf, _name, _binding_node), do: false
 
   # === Leak / alias check ============================================
 
@@ -298,12 +305,16 @@ defmodule Pylixir.AlistAnalysis do
     Enum.any?(args, &leak_in?(&1, name)) or Enum.any?(kws, &leak_in?(&1, name))
   end
 
-  # Boundary nodes belong to the nested-scope detector. Stop here
-  # so we don't double-report or peer into a different scope.
-  defp leak_in?(%{"_type" => type}, _name) when type in @scope_boundary_types, do: false
-
   # Bare `Name(xs)` not absorbed by any safe-slot clause above is a
-  # leak by definition.
+  # leak by definition. Note: we deliberately do NOT short-circuit
+  # at nested-scope boundaries — a `return xs` inside a nested def
+  # or a `[xs for _ in src]` inside a list-comp body still leaks
+  # via this clause, and a read-only `L[i]` inside a comprehension
+  # is absorbed by the Subscript safe-slot clause above (no leak).
+  # Param/loop-var shadowing is handled conservatively: an inner
+  # rebinding to the same name reads here as if it referred to the
+  # outer name, which over-bails in pathological cases but never
+  # produces an incorrect freeze.
   defp leak_in?(%{"_type" => "Name", "id" => id}, name) when id == name, do: true
 
   # Generic node: descend into every child slot.
@@ -324,49 +335,6 @@ defmodule Pylixir.AlistAnalysis do
   # non-Name expression for transitive leaks.
   defp leak_in_value_slot?(%{"_type" => "Name", "id" => id}, name) when id == name, do: false
   defp leak_in_value_slot?(other, name), do: leak_in?(other, name)
-
-  # === Nested-scope mention check ====================================
-
-  # Sibling to `Walk.walk_scope/3` that *does* descend into boundary
-  # nodes. Any mention of `name` inside a nested
-  # `def`/`lambda`/`class`/comprehension disqualifies — we can't
-  # prove the closure doesn't mutate, so we conservatively bail.
-  defp mentioned_in_nested_scope?(body, name) do
-    Enum.any?(body, &has_nested_mention?(&1, name))
-  end
-
-  defp has_nested_mention?(%{"_type" => type} = node, name) when type in @scope_boundary_types do
-    name_mentioned_deep?(node, name)
-  end
-
-  defp has_nested_mention?(%{"_type" => _} = node, name) do
-    node
-    |> Map.delete("_type")
-    |> Enum.any?(fn {_k, v} -> has_nested_mention?(v, name) end)
-  end
-
-  defp has_nested_mention?(list, name) when is_list(list) do
-    Enum.any?(list, &has_nested_mention?(&1, name))
-  end
-
-  defp has_nested_mention?(_leaf, _name), do: false
-
-  # Once we're inside a boundary subtree, every Name(name) counts
-  # (we don't try to follow Python's shadowing rules — the goal is
-  # a strict safety check, not a precise analysis).
-  defp name_mentioned_deep?(%{"_type" => "Name", "id" => id}, name) when id == name, do: true
-
-  defp name_mentioned_deep?(%{"_type" => _} = node, name) do
-    node
-    |> Map.delete("_type")
-    |> Enum.any?(fn {_k, v} -> name_mentioned_deep?(v, name) end)
-  end
-
-  defp name_mentioned_deep?(list, name) when is_list(list) do
-    Enum.any?(list, &name_mentioned_deep?(&1, name))
-  end
-
-  defp name_mentioned_deep?(_leaf, _name), do: false
 
   # === Debug knobs ===================================================
 

@@ -290,6 +290,40 @@ These were resolved during the design grill:
 
 5. **Micro-benchmark.** Add a one-shot timing in `mix eval.probe`: read 100,000 ints into `xs`, then `Enum.reduce(0..99_999, 0, fn i, acc -> acc + py_getitem(xs, i) end)`. Before: tens of seconds (regular list). After: tens of milliseconds (alist). Ratio ≥ 100×.
 
+## Post-P6 investigation: why are 15 of 100 still timing out?
+
+Per-sample diagnostics on the 15 timeouts (`PYLIXIR_ALIST_DIAG=1`) show the freeze is doing exactly what it should — the bottleneck is somewhere else:
+
+| Sample(s) | Candidate decision | Actual hot-loop receiver |
+|---|---|---|
+| 001–003 | `x` and `y` **froze** | `x_sums = []` / `y_sums = []` then `.append(...)` in a loop, indexed in a tight `while` — append-built scratch lists, hot subscript reads on those |
+| 004–008 | `L` **froze** | `min_after = [0] * (n+2)` / `intervals = []` — scratch lists with subscript-assigns in one phase, indexed reads in the next |
+| 009 | `L` was bailing `nested_scope`; now **freezes** after the refinement below | `min_R = [0] * n` — same scratch-list pattern. Freezing `R` (a list comp) would also need a wider candidate shape |
+| 010 | `L` bails `mutation` (correct: `L = [0] + L` reassigns) | Reassignment is fundamental — would need either flow-sensitivity or accepting the rebound shape |
+
+Two concrete findings drove a code change:
+
+1. **Sample 009's `R = [i - L[i] for i in range(n)]` was bailing the wrong way.** The conservative "any mention of `L` inside a nested scope disqualifies" rule (design decision #2) was rejecting a *read-only* `L[i]` inside a list comprehension. The refinement: replace the bail-on-mention rule with a precise descending walk that runs the same leak/mutation checks across boundaries — a read-only `L[i]` inside a comprehension is now SAFE, a `.append(...)` or `return L` inside a lambda still bails. `L` in 009 now freezes.
+
+2. **The remaining timeouts are all "scratch list" patterns** that the design explicitly flagged as out-of-scope (see below). The candidate freeze isn't going to help when the *hot* receiver isn't a `list(...)`-bound name. Moving the needle further requires either:
+   - **Flow-sensitive analysis** of "build phase then read-only phase" — `xs = []; for ... xs.append(...); for ... xs[i]` — proven safe after the append loop ends.
+   - **Widening the candidate shape** to list comprehensions (`xs = [expr for ... in ...]`) and `sorted(...)` results, both of which return fresh lists with no later mutation in the common case.
+   - **A different data structure** for `[default] * n` followed by subscript-assigns — neither `list ++ replace_at` nor a frozen tuple is the right cost model; an `:array` or persistent vector would be.
+
+### What the refinement did to the analyser
+
+- `Pylixir.AlistAnalysis`'s mutation check now uses a descending walker (`mutates_deep?`) instead of `Walk.walk_scope` — mutations inside lambdas / defs / comprehensions are still caught.
+- `Pylixir.AlistAnalysis`'s leak check (`leak_in?`) no longer short-circuits at scope boundaries — `return xs` inside a nested def or a bare `Name(xs)` inside a comprehension's `elt` is still flagged as a leak.
+- The dedicated `mentioned_in_nested_scope?` walker (and its `name_mentioned_deep?` helper) was deleted — fully subsumed by the descending leak/mutation checks.
+- Param/loop-var shadowing of the candidate is handled conservatively: an inner rebinding reads as if it were the outer name, which over-bails in pathological cases but never produces an incorrect freeze.
+- Three tests changed semantics (read-only nested mention now → SAFE rather than → bail). Two new tests added (`MUTATION inside a nested def bails`, `LEAK inside a nested def bails`).
+
+### Net result
+
+- `:ok = 85` unchanged at `--limit 100` (the refinement helps cases like 009 freeze the right candidate, but those candidates aren't the actual hot-loop receivers).
+- Soundness: 1147 tests still green. Eval non-timeout buckets unchanged.
+- Direction: matches the design's "out of scope" list. The remaining 15 are the next batch of work, not bugs in this one.
+
 ## Explicitly out of scope
 
 - **Freeze list comprehensions, list literals, `sorted` results.** Initial cut only freezes `list(<iter>)` calls. Expanding the gate is a follow-up once the narrow case is proven.

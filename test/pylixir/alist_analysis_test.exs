@@ -229,17 +229,17 @@ defmodule Pylixir.AlistAnalysisTest do
     end
   end
 
-  describe "nested-scope disqualifier" do
-    test "any mention of xs inside a nested def bails (even read-only)" do
+  describe "nested-scope rules (precise via descending walks)" do
+    test "read-only mention of xs inside a nested def is SAFE (no leak, no mutation)" do
       body = [
         list_call_bind("xs"),
         fn_def("inner", [expr(call_name("print", [name("xs")]))])
       ]
 
-      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
     end
 
-    test "mention inside a lambda body bails" do
+    test "read-only mention inside a lambda body is SAFE" do
       body = [
         list_call_bind("xs"),
         assign(
@@ -250,6 +250,53 @@ defmodule Pylixir.AlistAnalysisTest do
             "body" => subscript_read("xs", 0)
           }
         )
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+    end
+
+    test "read-only mention inside a list comprehension is SAFE (sample 009 pattern)" do
+      # `r = [i - xs[i] for i in range(n)]`
+      list_comp = %{
+        "_type" => "ListComp",
+        "elt" => %{
+          "_type" => "BinOp",
+          "left" => name("i"),
+          "op" => %{"_type" => "Sub"},
+          "right" => subscript_read("xs", "i")
+        },
+        "generators" => [
+          %{
+            "_type" => "comprehension",
+            "target" => name("i"),
+            "iter" => call_name("range", [name("n")]),
+            "ifs" => [],
+            "is_async" => 0
+          }
+        ]
+      }
+
+      body = [
+        list_call_bind("xs"),
+        assign("r", list_comp)
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+    end
+
+    test "MUTATION inside a nested def bails (descending walk catches it)" do
+      body = [
+        list_call_bind("xs"),
+        fn_def("inner", [method_call("xs", "append", [const(0)])])
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+    end
+
+    test "LEAK inside a nested def bails (return xs / alias inside the closure)" do
+      body = [
+        list_call_bind("xs"),
+        fn_def("inner", [return(name("xs"))])
       ]
 
       assert AlistAnalysis.freezable_names(body) == MapSet.new()
