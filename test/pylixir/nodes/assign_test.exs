@@ -85,6 +85,76 @@ defmodule Pylixir.Nodes.AssignTest do
         Converter.convert(assign([tup_target], tup_value), Context.new())
       end
     end
+
+    # Python's `a, b, c = <iterable>` accepts any iterable on the RHS,
+    # not just tuples. Emitting `{a, b, c} = rhs` would `MatchError` at
+    # runtime whenever the RHS is a list (every `map()`, `split()`,
+    # comprehension, etc. produces a list).
+    test "flat Name target with list-literal RHS emits a list pattern (no coerce)" do
+      tup_target = %{"_type" => "Tuple", "elts" => [name("a"), name("b")]}
+      list_value = %{"_type" => "List", "elts" => [const(1), const(2)]}
+
+      {ast, _ctx} = Converter.convert(assign([tup_target], list_value), Context.new())
+
+      assert ast == {:=, [], [[{:a, [], nil}, {:b, [], nil}], [1, 2]]}
+    end
+
+    test "flat Name target with unknown-type RHS coerces via py_iter_to_list" do
+      # A bare Name reference has unknown type. The emitted pattern
+      # must be a list and the RHS must be wrapped in py_iter_to_list/1
+      # so a tuple/string/etc. RHS is normalised at runtime.
+      tup_target = %{"_type" => "Tuple", "elts" => [name("x"), name("y")]}
+      {ast, _ctx} = Converter.convert(assign([tup_target], name("src")), Context.new())
+
+      assert ast ==
+               {:=, [],
+                [
+                  [{:x, [], nil}, {:y, [], nil}],
+                  {:py_iter_to_list, [], [{:src, [], nil}]}
+                ]}
+    end
+
+    test "flat Name target with tuple-literal RHS keeps tuple pattern (no coerce)" do
+      # When the RHS is statically a tuple, the existing tuple-pattern
+      # path is the right Elixir shape — no need for a list-pattern
+      # detour or runtime coercion.
+      tup_target = %{"_type" => "Tuple", "elts" => [name("a"), name("b")]}
+      tup_value = %{"_type" => "Tuple", "elts" => [const(1), const(2)]}
+
+      {ast, _ctx} = Converter.convert(assign([tup_target], tup_value), Context.new())
+
+      assert ast == {:=, [], [{{:a, [], nil}, {:b, [], nil}}, {1, 2}]}
+    end
+
+    test "nested Tuple target keeps tuple pattern (no list-pattern path)" do
+      # `count, (a, b) = ...` has a nested Tuple target; the
+      # list-pattern transform only applies to fully-flat Name targets.
+      # Use a List RHS so any naive type-only check would still pick
+      # the list path — the flatness check must take precedence.
+      inner = %{"_type" => "Tuple", "elts" => [name("a"), name("b")]}
+      outer_target = %{"_type" => "Tuple", "elts" => [name("count"), inner]}
+      list_value = %{"_type" => "List", "elts" => [const(5), const(6)]}
+
+      {ast, _ctx} = Converter.convert(assign([outer_target], list_value), Context.new())
+
+      assert ast ==
+               {:=, [],
+                [
+                  {{:count, [], nil}, {{:a, [], nil}, {:b, [], nil}}},
+                  [5, 6]
+                ]}
+    end
+
+    test "flat Name target binds every name into scope (list-pattern path)" do
+      tup_target = %{"_type" => "Tuple", "elts" => [name("n"), name("m"), name("k")]}
+      list_value = %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}
+
+      {_ast, ctx} = Converter.convert(assign([tup_target], list_value), Context.new())
+
+      assert MapSet.member?(hd(ctx.scopes), "n")
+      assert MapSet.member?(hd(ctx.scopes), "m")
+      assert MapSet.member?(hd(ctx.scopes), "k")
+    end
   end
 
   describe "Subscript target (plain Assign)" do

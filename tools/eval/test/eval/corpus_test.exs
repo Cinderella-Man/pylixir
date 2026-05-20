@@ -65,10 +65,14 @@ defmodule Eval.CorpusTest do
         )
       ],
       tc_shards: [
+        # `inputs` / `outputs` are JSON-encoded *lists of strings* in
+        # the real seed_testcase dataset — one element per testcase,
+        # packed into a single row per qid. The corpus parser does the
+        # decode + zip, so tests must feed the same shape.
         DF.new(
-          question_id: ["q1", "q1", "q2"],
-          inputs: ["i1", "i2", "i3"],
-          outputs: ["o1", "o2", "o3"]
+          question_id: ["q1", "q2"],
+          inputs: [tc_inputs(["i1", "i2"]), tc_inputs(["i3"])],
+          outputs: [tc_outputs(["o1", "o2"]), tc_outputs(["o3"])]
         )
       ]
     })
@@ -89,7 +93,7 @@ defmodule Eval.CorpusTest do
     assert length(by_qid["q1"]) == 2
     assert length(by_qid["q2"]) == 1
 
-    # Both q1 samples share their full testcase set.
+    # Both q1 samples share their full testcase set (2 testcases each).
     q1_samples = by_qid["q1"]
     assert Enum.all?(q1_samples, &(length(&1.testcases) == 2))
 
@@ -112,7 +116,11 @@ defmodule Eval.CorpusTest do
       tc_shards: [
         # q2's testcases live in a (notional) shard NOT loaded. q3 has
         # no testcases anywhere. Only q1 yields samples.
-        DF.new(question_id: ["q1"], inputs: ["i"], outputs: ["o"])
+        DF.new(
+          question_id: ["q1"],
+          inputs: [tc_inputs(["i"])],
+          outputs: [tc_outputs(["o"])]
+        )
       ]
     })
 
@@ -139,8 +147,16 @@ defmodule Eval.CorpusTest do
         )
       ],
       tc_shards: [
-        DF.new(question_id: ["q1"], inputs: ["i1"], outputs: ["o1"]),
-        DF.new(question_id: ["q2"], inputs: ["i2"], outputs: ["o2"])
+        DF.new(
+          question_id: ["q1"],
+          inputs: [tc_inputs(["i1"])],
+          outputs: [tc_outputs(["o1"])]
+        ),
+        DF.new(
+          question_id: ["q2"],
+          inputs: [tc_inputs(["i2"])],
+          outputs: [tc_outputs(["o2"])]
+        )
       ]
     })
 
@@ -157,6 +173,76 @@ defmodule Eval.CorpusTest do
     assert length(Enum.to_list(stream_k2)) == 2
   end
 
+  test "JSON-encoded list inputs/outputs unpack into one testcase per element",
+       %{tmp_cache: tmp_cache} do
+    FakeDataset.set(%{
+      sft_shards: [
+        DF.new(question_id: ["q1"], code: ["A"], is_passed: [true])
+      ],
+      tc_shards: [
+        # One row, three testcases packed inside the JSON.
+        DF.new(
+          question_id: ["q1"],
+          inputs: [tc_inputs(["3\n1 2 3\n", "1\n5\n", "0\n\n"])],
+          outputs: [tc_outputs(["6\n", "5\n", "0\n"])]
+        )
+      ]
+    })
+
+    {stream, _stats} = build_silent(tmp_cache: tmp_cache)
+    [sample] = Enum.to_list(stream)
+
+    assert length(sample.testcases) == 3
+    assert Enum.at(sample.testcases, 0) == %{stdin: "3\n1 2 3\n", expected: "6\n"}
+    assert Enum.at(sample.testcases, 1) == %{stdin: "1\n5\n", expected: "5\n"}
+    assert Enum.at(sample.testcases, 2) == %{stdin: "0\n\n", expected: "0\n"}
+  end
+
+  test "non-string JSON entries (function-call style) are filtered out",
+       %{tmp_cache: tmp_cache} do
+    FakeDataset.set(%{
+      sft_shards: [
+        DF.new(question_id: ["q1"], code: ["A"], is_passed: [true])
+      ],
+      tc_shards: [
+        # Mixed: one stdin-style testcase + one function-call-style
+        # (the latter has a list-of-args for `inputs`). Only the
+        # string testcase should make it through; the list one is
+        # dropped.
+        DF.new(
+          question_id: ["q1"],
+          inputs: [Jason.encode!(["stdin_ok\n", [1, 2, 3]])],
+          outputs: [Jason.encode!(["ok\n", 6])]
+        )
+      ]
+    })
+
+    {stream, _stats} = build_silent(tmp_cache: tmp_cache)
+    [sample] = Enum.to_list(stream)
+
+    assert sample.testcases == [%{stdin: "stdin_ok\n", expected: "ok\n"}]
+  end
+
+  test "rows whose inputs/outputs aren't JSON lists are dropped entirely",
+       %{tmp_cache: tmp_cache} do
+    FakeDataset.set(%{
+      sft_shards: [
+        DF.new(question_id: ["q1"], code: ["A"], is_passed: [true])
+      ],
+      tc_shards: [
+        # Plain string (not a JSON list) — schema mismatch; drop the row.
+        DF.new(question_id: ["q1"], inputs: ["raw"], outputs: ["raw"])
+      ]
+    })
+
+    {stream, stats} = build_silent(tmp_cache: tmp_cache)
+    samples = Enum.to_list(stream)
+
+    assert samples == []
+    assert stats.testcase_shard_missing == 1
+    assert stats.total_qids_with_testcases == 0
+  end
+
   test "yielded samples carry testcases as a list of %{stdin, expected}",
        %{tmp_cache: tmp_cache} do
     FakeDataset.set(%{
@@ -164,10 +250,11 @@ defmodule Eval.CorpusTest do
         DF.new(question_id: ["q1"], code: ["src"], is_passed: [true])
       ],
       tc_shards: [
+        # Single row, two testcases packed inside (matches real schema).
         DF.new(
-          question_id: ["q1", "q1"],
-          inputs: ["i1", "i2"],
-          outputs: ["o1", "o2"]
+          question_id: ["q1"],
+          inputs: [tc_inputs(["i1", "i2"])],
+          outputs: [tc_outputs(["o1", "o2"])]
         )
       ]
     })
@@ -209,4 +296,10 @@ defmodule Eval.CorpusTest do
     [qid, _sha8] = String.split(id, "--", parts: 2)
     qid
   end
+
+  # Build the JSON-encoded list-of-strings shape that the real
+  # `seed_testcase` parquet stores in its `inputs` / `outputs` columns
+  # — one row per qid, one list element per testcase.
+  defp tc_inputs(list) when is_list(list), do: Jason.encode!(list)
+  defp tc_outputs(list) when is_list(list), do: Jason.encode!(list)
 end

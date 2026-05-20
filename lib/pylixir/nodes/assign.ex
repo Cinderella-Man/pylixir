@@ -309,7 +309,8 @@ defmodule Pylixir.Nodes.Assign do
         cond do
           pure_destructure_target?(elts) ->
             # Pure tuple-of-Names (possibly nested) — e.g.
-            # `a, b = (1, 2)` or `count, (a, b) = func()`.
+            # `a, b = (1, 2)`, `n, m, k = map(int, ...)`, or
+            # `count, (a, b) = func()`.
             value_type = TypeInfer.infer_expr(value, context)
 
             context =
@@ -317,8 +318,26 @@ defmodule Pylixir.Nodes.Assign do
 
             {value_ast, context} = Converter.convert(value, context)
             context = bind_destructure_target(elts, context)
-            pattern = destructure_pattern(elts)
-            {{:=, [], [pattern, value_ast]}, context}
+
+            if flat_name_target?(elts) and not TypeInfer.is_tuple_tag?(value_type) do
+              # Python's `n, m, k = X` works for ANY iterable on the
+              # RHS: list, tuple, generator, string, ... Emitting an
+              # Elixir tuple pattern `{n, m, k} = X` would MatchError
+              # at runtime whenever the RHS is a list (every `map()`,
+              # `split()`, comprehension, etc.). When the RHS isn't
+              # statically a tuple, coerce it to a list and use a
+              # list pattern instead — `py_iter_to_list/1` no-ops on
+              # actual lists and normalises tuples/strings/etc.
+              pattern = list_destructure_pattern(elts)
+              rhs = TypeInfer.coerce_iter(value_ast, value_type)
+              {{:=, [], [pattern, rhs]}, context}
+            else
+              # Static tuple RHS or nested Tuple/List target — the
+              # existing tuple-pattern path is the right Elixir shape
+              # (and avoids a needless `py_iter_to_list` call).
+              pattern = destructure_pattern(elts)
+              {{:=, [], [pattern, value_ast]}, context}
+            end
 
           true ->
             # Mixed Name/Subscript targets (the swap idiom etc.).
@@ -809,6 +828,19 @@ defmodule Pylixir.Nodes.Assign do
   defp destructure_pattern(elts) when is_list(elts) do
     refs = Enum.map(elts, &destructure_elt/1)
     Converter.tuple_pattern(refs)
+  end
+
+  # Flat tuple-of-Names with no nested Tuple/List targets — the shape
+  # for which `[a, b, c] = py_iter_to_list(rhs)` is sufficient. Nested
+  # patterns like `count, (a, b) = ...` keep the tuple-pattern path.
+  defp flat_name_target?(elts) when is_list(elts) do
+    Enum.all?(elts, &match?(%{"_type" => "Name"}, &1))
+  end
+
+  defp list_destructure_pattern(elts) when is_list(elts) do
+    Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
+      {id |> Naming.rewrite() |> String.to_atom(), [], nil}
+    end)
   end
 
   defp destructure_elt(%{"_type" => "Name", "id" => id}),
