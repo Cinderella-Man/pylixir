@@ -423,7 +423,14 @@ defmodule Pylixir.SpecializationTest do
       """
 
       out = Pylixir.transpile(src)
-      refute out =~ "py_len("
+
+      # After Task 2 the `ys = sorted(xs)` RHS is a freezable shape,
+      # so it now lowers to `ys = py_alist_new(Enum.sort(xs))` and
+      # `len(ys)` goes through `py_len/1`'s `{:py_alist, _}` clause
+      # (also O(1)). Specialization is still happening — just via the
+      # alist dispatch instead of a direct `length/1`.
+      assert out =~ "py_alist_new(Enum.sort"
+      assert out =~ "py_len(ys)"
     end
   end
 

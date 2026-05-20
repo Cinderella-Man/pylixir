@@ -183,6 +183,9 @@ defmodule Pylixir.Nodes.Functions do
     saved_return_mode = context.return_mode
     saved_types = context.types
     saved_freezable_names = context.freezable_names
+    saved_append_build_names = context.append_build_names
+    saved_append_build_freeze_after = context.append_build_freeze_after
+    saved_pvec_names = context.pvec_names
 
     new_scope = MapSet.new(param_names)
 
@@ -200,13 +203,19 @@ defmodule Pylixir.Nodes.Functions do
       |> Enum.zip(param_types)
       |> Enum.reduce(context.types, fn {name, t}, acc -> Map.put(acc, name, t) end)
 
+    {append_names, append_freeze_after} =
+      Pylixir.AppendBuildAnalysis.analyze(body, py_name)
+
     context = %{
       context
       | scopes: [new_scope | context.scopes],
         def_position: :nested_fn,
         return_mode: return_mode,
         types: primed_types,
-        freezable_names: Pylixir.AlistAnalysis.freezable_names(body, py_name)
+        freezable_names: Pylixir.AlistAnalysis.freezable_names(body, py_name),
+        append_build_names: append_names,
+        append_build_freeze_after: append_freeze_after,
+        pvec_names: Pylixir.PvecAnalysis.analyze(body, py_name)
     }
 
     {doc, stripped_body} = extract_docstring(body)
@@ -228,11 +237,14 @@ defmodule Pylixir.Nodes.Functions do
           saved_def_position,
           saved_return_mode,
           saved_types,
-          saved_freezable_names
+          saved_freezable_names,
+          saved_append_build_names,
+          saved_append_build_freeze_after,
+          saved_pvec_names
         )
 
       :no ->
-        {body_asts, context} = Converter.convert_each(stripped_body, context)
+        {body_asts, context} = Converter.convert_each_with_freezes(stripped_body, context)
 
         context = %{
           context
@@ -240,7 +252,10 @@ defmodule Pylixir.Nodes.Functions do
             def_position: saved_def_position,
             return_mode: saved_return_mode,
             types: saved_types,
-            freezable_names: saved_freezable_names
+            freezable_names: saved_freezable_names,
+            append_build_names: saved_append_build_names,
+            append_build_freeze_after: saved_append_build_freeze_after,
+            pvec_names: saved_pvec_names
         }
 
         body_block =
@@ -328,7 +343,10 @@ defmodule Pylixir.Nodes.Functions do
          saved_def_position,
          saved_return_mode,
          saved_types,
-         saved_freezable_names
+         saved_freezable_names,
+         saved_append_build_names,
+         saved_append_build_freeze_after,
+         saved_pvec_names
        ) do
     [param_ast] = param_asts
     [%{"_type" => "Name", "id" => param_name}, _] = test_node["args"]
@@ -348,7 +366,10 @@ defmodule Pylixir.Nodes.Functions do
           def_position: saved_def_position,
           return_mode: saved_return_mode,
           types: saved_types,
-          freezable_names: saved_freezable_names
+          freezable_names: saved_freezable_names,
+          append_build_names: saved_append_build_names,
+          append_build_freeze_after: saved_append_build_freeze_after,
+          pvec_names: saved_pvec_names
       }
 
       single_def = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_ast]]}
@@ -376,7 +397,10 @@ defmodule Pylixir.Nodes.Functions do
           def_position: saved_def_position,
           return_mode: saved_return_mode,
           types: saved_types,
-          freezable_names: saved_freezable_names
+          freezable_names: saved_freezable_names,
+          append_build_names: saved_append_build_names,
+          append_build_freeze_after: saved_append_build_freeze_after,
+          pvec_names: saved_pvec_names
       }
 
       guard = isinstance_guard(type_ref, param_ast)

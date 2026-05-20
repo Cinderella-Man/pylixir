@@ -156,7 +156,19 @@ defmodule Pylixir.Nodes.Mutations do
 
     target_atom = target_name |> Naming.rewrite() |> String.to_atom()
     target_ast = {target_atom, [], nil}
-    new_value = mutation_rhs(method, target_ast, arg_asts, kwargs, source)
+
+    new_value =
+      if method == "append" and MapSet.member?(context.append_build_names, target_name) do
+        # Append-build mode (`Pylixir.AppendBuildAnalysis`): emit O(1)
+        # `[v | xs]` prepend instead of O(n) `xs ++ [v]`. The build
+        # loop produces a reversed list; the converter injects
+        # `xs = py_alist_new(Enum.reverse(xs))` after the last
+        # mutating top-level statement to restore order and freeze.
+        [arg_ast] = arg_asts
+        [{:|, [], [arg_ast, target_ast]}]
+      else
+        mutation_rhs(method, target_ast, arg_asts, kwargs, source)
+      end
 
     context = TypeInfer.demote(context, target_name)
     context = Converter.bind_name(context, target_name)

@@ -112,19 +112,31 @@ defmodule Pylixir.Converter do
     # body. Restored after the conversion. The set is consulted by
     # `Pylixir.Nodes.Assign` when P5 lands.
     saved_freezable_names = context.freezable_names
+    saved_append_build_names = context.append_build_names
+    saved_append_build_freeze_after = context.append_build_freeze_after
+    saved_pvec_names = context.pvec_names
+
+    {append_names, append_freeze_after} =
+      Pylixir.AppendBuildAnalysis.analyze(analysis.runtime_statements)
 
     context = %{
       context
       | def_position: :nested_fn,
-        freezable_names: Pylixir.AlistAnalysis.freezable_names(analysis.runtime_statements)
+        freezable_names: Pylixir.AlistAnalysis.freezable_names(analysis.runtime_statements),
+        append_build_names: append_names,
+        append_build_freeze_after: append_freeze_after,
+        pvec_names: Pylixir.PvecAnalysis.analyze(analysis.runtime_statements)
     }
 
-    {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
+    {stmt_asts, context} = convert_each_with_freezes(analysis.runtime_statements, context)
 
     context = %{
       context
       | def_position: :module_top,
-        freezable_names: saved_freezable_names
+        freezable_names: saved_freezable_names,
+        append_build_names: saved_append_build_names,
+        append_build_freeze_after: saved_append_build_freeze_after,
+        pvec_names: saved_pvec_names
     }
 
     # M3 — drop empty `{:__block__, [], []}` and noop sentinels that
@@ -3056,6 +3068,74 @@ defmodule Pylixir.Converter do
       end)
 
     {Enum.reverse(asts), context}
+  end
+
+  @doc """
+  Convert a top-level statement list, injecting append-build freeze
+  statements after the indices recorded in `ctx.append_build_freeze_after`.
+
+  After emitting the AST for statement `i`, looks up `freeze_after[i]`;
+  for each `xs` in that set, appends a synthetic
+  `xs = py_alist_new(Enum.reverse(xs))` AST and re-binds the type so
+  downstream Subscript/len/iter reads route through alist clauses.
+
+  Falls back to plain `convert_each/2` when the freeze map is empty —
+  no behaviour change for scopes without an append-then-readonly hit.
+  """
+  @spec convert_each_with_freezes([map()], Context.t()) :: {[Macro.t()], Context.t()}
+  def convert_each_with_freezes(nodes, context) do
+    freeze_map = context.append_build_freeze_after
+
+    if map_size(freeze_map) == 0 do
+      convert_each(nodes, context)
+    else
+      {asts, context} =
+        nodes
+        |> Enum.with_index()
+        |> Enum.reduce({[], context}, fn {node, idx}, {acc, ctx} ->
+          {ast, ctx} = convert(node, ctx)
+
+          case Map.get(freeze_map, idx) do
+            nil ->
+              {[ast | acc], ctx}
+
+            names ->
+              {freeze_asts, ctx} = emit_append_build_freezes(names, ctx)
+              # Stack: latest at head, so prepend in order.
+              new_acc = Enum.reduce(freeze_asts, [ast | acc], &[&1 | &2])
+              {new_acc, ctx}
+          end
+        end)
+
+      {Enum.reverse(asts), context}
+    end
+  end
+
+  # Emit `xs = py_alist_new(Enum.reverse(xs))` for each name in the set,
+  # and rebind the type tracker to `{:py_alist, e}` so coerce_iter and
+  # subscript-read paths see the alist representation.
+  defp emit_append_build_freezes(names, context) do
+    Enum.reduce(names, {[], context}, fn name, {acc, ctx} ->
+      atom = name |> Pylixir.Naming.rewrite() |> String.to_atom()
+      ref = {atom, [], nil}
+
+      reversed =
+        {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [ref]}
+
+      freeze_rhs = {:py_alist_new, [], [reversed]}
+      assign_ast = {:=, [], [ref, freeze_rhs]}
+
+      # Type after freeze: alist of whatever element type we had (we
+      # don't track it across the build loop precisely, so :any is the
+      # safe default). The downstream `coerce_iter` and helper clauses
+      # already handle `{:py_alist, :any}` correctly.
+      ctx =
+        ctx
+        |> TypeInfer.bind(name, {:py_alist, :any})
+        |> bind_name(name)
+
+      {[assign_ast | acc], ctx}
+    end)
   end
 
   # `@moduledoc "..."` from a Python module-level docstring. Returns

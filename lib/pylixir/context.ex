@@ -31,6 +31,24 @@ defmodule Pylixir.Context do
       (the alist optimisation, see `Pylixir.AlistAnalysis`). Populated
       when the converter enters a function body; restored on exit. Empty
       until `Pylixir.Nodes.Assign` is wired in P5.
+    * `:append_build_names` — `MapSet` of names matching the
+      "append-then-readonly" pattern (see `Pylixir.AppendBuildAnalysis`).
+      `Pylixir.Nodes.Mutations` consults it to choose the O(1) `[v | xs]`
+      prepend lowering for `.append`.
+    * `:append_build_freeze_after` — `%{stmt_idx => MapSet}` keyed by
+      top-level statement index. After emitting the statement at index
+      `i`, the body emitter injects
+      `xs = py_alist_new(Enum.reverse(xs))` for each name in the set,
+      flipping the type to `{:py_alist, _}` so downstream reads use the
+      alist helper clauses.
+    * `:pvec_names` — `%{name => default_ast}` of Python names matching
+      the `xs = [<default>] * <n>` + index-write pattern (see
+      `Pylixir.PvecAnalysis`). When the Assign node module sees a
+      candidate's bind, it rewrites the RHS into
+      `py_pvec_new(<n>, <default>)` and binds the type to
+      `{:py_pvec, _}`, so subsequent `xs[i] = v` and `xs[i]`
+      operations route through the O(log n) `:array`-backed helper
+      clauses.
   """
 
   @type def_position :: :module_top | :nested_fn | :other
@@ -62,7 +80,10 @@ defmodule Pylixir.Context do
           type_stack: [{type_frame_kind(), %{optional(String.t()) => term()}}],
           fn_signatures: %{optional(String.t()) => {[term()], term()}},
           heap_types: %{optional(String.t()) => term()},
-          freezable_names: MapSet.t(String.t())
+          freezable_names: MapSet.t(String.t()),
+          append_build_names: MapSet.t(String.t()),
+          append_build_freeze_after: %{optional(non_neg_integer()) => MapSet.t(String.t())},
+          pvec_names: %{optional(String.t()) => map()}
         }
 
   @enforce_keys [:scopes]
@@ -88,7 +109,10 @@ defmodule Pylixir.Context do
             type_stack: [],
             fn_signatures: %{},
             heap_types: %{},
-            freezable_names: MapSet.new()
+            freezable_names: MapSet.new(),
+            append_build_names: MapSet.new(),
+            append_build_freeze_after: %{},
+            pvec_names: %{}
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

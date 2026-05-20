@@ -364,6 +364,7 @@ defmodule Pylixir.RuntimeHelpers do
   # Frozen alist: leading clause keeps `{:py_alist, _}` from matching
   # the trailing `is_tuple` clause and returning a wrong size.
   def py_len({:py_alist, t}), do: tuple_size(t)
+  def py_len({:py_pvec, arr}), do: :array.size(arr)
   def py_len(x) when is_list(x), do: length(x)
   def py_len(x) when is_binary(x), do: String.length(x)
   def py_len(%MapSet{} = x), do: MapSet.size(x)
@@ -394,6 +395,11 @@ defmodule Pylixir.RuntimeHelpers do
       match?({:py_alist, _}, coll) ->
         {:py_alist, t} = coll
         Enum.map(indices, &elem(t, &1))
+
+      # Same shape rule for `{:py_pvec, _}`.
+      match?({:py_pvec, _}, coll) ->
+        {:py_pvec, arr} = coll
+        Enum.map(indices, &:array.get(&1, arr))
 
       is_tuple(coll) ->
         indices |> Enum.map(&elem(coll, &1)) |> List.to_tuple()
@@ -443,6 +449,11 @@ defmodule Pylixir.RuntimeHelpers do
     if idx >= 0, do: elem(t, idx), else: nil
   end
 
+  # Pvec clause — same out-of-bounds / negative-index semantics as
+  # alist. Must come before the `is_tuple` clauses since
+  # `{:py_pvec, _}` is structurally a tuple.
+  def py_getitem({:py_pvec, _} = pv, k), do: py_pvec_get(pv, k)
+
   def py_getitem(c, k) when is_tuple(c) and k >= 0, do: elem(c, k)
   def py_getitem(c, k) when is_tuple(c), do: elem(c, tuple_size(c) + k)
   # Maps: return `nil` for missing keys (not `Map.fetch!`/raise). This
@@ -455,6 +466,8 @@ defmodule Pylixir.RuntimeHelpers do
   # `Map.get` already — those callers are unaffected.
   def py_getitem(c, k) when is_map(c), do: Map.get(c, k)
 
+  # Pvec clause first — `{:py_pvec, _}` is structurally a tuple.
+  def py_setitem({:py_pvec, _} = pv, k, v), do: py_pvec_set(pv, k, v)
   def py_setitem(c, k, v) when is_list(c), do: List.replace_at(c, k, v)
   def py_setitem(c, k, v) when is_map(c), do: Map.put(c, k, v)
 
@@ -473,6 +486,7 @@ defmodule Pylixir.RuntimeHelpers do
   # Alist clause MUST precede the `is_tuple` clause so a frozen list
   # doesn't get matched as a Python tuple.
   def py_in(x, {:py_alist, t}), do: x in Tuple.to_list(t)
+  def py_in(x, {:py_pvec, arr}), do: x in :array.to_list(arr)
   def py_in(x, c) when is_tuple(c), do: py_in(x, Tuple.to_list(c))
 
   # Iterator handle (positive int returned by `py_iter_make/1`). Check
@@ -495,6 +509,7 @@ defmodule Pylixir.RuntimeHelpers do
   # untouched. The `{:py_alist, _}` clause unwraps the frozen tuple to
   # a fresh regular list — callers want a mutable copy back.
   def py_copy({:py_alist, t}), do: Tuple.to_list(t)
+  def py_copy({:py_pvec, arr}), do: :array.to_list(arr)
   def py_copy(x), do: x
 
   # === Alist (frozen-list representation) ===
@@ -518,6 +533,41 @@ defmodule Pylixir.RuntimeHelpers do
   # `py_repr`.
   def py_alist_new(enum), do: {:py_alist, enum |> Enum.to_list() |> List.to_tuple()}
 
+  # === Persistent-vector (pvec) helpers ===========================
+  # Used by the `xs = [default] * n` + subscript-write pattern (see
+  # `Pylixir.PvecAnalysis`). Backed by Erlang's `:array` module —
+  # O(log n) get/set, O(n) size. Wrapped in a `{:py_pvec, arr}` tag
+  # so downstream helpers can pattern-match.
+  #
+  # Why not a tuple? `put_elem/3` on a tuple is O(n) — copies the
+  # whole tuple — which makes a build loop O(n²). `:array` is O(log
+  # n) per write, turning a 10⁵-element fill from ~10⁹ ops down to
+  # ~10⁶.
+
+  def py_pvec_new(size, default) when is_integer(size) and size >= 0 do
+    {:py_pvec, :array.new([{:size, size}, {:fixed, true}, {:default, default}])}
+  end
+
+  def py_pvec_get({:py_pvec, arr}, k) when k >= 0 do
+    if k < :array.size(arr), do: :array.get(k, arr), else: nil
+  end
+
+  def py_pvec_get({:py_pvec, arr}, k) do
+    idx = :array.size(arr) + k
+    if idx >= 0, do: :array.get(idx, arr), else: nil
+  end
+
+  def py_pvec_set({:py_pvec, arr}, k, v) when k >= 0 do
+    {:py_pvec, :array.set(k, v, arr)}
+  end
+
+  def py_pvec_set({:py_pvec, arr}, k, v) do
+    {:py_pvec, :array.set(:array.size(arr) + k, v, arr)}
+  end
+
+  def py_pvec_len({:py_pvec, arr}), do: :array.size(arr)
+  def py_pvec_to_list({:py_pvec, arr}), do: :array.to_list(arr)
+
   # Cross-type structural equality. `{:py_alist, t1} == [1, 2, 3]` is
   # false under Elixir's `==/2` (one's a tuple-shaped term, the other
   # a list), but in Python the corresponding values would compare
@@ -527,6 +577,8 @@ defmodule Pylixir.RuntimeHelpers do
   # _}`; everything else stays on plain `==/2`.
   def py_eq({:py_alist, _} = a, b), do: py_iter_to_list(a) == py_iter_to_list(b)
   def py_eq(a, {:py_alist, _} = b), do: py_iter_to_list(a) == py_iter_to_list(b)
+  def py_eq({:py_pvec, _} = a, b), do: py_iter_to_list(a) == py_iter_to_list(b)
+  def py_eq(a, {:py_pvec, _} = b), do: py_iter_to_list(a) == py_iter_to_list(b)
   def py_eq(a, b), do: a == b
 
   # === Type conversion ===
@@ -575,6 +627,7 @@ defmodule Pylixir.RuntimeHelpers do
   # Alist renders Python-list-style (`"[1, 2, 3]"`), NOT tuple-style
   # — leading clause keeps it out of the `is_tuple` clause below.
   def py_str({:py_alist, _} = a), do: py_repr(a)
+  def py_str({:py_pvec, _} = a), do: py_repr(a)
   def py_str(x) when is_tuple(x), do: py_repr(x)
   def py_str(%MapSet{} = s), do: py_repr(s)
   def py_str(x) when is_map(x) and not is_struct(x), do: py_repr(x)
@@ -729,6 +782,7 @@ defmodule Pylixir.RuntimeHelpers do
   # Alist renders identically to a regular list — the freeze is an
   # internal optimisation, not user-visible.
   def py_repr({:py_alist, t}), do: py_repr(Tuple.to_list(t))
+  def py_repr({:py_pvec, arr}), do: py_repr(:array.to_list(arr))
 
   def py_repr(x) when is_tuple(x) do
     items = Tuple.to_list(x)
@@ -955,8 +1009,22 @@ defmodule Pylixir.RuntimeHelpers do
     |> Enum.reverse()
   end
 
-  def py_str_count(s, ""), do: String.length(s) + 1
-  def py_str_count(s, sub), do: length(String.split(s, sub)) - 1
+  def py_str_count(s, "") when is_binary(s), do: String.length(s) + 1
+  def py_str_count(s, sub) when is_binary(s), do: length(String.split(s, sub)) - 1
+
+  # Python's `list.count(v)` / `tuple.count(v)` — count of equal
+  # elements. Pylixir's converter always emits `py_str_count`
+  # regardless of receiver type; dispatch at runtime. Alist / pvec
+  # clauses MUST come before the `is_tuple` guard since the tagged
+  # tuples are structurally tuples themselves.
+  def py_str_count({:py_alist, t}, x), do: py_str_count(Tuple.to_list(t), x)
+  def py_str_count({:py_pvec, arr}, x), do: py_str_count(:array.to_list(arr), x)
+
+  def py_str_count(list, x) when is_list(list),
+    do: Enum.count(list, fn v -> v == x end)
+
+  def py_str_count(tuple, x) when is_tuple(tuple),
+    do: py_str_count(Tuple.to_list(tuple), x)
 
   # Python's `str.islower()` / `str.isupper()` — non-empty AND every
   # cased char matches the predicate AND at least one cased char
@@ -1146,6 +1214,13 @@ defmodule Pylixir.RuntimeHelpers do
       idx -> idx
     end
   end
+
+  # Alist / pvec clauses MUST come before the `is_tuple` clause — a
+  # `{:py_alist, t}` / `{:py_pvec, arr}` is structurally a 2-tuple
+  # and would otherwise be turned into the list `[tag, t]` and
+  # never find the target.
+  def py_str_index({:py_alist, t}, x), do: py_list_index(Tuple.to_list(t), x)
+  def py_str_index({:py_pvec, arr}, x), do: py_list_index(:array.to_list(arr), x)
 
   def py_str_index(list, x) when is_list(list), do: py_list_index(list, x)
 
@@ -1432,6 +1507,7 @@ defmodule Pylixir.RuntimeHelpers do
   # `[v0, v1, ...]` rather than as a Python tuple's elements (the
   # outer behaviour is the same shape, but the type-tag would leak).
   def py_iter_to_list({:py_alist, t}), do: Tuple.to_list(t)
+  def py_iter_to_list({:py_pvec, arr}), do: :array.to_list(arr)
   def py_iter_to_list(t) when is_tuple(t), do: Tuple.to_list(t)
   # Python iterates dicts by KEYS, not entries. `Enum.to_list/1` on a
   # map yields `[{k, v}, ...]` which is `dict.items()` shape — wrong

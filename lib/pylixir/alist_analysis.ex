@@ -126,12 +126,35 @@ defmodule Pylixir.AlistAnalysis do
          %{
            "_type" => "Assign",
            "targets" => [%{"_type" => "Name", "id" => name}],
-           "value" => %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "list"}}
+           "value" => value
          } = node
-       ),
-       do: {:ok, name, node}
+       ) do
+    if freezable_rhs?(value), do: {:ok, name, node}, else: :no
+  end
 
   defp list_call_binding(_), do: :no
+
+  # Shapes whose evaluation produces a fresh regular Elixir list that
+  # the converter is safe to wrap in `py_alist_new/1`.
+  #
+  #   * `list(<iter>)`  — the original initial-cut shape.
+  #   * `[<expr> for ... in ...]` — list comprehension; converter
+  #     lowers to `Enum.map(...)` / `Enum.reduce(..., [])` / similar,
+  #     all of which return plain Elixir lists.
+  #   * `sorted(<iter>, ...)` — Pylixir lowers to `Enum.sort(...)` or
+  #     `Enum.sort_by(...)`; both return plain lists.
+  #
+  # Keep this in sync with `Pylixir.Nodes.Assign.python_freezable_rhs?/1`
+  # — emission and analysis must agree on the RHS shape we freeze.
+  defp freezable_rhs?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "list"}}),
+    do: true
+
+  defp freezable_rhs?(%{"_type" => "ListComp"}), do: true
+
+  defp freezable_rhs?(%{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "sorted"}}),
+    do: true
+
+  defp freezable_rhs?(_), do: false
 
   # === Per-candidate decision ========================================
 
@@ -191,22 +214,41 @@ defmodule Pylixir.AlistAnalysis do
     Enum.any?(body, &leak_in?(&1, name))
   end
 
-  # The candidate's own `xs = list(<expr>)` Assign — the target
-  # `Name(xs)` is the bind site, not a leak. Walk only the value
-  # (so `xs = list(xs)` or `xs = list(something_with_xs)` still
-  # gets caught via the value descent). A reassignment that matches
-  # this shape was already rejected upstream by the "multiple
-  # bindings" check, so it never reaches the leak detector.
+  # The candidate's own freezable Assign (`xs = list(...)`,
+  # `xs = [<expr> for ... in ...]`, `xs = sorted(...)`) — the target
+  # `Name(xs)` is the bind site, not a leak. Walk only the value so
+  # any embedded `xs` reference inside the RHS still gets caught
+  # via descent. A reassignment that matches this shape was already
+  # rejected upstream by the "multiple bindings" check, so it never
+  # reaches the leak detector.
   defp leak_in?(
          %{
            "_type" => "Assign",
            "targets" => [%{"_type" => "Name", "id" => target_id}],
-           "value" => %{"_type" => "Call", "func" => %{"_type" => "Name", "id" => "list"}} = value
+           "value" => value
          },
          name
        )
        when target_id == name do
-    leak_in?(value, name)
+    if freezable_rhs?(value) do
+      leak_in?(value, name)
+    else
+      # Non-freezable RHS — descend through the generic Name-target
+      # Assign clause so `xs = whatever_with_xs` flags as a leak.
+      # We delegate by walking value's children with leak_in?/2.
+      case value do
+        %{"_type" => _} = sub ->
+          sub
+          |> Map.delete("_type")
+          |> Enum.any?(fn {_k, v} -> leak_in?(v, name) end)
+
+        list when is_list(list) ->
+          Enum.any?(list, &leak_in?(&1, name))
+
+        _ ->
+          false
+      end
+    end
   end
 
   # Subscript: `xs[i]` and `xs[a:b]` are read shapes. The `value`

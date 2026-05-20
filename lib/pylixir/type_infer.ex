@@ -23,6 +23,7 @@ defmodule Pylixir.TypeInfer do
           | {:none}
           | {:list, t()}
           | {:py_alist, t()}
+          | {:py_pvec, t()}
           | {:tuple, [t()] | :any_arity}
           | {:dict, t(), t()}
           | {:set}
@@ -100,6 +101,7 @@ defmodule Pylixir.TypeInfer do
   # type tracker would fall through to `union/1`, which is fine for
   # soundness but kills downstream alist-aware specialisation.
   def lub({:py_alist, a}, {:py_alist, b}), do: {:py_alist, lub(a, b)}
+  def lub({:py_pvec, a}, {:py_pvec, b}), do: {:py_pvec, lub(a, b)}
   def lub({:dict, ka, va}, {:dict, kb, vb}), do: {:dict, lub(ka, kb), lub(va, vb)}
 
   def lub({:tuple, ta}, {:tuple, tb}) when is_list(ta) and is_list(tb) do
@@ -152,6 +154,7 @@ defmodule Pylixir.TypeInfer do
   @spec elem_of(t()) :: t()
   def elem_of({:list, e}), do: e
   def elem_of({:py_alist, e}), do: e
+  def elem_of({:py_pvec, e}), do: e
   def elem_of({:str}), do: {:str}
   def elem_of({:tuple, ts}) when is_list(ts), do: lub_all(ts)
   def elem_of({:tuple, :any_arity}), do: :any

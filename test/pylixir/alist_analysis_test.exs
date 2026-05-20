@@ -281,7 +281,10 @@ defmodule Pylixir.AlistAnalysisTest do
         assign("r", list_comp)
       ]
 
-      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+      # Both freeze: `xs` was always a freezable candidate; `r` is a
+      # ListComp bind, which Task-2 widened the gate to accept as a
+      # fresh-list source.
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs", "r"])
     end
 
     test "MUTATION inside a nested def bails (descending walk catches it)" do

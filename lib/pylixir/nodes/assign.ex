@@ -457,35 +457,51 @@ defmodule Pylixir.Nodes.Assign do
 
         :no ->
           value_type = TypeInfer.infer_expr(value, context)
-          {value_ast, context} = Converter.convert(value, context)
 
-          # Alist freeze (P5): when the safety check (P3) has put
-          # this name in `freezable_names` AND the RHS is a `list(...)`
-          # builtin call, wrap the converted value in `py_alist_new/1`
-          # and switch the bound type to `{:py_alist, elem_t}`. Every
-          # downstream consumer either handles alists via the helper
-          # clauses added in P1 or routes through `coerce_iter`
-          # (`is_list?({:py_alist, _})` returns false, P2). Bail on
-          # any other RHS shape — the analysis's allowlist is built
-          # around the `list(...)` form specifically.
-          {emitted_value_ast, bound_type} =
-            if MapSet.member?(context.freezable_names, id) and
-                 python_calls_list_builtin?(value) do
-              elem_t =
-                case value_type do
-                  {:list, e} -> e
-                  _ -> :any
+          # Pvec emission (Task 3): when the safety check has put this
+          # name in `pvec_names` AND the RHS is a `[<default>] * <n>`
+          # BinOp, rewrite the RHS to `py_pvec_new(<n>, <default>)`
+          # — an :array-backed persistent vector with O(log n)
+          # get/set. Element type stays unknown (`:any`) since the
+          # default's static type may not reflect what the writes put.
+          case maybe_pvec_emission(id, value, context) do
+            {:ok, pvec_ast, ctx2} ->
+              ctx2 = TypeInfer.bind(ctx2, id, {:py_pvec, :any})
+              ctx2 = Converter.bind_name(ctx2, id)
+              {target_ast, ctx2} = Converter.convert(target, ctx2)
+              {{:=, [], [target_ast, pvec_ast]}, ctx2}
+
+            :no ->
+              {value_ast, context} = Converter.convert(value, context)
+
+              # Alist freeze (P5): when the safety check (P3) has put
+              # this name in `freezable_names` AND the RHS is one of
+              # the freezable shapes (`list(...)`, list comprehension,
+              # `sorted(...)`), wrap the converted value in
+              # `py_alist_new/1` and switch the bound type to
+              # `{:py_alist, elem_t}`. Every downstream consumer either
+              # handles alists via the helper clauses or routes
+              # through `coerce_iter` (`is_list?({:py_alist, _})`
+              # returns false).
+              {emitted_value_ast, bound_type} =
+                if MapSet.member?(context.freezable_names, id) and
+                     python_freezable_rhs?(value) do
+                  elem_t =
+                    case value_type do
+                      {:list, e} -> e
+                      _ -> :any
+                    end
+
+                  {{:py_alist_new, [], [value_ast]}, {:py_alist, elem_t}}
+                else
+                  {value_ast, value_type}
                 end
 
-              {{:py_alist_new, [], [value_ast]}, {:py_alist, elem_t}}
-            else
-              {value_ast, value_type}
-            end
-
-          context = TypeInfer.bind(context, id, bound_type)
-          context = Converter.bind_name(context, id)
-          {target_ast, context} = Converter.convert(target, context)
-          {{:=, [], [target_ast, emitted_value_ast]}, context}
+              context = TypeInfer.bind(context, id, bound_type)
+              context = Converter.bind_name(context, id)
+              {target_ast, context} = Converter.convert(target, context)
+              {{:=, [], [target_ast, emitted_value_ast]}, context}
+          end
       end
     end
   end
@@ -575,17 +591,77 @@ defmodule Pylixir.Nodes.Assign do
   # catch-all so they don't split the `single_target_assign/4` clause
   # cluster.
 
-  # Python-AST shape predicate: is this a call to the builtin
-  # `list(<anything>)`? Mirrors `Pylixir.AlistAnalysis`'s candidate
-  # filter so emission and safety check agree on the RHS shape we
-  # freeze.
-  defp python_calls_list_builtin?(%{
+  # Python-AST shape predicate: does this expression produce a fresh
+  # regular Elixir list that's safe to wrap in `py_alist_new/1`?
+  # Mirrors `Pylixir.AlistAnalysis.freezable_rhs?/1` — emission and
+  # safety check must agree on the RHS shape we freeze.
+  #
+  #   * `list(<iter>)`           — initial-cut shape.
+  #   * `[<expr> for ... in ...]` — list comprehension, lowers to
+  #     `Enum.map`/`Enum.reduce(..., [])` (both return plain lists).
+  #   * `sorted(<iter>, ...)`    — lowers to `Enum.sort`/`Enum.sort_by`,
+  #     both return plain lists.
+  defp python_freezable_rhs?(%{
          "_type" => "Call",
          "func" => %{"_type" => "Name", "id" => "list"}
        }),
        do: true
 
-  defp python_calls_list_builtin?(_), do: false
+  defp python_freezable_rhs?(%{"_type" => "ListComp"}), do: true
+
+  defp python_freezable_rhs?(%{
+         "_type" => "Call",
+         "func" => %{"_type" => "Name", "id" => "sorted"}
+       }),
+       do: true
+
+  defp python_freezable_rhs?(_), do: false
+
+  # Pvec emission helper. If the candidate name is in `pvec_names`
+  # and the RHS matches `[<default>] * <n>` (or the symmetric form
+  # `<n> * [<default>]`), build `py_pvec_new(<n>_ast, <default>_ast)`
+  # and return it. The default value comes from the analyzer (already
+  # captured at decision time); we re-extract the multiplier from the
+  # current RHS so we can convert it in this context.
+  defp maybe_pvec_emission(id, value, context) do
+    case Map.fetch(context.pvec_names, id) do
+      :error ->
+        :no
+
+      {:ok, default_python_ast} ->
+        case multiplier_from_rhs(value) do
+          {:ok, mult_ast} ->
+            {mult_elixir, ctx2} = Converter.convert(mult_ast, context)
+            {default_elixir, ctx2} = Converter.convert(default_python_ast, ctx2)
+            {:ok, {:py_pvec_new, [], [mult_elixir, default_elixir]}, ctx2}
+
+          :no ->
+            :no
+        end
+    end
+  end
+
+  # Given a `BinOp(Mult, left, right)` where one side is a
+  # single-element list literal, return the *other* side's AST (the
+  # multiplier). The analyzer accepted the candidate already; here we
+  # just need to identify which side was the list.
+  defp multiplier_from_rhs(%{
+         "_type" => "BinOp",
+         "op" => %{"_type" => "Mult"},
+         "left" => %{"_type" => "List", "elts" => [_]},
+         "right" => right
+       }),
+       do: {:ok, right}
+
+  defp multiplier_from_rhs(%{
+         "_type" => "BinOp",
+         "op" => %{"_type" => "Mult"},
+         "left" => left,
+         "right" => %{"_type" => "List", "elts" => [_]}
+       }),
+       do: {:ok, left}
+
+  defp multiplier_from_rhs(_), do: :no
 
   defp detect_mutating_method_call(
          %{
