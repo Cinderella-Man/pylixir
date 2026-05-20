@@ -30,6 +30,17 @@ defmodule Eval do
 
   @type accumulator :: %{
           counts: %{Bucket.bucket_key() => non_neg_integer()},
+          # Per-bucket sub-counts: how many testcases were observed for
+          # samples that landed in this bucket, and how many of those
+          # testcases passed. Lets the run summary show e.g.
+          # `ok: 58 samples / 1247 testcases passed` instead of forcing
+          # the reader to divide the global totals manually.
+          testcase_counts: %{
+            Bucket.bucket_key() => %{
+              run: non_neg_integer(),
+              passed: non_neg_integer()
+            }
+          },
           samples: %{Bucket.bucket_key() => [sample_entry()]},
           totals: %{
             processed: non_neg_integer(),
@@ -105,6 +116,7 @@ defmodule Eval do
 
     initial = %{
       counts: %{},
+      testcase_counts: %{},
       samples: %{},
       totals: %{
         processed: 0,
@@ -127,11 +139,14 @@ defmodule Eval do
       {:ok, {sample, bucket_key, metadata}}, acc ->
         cap = if bucket_key == :ok, do: save_ok, else: samples_per_bucket
         per_tc = Map.get(metadata, :per_testcase, [])
+        tc_run = length(per_tc)
+        tc_passed = count_passed(per_tc)
 
         acc
         |> update_in([:totals, :processed], &(&1 + 1))
-        |> update_in([:totals, :testcases_run], &(&1 + length(per_tc)))
-        |> update_in([:totals, :testcases_passed], &(&1 + count_passed(per_tc)))
+        |> update_in([:totals, :testcases_run], &(&1 + tc_run))
+        |> update_in([:totals, :testcases_passed], &(&1 + tc_passed))
+        |> bump_testcase_counts(bucket_key, tc_run, tc_passed)
         |> maybe_count_transpiled(bucket_key)
         |> bump_count(bucket_key)
         |> maybe_store_sample(bucket_key, sample, metadata, cap)
@@ -426,6 +441,13 @@ defmodule Eval do
 
   defp bump_count(acc, key),
     do: update_in(acc.counts[key], fn n -> (n || 0) + 1 end)
+
+  defp bump_testcase_counts(acc, key, run, passed) do
+    update_in(acc.testcase_counts[key], fn
+      nil -> %{run: run, passed: passed}
+      %{run: r, passed: p} -> %{run: r + run, passed: p + passed}
+    end)
+  end
 
   defp maybe_count_transpiled(acc, :ok),
     do: update_in(acc.totals.transpiled, &(&1 + 1))

@@ -164,8 +164,10 @@ defmodule PylixirTest do
 
         elixir_src = Pylixir.transpile(python_src)
 
-        # Pin the rebind shape: `adj = py_setitem(adj, …, py_getitem(adj, …) ++ …)`.
-        assert elixir_src =~ ~r/py_setitem\(adj, 0, py_getitem\(adj, 0\)/
+        # Pin the rebind shape: `adj = py_setitem(adj, 0, py_append(py_getitem(adj, 0), …))`.
+        # The `py_append` helper replaced the raw `++ [v]` so a
+        # missing-key chain doesn't crash on `nil ++ [v]`.
+        assert elixir_src =~ ~r/py_setitem\(adj, 0, py_append\(py_getitem\(adj, 0\)/
 
         # `adj` must NOT have been promoted to a module attribute.
         refute elixir_src =~ "@var_adj"

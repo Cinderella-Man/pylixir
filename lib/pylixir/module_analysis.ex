@@ -1176,19 +1176,38 @@ defmodule Pylixir.ModuleAnalysis do
 
   defp mutated_inside_top_def?(body, name) do
     Enum.any?(body, fn
-      %{"_type" => type, "body" => def_body}
+      %{"_type" => type, "body" => def_body} = node
       when type in ["FunctionDef", "AsyncFunctionDef"] ->
-        not def_rebinds_name?(def_body, name) and def_mutates_name?(def_body, name)
+        not def_param_shadows?(node, name) and
+          not def_rebinds_name?(def_body, name) and def_mutates_name?(def_body, name)
 
       _ ->
         false
     end)
   end
 
+  # Function parameter with the same name shadows the module-level
+  # binding for the entire body — `def f(x): x += 1` mutates the
+  # local param, never the module-level `x`.
+  defp def_param_shadows?(%{"args" => args}, name) when is_map(args) do
+    args
+    |> Map.take(["args", "posonlyargs", "kwonlyargs"])
+    |> Map.values()
+    |> List.flatten()
+    |> Enum.any?(fn
+      %{"_type" => "arg", "arg" => ^name} -> true
+      _ -> false
+    end)
+  end
+
+  defp def_param_shadows?(_, _), do: false
+
   # A `name = ...` (bare Name LHS) anywhere in the def body shadows
   # the module-level name — Python's local-by-default rule. Subscript
   # mutations of that local don't reach the global, so we don't reject
-  # the global's promotion in that case.
+  # the global's promotion in that case. The same logic applies to
+  # `for name in ...:` — the for-target binds a fresh local on every
+  # iteration, which shadows any module-level `name`.
   defp def_rebinds_name?(def_body, name) do
     Enum.any?(def_body, fn n ->
       Walk.walk_scope(n, false, fn node, acc -> acc or assigns_local_name?(node, name) end)
@@ -1201,6 +1220,13 @@ defmodule Pylixir.ModuleAnalysis do
       _ -> false
     end)
   end
+
+  # `for name in ...:` — the for-target rebinds `name` locally.
+  defp assigns_local_name?(
+         %{"_type" => "For", "target" => %{"_type" => "Name", "id" => id}},
+         name
+       ),
+       do: id == name
 
   defp assigns_local_name?(_, _), do: false
 

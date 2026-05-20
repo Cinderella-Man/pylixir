@@ -175,8 +175,14 @@ defmodule Mix.Tasks.Eval.Run do
     IO.puts("no samples processed")
   end
 
-  defp print_top_buckets(%{counts: counts, totals: totals}) do
+  defp print_top_buckets(%{counts: counts, totals: totals} = acc) do
     IO.puts("\n--- top buckets ---")
+
+    tc_counts = Map.get(acc, :testcase_counts, %{})
+
+    IO.puts(
+      "  #{String.pad_trailing("bucket", 50)} #{String.pad_leading("samples", 8)}  share   testcases (pass/run)"
+    )
 
     counts
     |> Enum.sort_by(fn {_k, n} -> -n end)
@@ -189,9 +195,20 @@ defmodule Mix.Tasks.Eval.Run do
           do: :erlang.float_to_binary(n / totals.processed * 100, decimals: 1),
           else: "0.0"
 
+      %{run: tc_run, passed: tc_passed} = Map.get(tc_counts, key, %{run: 0, passed: 0})
+
+      tc_summary =
+        if tc_run == 0,
+          do: "—",
+          else: "#{tc_passed}/#{tc_run}"
+
       IO.puts(
-        "  #{String.pad_trailing(slug, 50)} #{String.pad_leading(Integer.to_string(n), 6)}  #{share}%"
+        "  #{String.pad_trailing(slug, 50)} #{String.pad_leading(Integer.to_string(n), 8)}  #{String.pad_leading(share <> "%", 5)}   #{tc_summary}"
       )
     end)
+
+    IO.puts(
+      "  #{String.pad_trailing("TOTAL", 50)} #{String.pad_leading(Integer.to_string(totals.processed), 8)}          #{totals.testcases_passed}/#{totals.testcases_run}"
+    )
   end
 end

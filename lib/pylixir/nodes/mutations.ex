@@ -323,8 +323,14 @@ defmodule Pylixir.Nodes.Mutations do
     {ast, context}
   end
 
+  # `xs.append(v)` → `py_append(xs, v)`. The helper unwraps nil to
+  # `[v]` so `coll[k].append(v)` works on a defaultdict-style missing
+  # key without crashing on `nil ++ [v]`. The Name-target case for
+  # append-build candidates is intercepted earlier in `emit/6` and
+  # emits a prepend instead, so this clause only fires for the
+  # subscript-target path and for unfreezable Name receivers.
   defp mutation_rhs("append", target, [x], _kw, _node),
-    do: {:++, [], [target, [x]]}
+    do: {:py_append, [], [target, x]}
 
   # `q.appendleft(x)` — deque prepend; Pylixir's deque rep is a plain
   # Elixir list, so `[x | q]` matches Python's O(1) leftward append.

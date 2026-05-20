@@ -177,6 +177,75 @@ defmodule Pylixir.ModuleAnalysisTest do
 
       assert Enum.map(analysis.module_attrs, &elem(&1, 0)) == ["PI"]
     end
+
+    # Regression (eval --skip 100 --limit 100, sample seed_14984--*):
+    # a module-level `for r in range(s)` binds `r` at module scope, but
+    # a `for r in range(s_val)` inside a top-level def is a FRESH local
+    # `r` (Python's for-target binding is local-by-default). The old
+    # `def_rebinds_name?` only looked at `Assign` nodes, so the inner
+    # for-target wasn't recognized as a local rebind — the analyzer
+    # then flagged the def as mutating the "module-level" `r` and
+    # raised `unsupported--Module`. Same issue applies to function
+    # parameters and comprehension targets.
+    test "for-loop target inside a def shadows the same-named outer for-target" do
+      empty_args = %{
+        "_type" => "arguments",
+        "args" => [],
+        "posonlyargs" => [],
+        "kwonlyargs" => [],
+        "kw_defaults" => [],
+        "defaults" => []
+      }
+
+      body = [
+        %{
+          "_type" => "For",
+          "target" => name("r"),
+          "iter" => call(name("range"), [const(3)]),
+          "body" => [expr_call("counts", "append", [name("r")])]
+        },
+        %{
+          "_type" => "FunctionDef",
+          "name" => "compute",
+          "args" => empty_args,
+          "body" => [
+            %{
+              "_type" => "For",
+              "target" => name("r"),
+              "iter" => call(name("range"), [name("s_val")]),
+              "body" => [assign("count", name("r"))]
+            }
+          ]
+        }
+      ]
+
+      # Should NOT raise — the inner `for r in ...` is a fresh local
+      # binding that shadows the module-level `r`.
+      ModuleAnalysis.analyze(body)
+    end
+
+    test "function param with the same name shadows a module-level binding" do
+      body = [
+        assign("x", const(1)),
+        %{
+          "_type" => "FunctionDef",
+          "name" => "f",
+          "body" => [%{"_type" => "AugAssign", "target" => name("x"), "value" => const(1)}],
+          "args" => %{
+            "_type" => "arguments",
+            "args" => [%{"_type" => "arg", "arg" => "x"}],
+            "posonlyargs" => [],
+            "kwonlyargs" => [],
+            "kw_defaults" => [],
+            "defaults" => []
+          }
+        }
+      ]
+
+      # Param `x` shadows the module-level `x`; `x += 1` inside `f`
+      # mutates the local param, not the module-level binding.
+      ModuleAnalysis.analyze(body)
+    end
   end
 
   describe "analyze/1 — runtime_statements bucket" do

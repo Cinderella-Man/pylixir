@@ -433,6 +433,13 @@ defmodule Pylixir.RuntimeHelpers do
     Stream.iterate(start, &(&1 + step)) |> Enum.take_while(&(&1 > stop))
   end
 
+  # Chained-subscript missing-key propagation: when an outer map
+  # returns `nil` for a missing key (Pylixir's chosen list/map miss
+  # semantics), the next `xs[k]` would `FunctionClauseError` without
+  # this leading clause. Returning `nil` lets the value flow through
+  # `nil`-aware helpers (`py_add(nil, n) == n`, etc.), matching what
+  # nested `defaultdict` expressions like `d[c][k]` produce in Python.
+  def py_getitem(nil, _k), do: nil
   def py_getitem(c, k) when is_list(c), do: Enum.at(c, k)
   def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
   # Alist: O(1) `elem/2`, but bounds-checked because the existing
@@ -468,6 +475,12 @@ defmodule Pylixir.RuntimeHelpers do
 
   # Pvec clause first — `{:py_pvec, _}` is structurally a tuple.
   def py_setitem({:py_pvec, _} = pv, k, v), do: py_pvec_set(pv, k, v)
+  # Nested-subscript-write missing-key path: `d[c][k] = v` lowers
+  # to `py_setitem(py_getitem(d, c), k, v)`. When `c` is missing,
+  # the inner read returns nil (see `py_getitem(nil, _)`), so we
+  # materialise a fresh map here — matches Python's
+  # `defaultdict(lambda: defaultdict(...))` auto-creation behaviour.
+  def py_setitem(nil, k, v), do: %{k => v}
   def py_setitem(c, k, v) when is_list(c), do: List.replace_at(c, k, v)
   def py_setitem(c, k, v) when is_map(c), do: Map.put(c, k, v)
 
@@ -532,6 +545,14 @@ defmodule Pylixir.RuntimeHelpers do
   # `py_len`, `py_in`, `py_iter_to_list`, `py_slice`, `py_str`,
   # `py_repr`.
   def py_alist_new(enum), do: {:py_alist, enum |> Enum.to_list() |> List.to_tuple()}
+
+  # `xs.append(v)` ↦ `py_append(xs, v)`. Wrap rather than raw `++ [v]`
+  # so a missing-key chain like `d[c].append(v)` (which produces nil
+  # at the inner `py_getitem`) materialises a fresh list instead of
+  # crashing with ArgumentError — matches Python's
+  # `defaultdict(list)` auto-creation.
+  def py_append(nil, v), do: [v]
+  def py_append(xs, v) when is_list(xs), do: xs ++ [v]
 
   # === Persistent-vector (pvec) helpers ===========================
   # Used by the `xs = [default] * n` + subscript-write pattern (see

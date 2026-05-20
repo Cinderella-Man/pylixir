@@ -245,6 +245,49 @@ defmodule Pylixir.RuntimeHelpersTest do
       assert H.py_getitem(a, -4) == nil
     end
 
+    # Regression (eval --skip 200 --limit 100, seed_1720--799b5d32):
+    # nested defaultdict subscripts (`char_dict[c][prev_sum]`) lower
+    # to chained `py_getitem` calls. When the OUTER dict has no entry
+    # for `c`, the outer lookup returns `nil` (Pylixir's chosen
+    # missing-key semantics — see the map clause comment) and the
+    # next `py_getitem(nil, prev_sum)` had no matching function clause,
+    # crashing with FunctionClauseError. Returning `nil` propagates
+    # cleanly through Pylixir's `nil`-as-additive-identity helpers
+    # (e.g. `py_add(nil, n) == n`).
+    test "py_getitem on nil returns nil (chained-subscript missing-key path)" do
+      assert H.py_getitem(nil, "anything") == nil
+      assert H.py_getitem(nil, 0) == nil
+    end
+
+    # Sibling regression: `char_dict[c][k] += 1` lowers to
+    # `py_setitem(py_getitem(char_dict, c), k, ...)`. When `c` is
+    # missing, the inner `py_getitem` now returns nil (per the test
+    # above), so `py_setitem` receives nil. Materialise as a fresh
+    # map containing just `k => v` — the outer `py_setitem` then
+    # binds that map at key `c`, mirroring Python's defaultdict
+    # auto-creation.
+    test "py_setitem on nil materialises a fresh map for nested-subscript writes" do
+      assert H.py_setitem(nil, "x", 1) == %{"x" => 1}
+      assert H.py_setitem(nil, 0, 42) == %{0 => 42}
+    end
+
+    # Regression (eval --skip 200 --limit 100, seed_1720--3aa6d273):
+    # `char_indices[c].append(idx)` lowers to
+    # `py_setitem(coll, c, py_getitem(coll, c) ++ [idx])`. With a
+    # missing `c`, `py_getitem` returns nil and the raw `++` operator
+    # blows up with ArgumentError. A dedicated `py_append/2` helper
+    # treats nil as an empty list — matches Python's
+    # `defaultdict(list)` auto-creation.
+    test "py_append on nil creates a new single-element list" do
+      assert H.py_append(nil, 1) == [1]
+      assert H.py_append(nil, "x") == ["x"]
+    end
+
+    test "py_append on a plain list appends at the tail (preserves order)" do
+      assert H.py_append([1, 2], 3) == [1, 2, 3]
+      assert H.py_append([], 1) == [1]
+    end
+
     test "py_len returns tuple_size; does not accidentally hit the is_tuple clause" do
       a = H.py_alist_new([:a, :b, :c, :d])
       assert H.py_len(a) == 4
