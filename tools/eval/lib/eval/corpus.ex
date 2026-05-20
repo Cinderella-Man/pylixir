@@ -56,20 +56,27 @@ defmodule Eval.Corpus do
     * `:testcase_shards` — number of `seed_testcase` shards to load
       (default 1). Each shard adds ~1.5 GB to the resident
       `testcases_by_qid` map.
+    * `:dataset_module` — module implementing the `shard_count/1`,
+      `shard_path/2`, `read_sft_shard/2`, `read_testcase_shard/3`
+      surface. Defaults to `Eval.Dataset`. Tests pass a fake.
+    * `:cache_path` — override the on-disk cache path. Defaults to
+      `cache/corpus_v1.term.gz` under `tools/eval/`.
   """
   @spec build(keyword()) :: {Enumerable.t(), stats()}
   def build(opts \\ []) do
     k = Keyword.get(opts, :testcase_shards, 1)
+    dataset = Keyword.get(opts, :dataset_module, Dataset)
+    cache_path = Keyword.get(opts, :cache_path, default_cache_path())
 
     {solutions_by_qid, testcases_by_qid} =
-      case load_cache(k) do
+      case load_cache(k, cache_path) do
         {:hit, payload} ->
-          IO.puts("[corpus] warm cache hit (#{cache_path()})")
+          IO.puts("[corpus] warm cache hit (#{cache_path})")
           {payload.solutions_by_qid, payload.testcases_by_qid}
 
         :miss ->
           IO.puts("[corpus] cold build (testcase_shards=#{k})")
-          rebuild_and_cache(k)
+          rebuild_and_cache(k, dataset, cache_path)
       end
 
     stats = compute_stats(solutions_by_qid, testcases_by_qid)
@@ -78,22 +85,24 @@ defmodule Eval.Corpus do
   end
 
   @doc """
-  On-disk path of the corpus cache file.
+  On-disk path of the corpus cache file (default location).
   """
   @spec cache_path() :: String.t()
-  def cache_path do
+  def cache_path, do: default_cache_path()
+
+  defp default_cache_path do
     Path.join(Path.expand("../../cache", __DIR__), @cache_filename)
   end
 
   # --- Cold build ------------------------------------------------------
 
-  defp rebuild_and_cache(k) do
-    sft_total = Dataset.shard_count(:seed_sft)
+  defp rebuild_and_cache(k, dataset, cache_path) do
+    sft_total = dataset.shard_count(:seed_sft)
 
     solutions_by_qid =
       Enum.reduce(0..(sft_total - 1), %{}, fn idx, acc ->
         IO.puts("[corpus] seed_sft shard #{idx + 1}/#{sft_total}")
-        df = Dataset.read_sft_shard(idx, ["question_id", "code", "is_passed"])
+        df = dataset.read_sft_shard(idx, ["question_id", "code", "is_passed"])
         accumulate_solutions(df, acc)
       end)
       |> materialise_solutions()
@@ -105,7 +114,7 @@ defmodule Eval.Corpus do
         IO.puts("[corpus] seed_testcase shard #{idx + 1}/#{k}")
 
         df =
-          Dataset.read_testcase_shard(idx, qid_filter, [
+          dataset.read_testcase_shard(idx, qid_filter, [
             "question_id",
             "inputs",
             "outputs"
@@ -114,7 +123,7 @@ defmodule Eval.Corpus do
         accumulate_testcases(df, acc)
       end)
 
-    write_cache(k, solutions_by_qid, testcases_by_qid)
+    write_cache(k, solutions_by_qid, testcases_by_qid, dataset, cache_path)
     {solutions_by_qid, testcases_by_qid}
   end
 
@@ -167,9 +176,7 @@ defmodule Eval.Corpus do
 
   # --- Cache I/O -------------------------------------------------------
 
-  defp load_cache(k) do
-    path = cache_path()
-
+  defp load_cache(k, path) do
     with true <- File.exists?(path),
          {:ok, binary} <- File.read(path),
          {:ok, payload} <- safe_decode(binary),
@@ -208,16 +215,15 @@ defmodule Eval.Corpus do
     end)
   end
 
-  defp write_cache(k, solutions_by_qid, testcases_by_qid) do
+  defp write_cache(k, solutions_by_qid, testcases_by_qid, dataset, path) do
     payload = %{
       version: @cache_version,
       shards_loaded: k,
-      parquet_mtimes: collect_parquet_mtimes(k),
+      parquet_mtimes: collect_parquet_mtimes(k, dataset),
       solutions_by_qid: solutions_by_qid,
       testcases_by_qid: testcases_by_qid
     }
 
-    path = cache_path()
     partial = path <> ".partial"
     File.mkdir_p!(Path.dirname(path))
 
@@ -228,18 +234,18 @@ defmodule Eval.Corpus do
     IO.puts("[corpus] wrote #{path} (#{format_bytes(byte_size(binary))})")
   end
 
-  defp collect_parquet_mtimes(k) do
-    sft_total = Dataset.shard_count(:seed_sft)
+  defp collect_parquet_mtimes(k, dataset) do
+    sft_total = dataset.shard_count(:seed_sft)
 
     sft_mtimes =
       for idx <- 0..(sft_total - 1), into: %{} do
-        path = Dataset.shard_path(:seed_sft, idx)
+        path = dataset.shard_path(:seed_sft, idx)
         {path, mtime_unix(path)}
       end
 
     tc_mtimes =
       for idx <- 0..(k - 1), into: %{} do
-        path = Dataset.shard_path(:seed_testcase, idx)
+        path = dataset.shard_path(:seed_testcase, idx)
         {path, mtime_unix(path)}
       end
 

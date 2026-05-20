@@ -1,45 +1,79 @@
 defmodule EvalTest do
   use ExUnit.Case, async: false
 
-  @fixtures_dir Path.expand("../../../test/fixtures/python", __DIR__)
+  describe "process/2 with mock corpus" do
+    test "all-passing testcases produce :ok bucket" do
+      samples = [
+        %{
+          id: "ok-sample",
+          source: "print(\"hello\")\n",
+          testcases: [%{stdin: "", expected: "hello\n"}]
+        }
+      ]
 
-  describe "process/2 against golden fixtures" do
-    test "every fixture in test/fixtures/python lands in :ok or a categorized failure bucket" do
-      samples =
-        @fixtures_dir
-        |> File.ls!()
-        |> Enum.filter(&String.ends_with?(&1, ".py"))
-        |> Enum.sort()
-        |> Enum.map(fn name ->
-          %{
-            "id" => name,
-            "source" => File.read!(Path.join(@fixtures_dir, name))
-          }
+      acc =
+        with_silent_io(fn ->
+          Eval.process(samples, concurrency: 1, samples_per_bucket: 5)
         end)
 
-      acc = Eval.process(samples, concurrency: 2, samples_per_bucket: 5)
-
-      assert acc.totals.processed == length(samples)
-      assert acc.totals.skipped == 0
-      assert acc.totals.transpiled > 0
-
+      assert acc.totals.processed == 1
+      assert acc.totals.testcases_run == 1
+      assert acc.totals.testcases_passed == 1
       assert Map.has_key?(acc.counts, :ok),
-             "expected at least one fixture to transpile + compile cleanly; got buckets: " <>
-               inspect(Map.keys(acc.counts))
+             "expected :ok bucket; got #{inspect(Map.keys(acc.counts))}"
+    end
+
+    test "worst-of: one mismatched testcase elevates the sample bucket" do
+      # Same source, two testcases. Python output is always "hello\n",
+      # so the second testcase's `expected: "wrong\n"` triggers the
+      # `:python_disagrees_expected` per-tc classification (py != expected,
+      # ex == py). The first testcase is `:ok`. The sample bucket should
+      # be the worst-of — `:python_disagrees_expected` beats `:ok`.
+      samples = [
+        %{
+          id: "mixed",
+          source: "print(\"hello\")\n",
+          testcases: [
+            %{stdin: "", expected: "hello\n"},
+            %{stdin: "", expected: "wrong\n"}
+          ]
+        }
+      ]
+
+      acc =
+        with_silent_io(fn ->
+          Eval.process(samples, concurrency: 1, samples_per_bucket: 5)
+        end)
+
+      assert acc.totals.processed == 1
+      assert acc.totals.testcases_run == 2
+      assert acc.totals.testcases_passed == 1
+
+      buckets = Map.keys(acc.counts)
+
+      assert Enum.any?(buckets, &match?({:python_disagrees_expected, _}, &1)),
+             "expected worst-of to lift sample bucket to :python_disagrees_expected; got #{inspect(buckets)}"
+
+      refute Map.has_key?(acc.counts, :ok),
+             "single-sample run should not also produce a :ok bucket entry"
+    end
+
+    test "corpus_stats threads testcase_shard_missing into totals" do
+      acc =
+        with_silent_io(fn ->
+          Eval.process([], concurrency: 1, corpus_stats: %{testcase_shard_missing: 42})
+        end)
+
+      assert acc.totals.testcase_shard_missing == 42
+      assert acc.totals.processed == 0
     end
   end
 
-  describe "process/2 with skip lines" do
-    test "skip envelopes increment the skipped counter without classifying" do
-      lines = [
-        %{"_skip" => "no python", "id" => "0"},
-        %{"_skip" => "again", "id" => "1"}
-      ]
-
-      acc = Eval.process(lines, concurrency: 1)
-
-      assert acc.totals == %{processed: 0, skipped: 2, transpiled: 0}
-      assert acc.counts == %{}
-    end
+  # `Eval.process` prints `[python_cache]` / progress / etc. via
+  # `IO.puts`. Tests don't care about those — swallow them so the test
+  # runner output stays focused on assertion failures.
+  defp with_silent_io(fun) do
+    {result, _io} = ExUnit.CaptureIO.with_io(fun)
+    result
   end
 end

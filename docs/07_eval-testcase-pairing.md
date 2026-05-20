@@ -354,10 +354,10 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 6 — Tests
 
-- [ ] T13. Rewrite `tools/eval/test/eval_test.exs`: feed mock corpus enumerable yielding `%{id, source, testcases}`, assert worst-of aggregation end-to-end. Delete `_skip` envelope test.
-- [ ] T14. Update `tools/eval/test/eval/bucket_test.exs`: keep transpile-failure tests; replace `{:compile_ok, ...}` clauses with `{:executed_testcases, ...}`; add 4-way truth-table classification tests.
-- [ ] T15. Update `tools/eval/test/eval/report_test.exs`: assert `schema_version: 3`; drop `comparison_mode: :compile_only` path; assert `testcase_shard_missing`, `testcases_run`, `testcases_passed`.
-- [ ] T16. Create `tools/eval/test/eval/corpus_test.exs`: inject mock `Eval.Dataset` returning hand-crafted DataFrames; verify dedup, join, `testcase_shard_missing` accounting.
+- [x] T13. Rewrite `tools/eval/test/eval_test.exs`: feed mock corpus enumerable yielding `%{id, source, testcases}`, assert worst-of aggregation end-to-end. Delete `_skip` envelope test. (`test_helper.exs` also updated to start `Eval.PythonCache` since `Eval.process/2` always exercises it.)
+- [x] T14. Update `tools/eval/test/eval/bucket_test.exs`: keep transpile-failure tests; replace `{:compile_ok, ...}` clauses with `{:executed_testcases, ...}`; add 4-way truth-table classification tests.
+- [x] T15. Update `tools/eval/test/eval/report_test.exs`: assert `schema_version: 3`; drop `comparison_mode: :compile_only` path; assert `testcase_shard_missing`, `testcases_run`, `testcases_passed`. Added two new tests covering per-testcase artifact emission for `{:output_mismatch, _}` / `{:python_disagrees_expected, _}` and elixir.txt omission.
+- [x] T16. Create `tools/eval/test/eval/corpus_test.exs`: inject mock `Eval.Dataset` returning hand-crafted DataFrames; verify dedup, join, `testcase_shard_missing` accounting. Required a small refactor of `Corpus.build/1` to accept `:dataset_module` / `:cache_path` opts.
 
 ### Phase 7 — Verification (post-implementation)
 
