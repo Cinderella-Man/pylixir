@@ -131,7 +131,17 @@ defmodule Eval.Stream do
   end
 
   defp close_port(%{port: port}) do
-    if Port.info(port), do: Port.close(port)
+    # `Port.info/1` → `Port.close/1` has a race: the port can exit
+    # between the two calls (more likely now that downstream stages
+    # may run for several seconds per sample, letting the dataset
+    # subprocess finish first). Closing an already-closed port raises
+    # ArgumentError. Swallow it — the port is gone either way.
+    try do
+      if Port.info(port), do: Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+
     :ok
   end
 end

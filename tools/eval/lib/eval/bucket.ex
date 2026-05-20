@@ -24,21 +24,71 @@ defmodule Eval.Bucket do
   """
 
   @type sample :: %{required(:id) => String.t(), required(:source) => String.t()}
+
+  @type python_failure ::
+          :syntax_error
+          | :import_error
+          | {:error, exception_class :: String.t()}
+          | :timeout
+          | :nondeterministic
+
+  @type elixir_stage ::
+          {:compile_ok, diagnostics :: [map()]}
+          | {:compile_raised, Exception.t()}
+          | {:execute_ok, diagnostics :: [map()],
+             python_stdout :: String.t(), elixir_stdout :: String.t()}
+          | {:execute_raised, diagnostics :: [map()], Exception.t() | atom()}
+          | {:execute_timeout, diagnostics :: [map()]}
+
   @type outcome ::
-          {:transpile_raised, Exception.t()}
-          | {:transpile_ok, source :: String.t(),
-             {:compile_ok, diagnostics :: [map()]}
-             | {:compile_raised, Exception.t()}}
+          {:python_failed, python_failure(), metadata :: map()}
+          | {:transpile_raised, Exception.t()}
+          | {:transpile_ok, source :: String.t(), elixir_stage()}
 
   @type metadata :: %{optional(atom()) => any()}
   @type bucket_key ::
           :ok
+          | :ok_empty_output
+          | {:output_mismatch, fingerprint :: String.t()}
+          | {:elixir_runtime_error, module()}
+          | :elixir_timeout
+          | :python_syntax_error
+          | :python_import_error
+          | {:python_error, exception_class :: String.t()}
+          | :python_timeout
+          | :nondeterministic_observed
           | {:unsupported, String.t()}
           | :parse_error
           | {:compile_error, String.t()}
           | {:internal, atom()}
 
   @spec classify(sample(), outcome()) :: {bucket_key(), metadata()}
+
+  # --- Python preflight outcomes (terminal — Elixir never ran) ---------
+
+  def classify(_sample, {:python_failed, :syntax_error, meta}) do
+    {:python_syntax_error, Map.take(meta, [:stderr_tail])}
+  end
+
+  def classify(_sample, {:python_failed, :import_error, meta}) do
+    {:python_import_error, Map.take(meta, [:missing_module, :stderr_tail])}
+  end
+
+  def classify(_sample, {:python_failed, {:error, class}, meta}) do
+    {{:python_error, class},
+     Map.take(meta, [:exception_class, :exit_code, :stderr_tail])}
+  end
+
+  def classify(_sample, {:python_failed, :timeout, _meta}) do
+    {:python_timeout, %{}}
+  end
+
+  def classify(_sample, {:python_failed, :nondeterministic, _meta}) do
+    {:nondeterministic_observed, %{}}
+  end
+
+  # --- Elixir-side outcomes (Python succeeded or skipped) --------------
+
   def classify(_sample, {:transpile_ok, src, {:compile_ok, diagnostics}}) do
     real = Enum.reject(diagnostics, &stylistic?/1)
 
@@ -59,6 +109,41 @@ defmodule Eval.Bucket do
   def classify(_sample, {:transpile_ok, _src, {:compile_raised, exception}}) do
     {{:compile_error, "compile_quoted raised"},
      %{exception: inspect(exception.__struct__), message: Exception.message(exception)}}
+  end
+
+  def classify(_sample, {:transpile_ok, src, {:execute_ok, diagnostics, py_stdout, ex_stdout}}) do
+    case Eval.Execute.compare_outputs(py_stdout, ex_stdout) do
+      :equal_empty ->
+        {:ok_empty_output, %{diagnostics: diagnostics, elixir_source: src}}
+
+      :equal ->
+        {:ok, %{diagnostics: diagnostics, elixir_source: src}}
+
+      {:differ, fp, summary} ->
+        {{:output_mismatch, fp},
+         %{
+           python_stdout: py_stdout,
+           elixir_stdout: ex_stdout,
+           diff_summary: summary,
+           diagnostics: diagnostics,
+           elixir_source: src
+         }}
+    end
+  end
+
+  def classify(_sample, {:transpile_ok, _src, {:execute_raised, diagnostics, exception}}) do
+    mod = exception_module(exception)
+
+    {{:elixir_runtime_error, mod},
+     %{
+       exception: inspect(mod),
+       message: exception_message(exception),
+       diagnostics: diagnostics
+     }}
+  end
+
+  def classify(_sample, {:transpile_ok, _src, {:execute_timeout, diagnostics}}) do
+    {:elixir_timeout, %{diagnostics: diagnostics}}
   end
 
   def classify(_sample, {:transpile_raised, %Pylixir.UnsupportedNodeError{} = e}) do
@@ -85,6 +170,7 @@ defmodule Eval.Bucket do
   """
   @spec slug(bucket_key()) :: String.t()
   def slug(:ok), do: "ok"
+  def slug(:ok_empty_output), do: "ok_empty_output"
   def slug(:parse_error), do: "parse_error"
   def slug({:unsupported, node_type}), do: "unsupported--" <> sanitize(node_type)
 
@@ -93,6 +179,22 @@ defmodule Eval.Bucket do
 
   def slug({:internal, module}),
     do: "internal--" <> sanitize(inspect(module))
+
+  def slug({:output_mismatch, fingerprint}),
+    do: "output_mismatch--" <> sanitize(fingerprint)
+
+  def slug({:elixir_runtime_error, module}),
+    do: "elixir_runtime_error--" <> sanitize(inspect(module))
+
+  def slug(:elixir_timeout), do: "elixir_timeout"
+  def slug(:python_syntax_error), do: "python_syntax_error"
+  def slug(:python_import_error), do: "python_import_error"
+
+  def slug({:python_error, class}),
+    do: "python_error--" <> sanitize(class)
+
+  def slug(:python_timeout), do: "python_timeout"
+  def slug(:nondeterministic_observed), do: "nondeterministic_observed"
 
   defp sanitize(s) do
     s
@@ -126,4 +228,11 @@ defmodule Eval.Bucket do
   end
 
   defp fingerprint(_), do: "unknown"
+
+  defp exception_module(e) when is_struct(e), do: e.__struct__
+  defp exception_module(e) when is_atom(e), do: e
+  defp exception_module(_), do: RuntimeError
+
+  defp exception_message(e) when is_struct(e), do: Exception.message(e)
+  defp exception_message(other), do: inspect(other)
 end

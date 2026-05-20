@@ -10,7 +10,21 @@ defmodule Mix.Tasks.Eval.Run do
       mix eval.run [--limit N] [--skip N] [--concurrency K]
                    [--samples-per-bucket K] [--dataset NAME] [--split SPLIT]
                    [--field NAME] [--name CONFIG] [--cache PATH] [--no-cache]
+                   [--execute|--no-execute]
+                   [--python-timeout MS] [--elixir-timeout MS]
+                   [--no-python-cache] [--rebuild-python-cache]
                    [--out DIR]
+
+  ## Behavioral equivalence
+
+  By default the harness runs each Python sample through CPython
+  (twice, for a determinism check) and compares its stdout to the
+  transpiled Elixir's stdout byte-equal. Python results are cached
+  in `cache/python.jsonl` (content-addressed by source SHA-256), so
+  warm-cache runs skip the CPython step entirely.
+
+  Pass `--no-execute` to keep the v1 behavior (transpile + compile
+  only, no Python or Elixir execution).
 
   ## Examples
 
@@ -26,6 +40,9 @@ defmodule Mix.Tasks.Eval.Run do
       # Skip the first 1000 samples (resume / jump ahead)
       mix eval.run --skip 1000 --limit 500 --name synthetic_sft
 
+      # Compile-only (no execution; matches v1 semantics)
+      mix eval.run --limit 100 --no-execute
+
   ## Caching
 
   By default, samples are cached to
@@ -33,6 +50,10 @@ defmodule Mix.Tasks.Eval.Run do
   First run streams from HF and writes the cache; subsequent runs
   serve from the cache (no HF download). Pass `--cache PATH` to use
   a specific cache file, or `--no-cache` to bypass entirely.
+
+  Python preflight results are independently cached at
+  `cache/python.jsonl`. `--no-python-cache` bypasses;
+  `--rebuild-python-cache` truncates and rewrites.
   """
 
   use Mix.Task
@@ -49,15 +70,32 @@ defmodule Mix.Tasks.Eval.Run do
     name: :string,
     cache: :string,
     no_cache: :boolean,
+    execute: :boolean,
+    python_timeout: :integer,
+    elixir_timeout: :integer,
+    no_python_cache: :boolean,
+    rebuild_python_cache: :boolean,
     out: :string
   ]
+
+  @default_python_timeout_ms 3_000
+  @default_elixir_timeout_ms 5_000
 
   @impl true
   def run(argv) do
     {opts, _rest} = OptionParser.parse!(argv, strict: @switches)
 
     Mix.Task.run("app.start")
-    Eval.CompilePool.ensure_started()
+
+    # `ExUnit.CaptureIO` lives in `:ex_unit`. Starting the app does
+    # NOT boot the test runner — `ExUnit.start/1` does. We only need
+    # the module loadable from `Eval.Execute.run_elixir/2`.
+    Application.ensure_all_started(:ex_unit)
+
+    # OptionParser with `execute: :boolean` accepts both `--execute`
+    # (→ true) and `--no-execute` (→ false). Default: ON.
+    execute? = Keyword.get(opts, :execute, true)
+    concurrency = opts[:concurrency] || System.schedulers_online() * 2
 
     # Suppress Python warnings (e.g. `SyntaxWarning: invalid escape
     # sequence`) from `Pylixir.python_ast/1`'s `python3` subprocess.
@@ -67,17 +105,46 @@ defmodule Mix.Tasks.Eval.Run do
     # `PYTHONWARNINGS` propagates to every child python process.
     System.put_env("PYTHONWARNINGS", "ignore")
 
+    # CompilePool slot is held for compile + (when executing) py_main
+    # invocation. Sizing to `concurrency` keeps Task.async_stream
+    # workers from blocking on slot checkout.
+    Eval.CompilePool.ensure_started(size: concurrency)
+
+    if execute? do
+      Eval.PythonCache.ensure_started(
+        path: default_python_cache_path(),
+        no_cache: opts[:no_python_cache] || false,
+        rebuild: opts[:rebuild_python_cache] || false
+      )
+    end
+
     eval_opts =
       opts
       |> Keyword.put(:offset, opts[:skip])
       |> Keyword.delete(:skip)
+      |> Keyword.put(:execute, execute?)
+      |> Keyword.put(:concurrency, concurrency)
+      |> Keyword.put(
+        :python_timeout_ms,
+        opts[:python_timeout] || @default_python_timeout_ms
+      )
+      |> Keyword.put(
+        :elixir_timeout_ms,
+        opts[:elixir_timeout] || @default_elixir_timeout_ms
+      )
+      |> Keyword.delete(:python_timeout)
+      |> Keyword.delete(:elixir_timeout)
+      |> Keyword.delete(:no_python_cache)
+      |> Keyword.delete(:rebuild_python_cache)
       |> apply_cache_default()
 
     progress = start_progress(opts[:limit])
     eval_opts = Keyword.put(eval_opts, :on_sample, fn _line -> tick(progress) end)
 
     accumulator = Eval.run(eval_opts)
-    run_dir = Eval.Report.write(accumulator, out: opts[:out])
+
+    comparison_mode = if execute?, do: :executed, else: :compile_only
+    run_dir = Eval.Report.write(accumulator, out: opts[:out], comparison_mode: comparison_mode)
 
     IO.puts("")
     IO.puts("report: #{run_dir}")
@@ -114,6 +181,9 @@ defmodule Mix.Tasks.Eval.Run do
 
     Path.join([File.cwd!(), "cache", slug <> ".jsonl"])
   end
+
+  defp default_python_cache_path,
+    do: Path.join([File.cwd!(), "cache", "python.jsonl"])
 
   defp start_progress(limit) do
     ref = :counters.new(1, [:atomics])

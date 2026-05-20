@@ -24,18 +24,23 @@ defmodule Eval.ReportTest do
       totals: %{processed: 6, skipped: 0, transpiled: 3}
     }
 
-    run_dir = Report.write(acc, out: Path.join(tmp, "run-test"))
+    run_dir =
+      Report.write(acc, out: Path.join(tmp, "run-test"), comparison_mode: :compile_only)
 
     assert File.exists?(Path.join(run_dir, "summary.md"))
     assert File.exists?(Path.join(run_dir, "summary.json"))
 
     md = File.read!(Path.join(run_dir, "summary.md"))
     assert md =~ "processed | 6"
-    assert md =~ "transpiled cleanly | 3"
+    assert md =~ "Compile-success | 3"
     assert md =~ "unsupported--ClassDef"
+    assert md =~ "comparison mode | `compile_only`"
 
     json = Path.join(run_dir, "summary.json") |> File.read!() |> Jason.decode!()
+    assert json["schema_version"] == 2
+    assert json["comparison_mode"] == "compile_only"
     assert json["totals"]["processed"] == 6
+    assert json["totals"]["equivalent"] == 3
     assert Map.has_key?(json["counts"], "unsupported--ClassDef")
 
     # Failure samples written; :ok bucket is NOT written.

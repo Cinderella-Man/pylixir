@@ -23,6 +23,12 @@ defmodule Eval.Compile do
           {:ok, diagnostics :: [map()]}
           | {:error, Exception.t()}
 
+  @type execute_result ::
+          {:ok, diagnostics :: [map()], stdout :: String.t()}
+          | {:raised, diagnostics :: [map()], Exception.t() | atom()}
+          | {:timeout, diagnostics :: [map()]}
+          | {:error, Exception.t()}
+
   @spec check(String.t()) :: result()
   def check(source) when is_binary(source) do
     Eval.CompilePool.with_slot(fn alias_atom ->
@@ -30,38 +36,89 @@ defmodule Eval.Compile do
     end)
   end
 
-  defp compile_with_alias(source, alias_atom) do
-    {compile_outcome, diagnostics} =
-      Code.with_diagnostics(fn ->
-        try do
-          parsed = Code.string_to_quoted!(source)
-          defmodule_ast = parsed |> extract_defmodule() |> rewrite_alias(alias_atom)
-          Code.compile_quoted(defmodule_ast)
-          :ok
-        rescue
-          e -> {:raised, e}
-        end
-      end)
+  @doc """
+  Compile-and-execute. Runs `module.py_main()` inside the same
+  `CompilePool` slot, before `:code.delete`/`:code.purge`, so the
+  module is guaranteed to be loaded for the duration of the call
+  and replaced cleanly on the next checkout of the same alias.
 
-    # `Code.compile_quoted` loads the module as "current". To reclaim
-    # its export-table slots we (a) demote it to "old" via
-    # `:code.delete/1` and (b) free the old version via
-    # `:code.purge/1` — the docs require this exact order.
-    #
-    # `Eval.CompilePool` guarantees `alias_atom` is owned by this
-    # process for the duration of this call, so the next compile of
-    # the same alias *replaces* this one cleanly without racing.
-    # That's what keeps `export_staged_index` bounded across long
-    # runs; the earlier `unique_integer`-per-call design grew the
-    # index by ~330 entries per sample and crashed at ~3500.
-    module = Module.concat(Elixir, alias_atom)
-    :code.delete(module)
-    :code.purge(module)
+  Returns:
+
+    * `{:ok, diagnostics, stdout}` — compile clean, run finished
+      under `timeout_ms`.
+    * `{:raised, diagnostics, exception}` — compile clean, run
+      raised at runtime.
+    * `{:timeout, diagnostics}` — compile clean, run exceeded the
+      budget.
+    * `{:error, exception}` — compile itself failed.
+  """
+  @spec check_and_execute(String.t(), pos_integer()) :: execute_result()
+  def check_and_execute(source, timeout_ms)
+      when is_binary(source) and is_integer(timeout_ms) and timeout_ms > 0 do
+    Eval.CompilePool.with_slot(fn alias_atom ->
+      compile_and_execute_with_alias(source, alias_atom, timeout_ms)
+    end)
+  end
+
+  defp compile_with_alias(source, alias_atom) do
+    {compile_outcome, diagnostics} = do_compile(source, alias_atom)
+    purge_module(alias_atom)
 
     case compile_outcome do
       :ok -> {:ok, diagnostics}
       {:raised, e} -> {:error, e}
     end
+  end
+
+  defp compile_and_execute_with_alias(source, alias_atom, timeout_ms) do
+    {compile_outcome, diagnostics} = do_compile(source, alias_atom)
+    module = Module.concat(Elixir, alias_atom)
+
+    try do
+      case compile_outcome do
+        :ok ->
+          case Eval.Execute.run_elixir(module, timeout_ms) do
+            {:ok, stdout} -> {:ok, diagnostics, stdout}
+            {:raised, e} -> {:raised, diagnostics, e}
+            :timeout -> {:timeout, diagnostics}
+          end
+
+        {:raised, e} ->
+          {:error, e}
+      end
+    after
+      purge_module(alias_atom)
+    end
+  end
+
+  defp do_compile(source, alias_atom) do
+    Code.with_diagnostics(fn ->
+      try do
+        parsed = Code.string_to_quoted!(source)
+        defmodule_ast = parsed |> extract_defmodule() |> rewrite_alias(alias_atom)
+        Code.compile_quoted(defmodule_ast)
+        :ok
+      rescue
+        e -> {:raised, e}
+      end
+    end)
+  end
+
+  # `Code.compile_quoted` loads the module as "current". To reclaim
+  # its export-table slots we (a) demote it to "old" via
+  # `:code.delete/1` and (b) free the old version via
+  # `:code.purge/1` — the docs require this exact order.
+  #
+  # `Eval.CompilePool` guarantees `alias_atom` is owned by this
+  # process for the duration of this call, so the next compile of
+  # the same alias *replaces* this one cleanly without racing.
+  # That's what keeps `export_staged_index` bounded across long
+  # runs; the earlier `unique_integer`-per-call design grew the
+  # index by ~330 entries per sample and crashed at ~3500.
+  defp purge_module(alias_atom) do
+    module = Module.concat(Elixir, alias_atom)
+    :code.delete(module)
+    :code.purge(module)
   end
 
   defp extract_defmodule({:__block__, _, statements}) do
