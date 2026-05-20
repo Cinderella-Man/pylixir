@@ -826,10 +826,29 @@ defmodule Pylixir.Converter do
   end
 
   def convert(%{"_type" => "BoolOp", "op" => op, "values" => values} = node, context) do
+    # Python's `and` / `or` short-circuit AND return the actual operand
+    # value, with falsy = `{0, 0.0, "", [], {}, MapSet.new(), nil,
+    # False}`. Elixir's `&&` / `||` only treat `false` / `nil` as falsy
+    # — so `[] && x` returns `x` in Elixir but `[]` in Python. For
+    # statically-bool operands the two match exactly (and the fast
+    # native operators stay; cheap inside hot loops). For everything
+    # else fall back to a `case` + `truthy?` emission that mirrors
+    # Python's value-returning short-circuit.
     op_atom = bool_op_atom(op, node)
+
+    all_bool? =
+      Enum.all?(values, fn v -> TypeInfer.infer_expr(v, context) == {:bool} end)
+
     {asts, context} = convert_each(values, context)
     [first | rest] = asts
-    fold = Enum.reduce(rest, first, fn ast, acc -> {op_atom, [], [acc, ast]} end)
+
+    fold =
+      if all_bool? do
+        Enum.reduce(rest, first, fn ast, acc -> {op_atom, [], [acc, ast]} end)
+      else
+        Enum.reduce(rest, first, fn ast, acc -> py_short_circuit(op_atom, acc, ast) end)
+      end
+
     {fold, context}
   end
 
@@ -1635,6 +1654,24 @@ defmodule Pylixir.Converter do
       hint: "boolean operator `#{other}` is not supported",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # `a and b` → `case a do v -> if truthy?(v), do: b, else: v end`
+  # `a or  b` → `case a do v -> if truthy?(v), do: v, else: b end`
+  #
+  # The `case` binding avoids double-evaluating `a` (its AST may have
+  # side effects). `v` is scoped to the case clause so it can't shadow
+  # caller-side bindings.
+  defp py_short_circuit(:&&, acc_ast, next_ast) do
+    v = {:py_bool_v, [], nil}
+    body = {:if, [], [{:truthy?, [], [v]}, [do: next_ast, else: v]]}
+    {:case, [], [acc_ast, [do: [{:->, [], [[v], body]}]]]}
+  end
+
+  defp py_short_circuit(:||, acc_ast, next_ast) do
+    v = {:py_bool_v, [], nil}
+    body = {:if, [], [{:truthy?, [], [v]}, [do: v, else: next_ast]]}
+    {:case, [], [acc_ast, [do: [{:->, [], [[v], body]}]]]}
   end
 
   @doc false

@@ -497,11 +497,18 @@ defmodule Pylixir.Builtins do
        {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
         [{:..//, [], [start, sub_one(stop), 1]}]}}
 
+  # `range(start, stop, step)`. Python's `stop` is exclusive; Elixir's
+  # `start..stop_inclusive//step` is inclusive on both ends. The
+  # conversion flips with the sign of `step`:
+  #   step > 0 → stop_elixir = stop - 1
+  #   step < 0 → stop_elixir = stop + 1
+  # When `step` is a literal we can decide at compile time; when it's
+  # an arbitrary expression we fall back to a runtime `if` so the
+  # right adjustment is picked at call time. Step == 0 keeps the
+  # existing behaviour (Elixir's `//0` raises, mirroring Python's
+  # `ValueError: range() arg 3 must not be zero`).
   def emit("range", [start, stop, step], _kw),
-    do:
-      {:ok,
-       {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [],
-        [{:..//, [], [start, sub_one(stop), step]}]}}
+    do: {:ok, range_with_step(start, stop, step)}
 
   def emit("sorted", [xs], kw) do
     # Wrap in `py_iter_to_list/1` so Python iteration semantics apply:
@@ -793,6 +800,31 @@ defmodule Pylixir.Builtins do
 
   defp sub_one(ast) when is_integer(ast), do: ast - 1
   defp sub_one(ast), do: {:-, [], [ast, 1]}
+
+  defp add_one(ast) when is_integer(ast), do: ast + 1
+  defp add_one(ast), do: {:+, [], [ast, 1]}
+
+  defp enum_to_list_of(range_ast),
+    do: {{:., [], [{:__aliases__, [], [:Enum]}, :to_list]}, [], [range_ast]}
+
+  defp range_with_step(start, stop, step) when is_integer(step) and step > 0,
+    do: enum_to_list_of({:..//, [], [start, sub_one(stop), step]})
+
+  defp range_with_step(start, stop, step) when is_integer(step) and step < 0,
+    do: enum_to_list_of({:..//, [], [start, add_one(stop), step]})
+
+  # Non-literal step: branch at runtime. For step == 0 the inner `//`
+  # will raise, matching Python's behaviour.
+  defp range_with_step(start, stop, step) do
+    pos_range = enum_to_list_of({:..//, [], [start, sub_one(stop), step]})
+    neg_range = enum_to_list_of({:..//, [], [start, add_one(stop), step]})
+
+    {:if, [],
+     [
+       {:>, [], [step, 0]},
+       [do: pos_range, else: neg_range]
+     ]}
+  end
 
   defp emit_sum(xs, start) do
     # Python sum() coerces booleans (RFC §6.11). Use py_add to retain that.

@@ -131,6 +131,43 @@ defmodule Pylixir.RuntimeHelpersTest do
     end
   end
 
+  describe "py_str_index/2 — receiver-polymorphic .index()" do
+    # Pylixir's `.index()` method always emits `py_str_index/2`. The
+    # helper must therefore handle every Python receiver type that
+    # supports `.index()`: str (substring search), list (equality),
+    # tuple (equality). A non-string receiver used to crash with
+    # `FunctionClauseError in String.split/3` because the binary-only
+    # path called `String.split(receiver, _, parts: 2)`.
+
+    test "string receiver: substring index, matching str.index()" do
+      assert H.py_str_index("hello world", "world") == 6
+      assert H.py_str_index("hello", "h") == 0
+    end
+
+    test "string receiver: missing substring raises" do
+      assert_raise RuntimeError, "substring not found", fn ->
+        H.py_str_index("hello", "z")
+      end
+    end
+
+    test "list receiver: returns the index of the first equal element" do
+      assert H.py_str_index([10, 20, 30], 20) == 1
+      assert H.py_str_index([10, 20, 30], 10) == 0
+      assert H.py_str_index([:a, :b, :c], :c) == 2
+    end
+
+    test "list receiver: missing element raises ValueError-ish" do
+      assert_raise RuntimeError, ~r/is not in list/, fn ->
+        H.py_str_index([1, 2, 3], 99)
+      end
+    end
+
+    test "tuple receiver: behaves like list.index" do
+      assert H.py_str_index({10, 20, 30}, 30) == 2
+      assert H.py_str_index({"a", "b"}, "b") == 1
+    end
+  end
+
   describe "py_str_count/2 — Python str.count semantics (RFC §6.20-adjacent)" do
     test "counts non-overlapping occurrences" do
       assert H.py_str_count("hello", "l") == 2

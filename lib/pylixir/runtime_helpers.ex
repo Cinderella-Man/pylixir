@@ -1053,12 +1053,24 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
-  def py_str_index(s, sub) do
+  # Python's `.index(x)` is defined on str, list, and tuple — each with
+  # the same name but different semantics (str: substring search; list
+  # / tuple: equality). Pylixir's converter always emits `py_str_index`
+  # regardless of receiver type, so this helper has to dispatch at
+  # runtime: a non-string receiver previously raised
+  # `FunctionClauseError in String.split/3` from the `py_str_find` →
+  # `String.split` path.
+  def py_str_index(s, sub) when is_binary(s) do
     case py_str_find(s, sub) do
       -1 -> raise RuntimeError, "substring not found"
       idx -> idx
     end
   end
+
+  def py_str_index(list, x) when is_list(list), do: py_list_index(list, x)
+
+  def py_str_index(tuple, x) when is_tuple(tuple),
+    do: py_list_index(Tuple.to_list(tuple), x)
 
   def py_list_index(list, x) do
     case Enum.find_index(list, fn v -> v == x end) do

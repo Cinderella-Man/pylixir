@@ -44,6 +44,46 @@ defmodule Pylixir.Nodes.BuiltinsTest do
       end
     end
 
+    # Python's `range(start, stop, step)` excludes `stop`. Elixir's
+    # `start..stop_inclusive//step` includes both ends. For positive
+    # step the conversion is `stop_elixir = stop_python - 1`; for
+    # *negative* step it has to flip to `stop_python + 1`, otherwise
+    # the iteration walks past 0 into negative indices and downstream
+    # `py_getitem(list, -k)` returns spurious values (or crashes when
+    # used in arithmetic).
+    test "range(start, stop, -1) counts down inclusive of 0 only" do
+      case run("(range(5, -1, -1))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [5, 4, 3, 2, 1, 0]
+      end
+    end
+
+    test "range(n - 1, -1, -1) on n=1 yields just [0]" do
+      # The exact shape that broke the ArithmeticError eval samples:
+      # `range(n-1, -1, -1)` with n=1 was emitting `0..-2//-1`,
+      # producing `[0, -1, -2]` instead of `[0]`. With `current += t[-1]`
+      # the negative index wrapped to the tail and downstream `c * sum`
+      # multiplied a non-integer accumulator → `ArithmeticError`.
+      case run("n = 1\nlist(range(n - 1, -1, -1))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [0]
+      end
+    end
+
+    test "range(10, 0, -2) excludes 0 (Python stop semantics)" do
+      case run("(range(10, 0, -2))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [10, 8, 6, 4, 2]
+      end
+    end
+
+    test "range(start, stop, 2) — positive step still excludes stop" do
+      case run("(range(1, 10, 2))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [1, 3, 5, 7, 9]
+      end
+    end
+
     test "sorted/reversed" do
       case run("sorted([3, 1, 4, 1, 5, 9, 2, 6])\n") do
         :skip -> :ok
