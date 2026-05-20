@@ -298,3 +298,74 @@ Sanity: `mix test test/pylixir/golden_corpus_test.exs` still passes.
 ## Unresolved questions
 
 None.
+
+## Implementation tasks
+
+Tracking checklist. All tasks executed in one pass; list is for self-management.
+
+### Phase 1 — Foundation (data ingestion)
+
+- [x] T1. `tools/eval/mix.exs`: add `{:explorer, "~> 0.10"}`, `{:req, "~> 0.5"}`.
+- [x] T2. Create `tools/eval/lib/eval/dataset.ex`: module attrs (repo, shard counts), `cache_dir/0`, `download_shard/2` (`:req` chunked → `.partial` → atomic rename, ~5%/5s progress, retry-from-scratch), `read_sft_shard/2` (column projection), `read_testcase_shard/2` (filter pushdown on qid set).
+- [x] T3. Create `tools/eval/lib/eval/corpus.ex`: `build/1` enumerable; cold path = scan all seed_sft shards → filter `is_passed`, dedup by `(qid, sha256(source))` → scan K seed_testcase shards → join; cache to `cache/corpus_v1.term.gz` (gzip `term_to_binary`, header `%{shards_loaded, parquet_mtimes}`, atomic `.partial` rename); warm path = restore if header matches K + no parquet newer; yield `%{id: "<qid>--<sha8>", source, testcases}`; track `testcase_shard_missing` count for qids whose testcase shard not loaded.
+
+### Phase 2 — Execution surface (stdin everywhere)
+
+- [ ] T4. `tools/eval/lib/eval/execute.ex`:
+  - `run_python/2`: accept `:stdin`, write sibling `.stdin` tmp, `... < tmp.stdin`, `try/after` cleanup.
+  - `run_elixir/3`: accept `:stdin`, wrap call in `ExUnit.CaptureIO.capture_io(stdin_string, fn -> ... end)` (pattern at `test/pylixir/runtime_helpers_test.exs:10`).
+  - Add `compare_lenient/2` (trim trailing `\n`, normalize `\r\n` → `\n`, byte-equal). Keep strict `compare_outputs/2`.
+- [ ] T5. `tools/eval/lib/eval/compile.ex`:
+  - Add `check_and_execute_testcases(source, testcases, elixir_timeout_ms, on_testcase)`: compile once in one `CompilePool` slot, iterate testcases invoking `on_testcase` per testcase, `try/after` delete + purge module.
+  - Delete `check/1` and `check_and_execute/2` (single-output / `--no-execute` only).
+
+### Phase 3 — Classification + caching
+
+- [ ] T6. `tools/eval/lib/eval/bucket.ex`:
+  - Add `python_failure` variant `:disagrees_expected`.
+  - Add `bucket_key()` variant `{:python_disagrees_expected, fp}` (fp = first 60 chars of first divergent line).
+  - Add `outcome()` variant `{:executed_testcases, diagnostics, [tc_outcome]}`.
+  - Add `classify/2` clause: worst-of severity `:elixir_runtime_error` / `:elixir_timeout` > `:output_mismatch` > `:python_disagrees_expected` > `:ok`. Implement 4-way truth table (see §8 above).
+  - Add `slug/1` for `:python_disagrees_expected`.
+  - Delete old single-output `{:transpile_ok, src, {:execute_*, ...}}` and `{:compile_ok, ...}` variants + their classify clauses.
+- [ ] T7. `tools/eval/lib/eval/python_cache.ex`:
+  - Replace `key/1` with `key/2(source, stdin) → sha256(source <> "\0" <> stdin)`.
+  - Startup cleanup: unconditionally delete `cache/python.jsonl` (legacy schema) with log line; also remove legacy `cache/microsoft_rStar-Coder--*.jsonl` files (log once each).
+
+### Phase 4 — Wiring + CLI + reporting
+
+- [ ] T8. `tools/eval/lib/eval.ex`:
+  - Swap `Eval.Stream.stream/1` → `Eval.Corpus.build/1` in `run/1`.
+  - Rewrite `attempt/2` as single testcase-mode path (calls `Compile.check_and_execute_testcases`).
+  - Delete `attempt_compile_only/1`, the non-testcase branch of `attempt_with_execution/2`, all `:execute` opt threading, the single-output outcome shapes.
+- [ ] T9. `tools/eval/lib/mix/tasks/eval.run.ex`:
+  - Drop switches: `--dataset`, `--name`, `--split`, `--field`, `--cache`, `--no-cache`, `--execute`, `--no-execute`.
+  - Add: `--testcase-shards K` (default 1).
+  - Keep: `--limit`, `--skip`, `--concurrency`, `--samples-per-bucket`, `--save-ok`, `--python-timeout`, `--elixir-timeout`, `--no-python-cache`, `--rebuild-python-cache`, `--out`.
+- [ ] T10. `tools/eval/lib/eval/report.ex`:
+  - Per-testcase artifact layout under `mismatches/<fp>/<NNN>.*` (see Report section above). Omit `<NNN>.testcase_<idx>.elixir.txt` when Elixir didn't run.
+  - `summary.json`: add `totals.testcases_run`, `totals.testcases_passed`, `totals.testcase_shard_missing`. Bump `schema_version` → 3.
+  - `summary.md`: headline hint line when `testcase_shard_missing > 0`.
+
+### Phase 5 — Cleanup (deletions)
+
+- [ ] T11. Delete `tools/eval/priv/python/dataset_stream.py`.
+- [ ] T12. Delete `tools/eval/lib/eval/stream.ex`.
+
+### Phase 6 — Tests
+
+- [ ] T13. Rewrite `tools/eval/test/eval_test.exs`: feed mock corpus enumerable yielding `%{id, source, testcases}`, assert worst-of aggregation end-to-end. Delete `_skip` envelope test.
+- [ ] T14. Update `tools/eval/test/eval/bucket_test.exs`: keep transpile-failure tests; replace `{:compile_ok, ...}` clauses with `{:executed_testcases, ...}`; add 4-way truth-table classification tests.
+- [ ] T15. Update `tools/eval/test/eval/report_test.exs`: assert `schema_version: 3`; drop `comparison_mode: :compile_only` path; assert `testcase_shard_missing`, `testcases_run`, `testcases_passed`.
+- [ ] T16. Create `tools/eval/test/eval/corpus_test.exs`: inject mock `Eval.Dataset` returning hand-crafted DataFrames; verify dedup, join, `testcase_shard_missing` accounting.
+
+### Phase 7 — Verification (post-implementation)
+
+- [ ] V1. Cold cache run: `PYLIXIR_PYTHON=python3.14 mix eval.run --limit 20 --samples-per-bucket 5`. Confirm:
+  - `tools/eval/cache/parquet/seed_sft/data-00000-of-00020.parquet` populated.
+  - `tools/eval/cache/parquet/seed_testcase/data-00000-of-00030.parquet` populated.
+  - `tools/eval/cache/python.jsonl` populated.
+  - `summary.json`: `schema_version: 3`, `comparison_mode: "executed"`, `:ok` rate ≫ 1.8%.
+- [ ] V2. Warm cache rerun: `mix eval.run --limit 20`. Confirm Python invocations only for cache misses.
+- [ ] V3. Manual `:ok` cross-check: `python3.14 reports/run-*/ok/001.py < reports/run-*/ok/001.testcase_0.stdin.txt | diff - reports/run-*/ok/001.testcase_0.expected.txt`.
+- [ ] V4. Sanity: `mix test test/pylixir/golden_corpus_test.exs` still green.

@@ -18,7 +18,9 @@ defmodule Eval.MixProject do
   defp deps do
     [
       {:pylixir, path: "../.."},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:explorer, "~> 0.10"},
+      {:req, "~> 0.5"}
     ]
   end
 end
