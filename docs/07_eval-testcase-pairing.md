@@ -321,16 +321,16 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 3 — Classification + caching
 
-- [ ] T6. `tools/eval/lib/eval/bucket.ex`:
+- [x] T6. `tools/eval/lib/eval/bucket.ex`:
   - Add `python_failure` variant `:disagrees_expected`.
   - Add `bucket_key()` variant `{:python_disagrees_expected, fp}` (fp = first 60 chars of first divergent line).
   - Add `outcome()` variant `{:executed_testcases, diagnostics, [tc_outcome]}`.
   - Add `classify/2` clause: worst-of severity `:elixir_runtime_error` / `:elixir_timeout` > `:output_mismatch` > `:python_disagrees_expected` > `:ok`. Implement 4-way truth table (see §8 above).
   - Add `slug/1` for `:python_disagrees_expected`.
   - Delete old single-output `{:transpile_ok, src, {:execute_*, ...}}` and `{:compile_ok, ...}` variants + their classify clauses.
-- [ ] T7. `tools/eval/lib/eval/python_cache.ex`:
+- [x] T7. `tools/eval/lib/eval/python_cache.ex`:
   - Replace `key/1` with `key/2(source, stdin) → sha256(source <> "\0" <> stdin)`.
-  - Startup cleanup: unconditionally delete `cache/python.jsonl` (legacy schema) with log line; also remove legacy `cache/microsoft_rStar-Coder--*.jsonl` files (log once each).
+  - Startup cleanup: one-shot via `cache/.python_cache_v2` sentinel — delete `cache/python.jsonl` (legacy source-only schema) and any `cache/microsoft_rStar-Coder--*.jsonl` files (log once each). Smoke-verified live.
 
 ### Phase 4 — Wiring + CLI + reporting
 

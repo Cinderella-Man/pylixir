@@ -2,11 +2,12 @@ defmodule Eval.PythonCache do
   @moduledoc """
   Content-addressed cache of CPython preflight results.
 
-  Each Python sample is content-keyed by `sha256(source)`. First time
-  a sample is seen, `Eval` runs `python3` twice (for determinism) and
-  caches the outcome — `ok`, `error`, `timeout`, or
-  `nondeterministic`. Future runs of the same source skip Python
-  entirely and go straight to the Elixir comparison.
+  Each `(source, stdin)` pair is content-keyed by
+  `sha256(source <> "\\0" <> stdin)`. First time a pair is seen,
+  `Eval` runs `python3` twice (for determinism) and caches the outcome
+  — `ok`, `error`, `timeout`, or `nondeterministic`. Future runs of
+  the same pair skip Python entirely and go straight to the Elixir
+  comparison.
 
   ## Storage
 
@@ -14,6 +15,12 @@ defmodule Eval.PythonCache do
   schema field set is enumerated in `entry()`. Entries from an older
   Python version (or differing `PYTHONHASHSEED`) are ignored on load
   — they'll be re-run and overwritten.
+
+  On startup, this module looks for a `cache/.python_cache_v2`
+  sentinel. If absent, it removes any pre-v2 `python.jsonl` (keyed on
+  source only) and any legacy `microsoft_rStar-Coder--*.jsonl` dataset
+  caches from the old Python-driver path, then writes the sentinel.
+  This is one-shot — subsequent boots skip the cleanup.
 
   ## Concurrency
 
@@ -26,6 +33,7 @@ defmodule Eval.PythonCache do
 
   @name __MODULE__
   @table __MODULE__.Cache
+  @schema_sentinel ".python_cache_v2"
 
   @type sha :: String.t()
 
@@ -47,11 +55,20 @@ defmodule Eval.PythonCache do
   end
 
   @doc """
-  Compute the cache key for a Python source string.
+  Compute the cache key for a `(source, stdin)` pair.
+
+  Keying on `source` alone is insufficient for the testcase-mode
+  harness: the same Python program produces different stdouts for
+  different testcase stdins. The cached entry must therefore include
+  the stdin in its identity. A NUL byte (which cannot appear in
+  well-formed UTF-8 Python source) separates the two parts so
+  collisions like `(source="A\\0", stdin="B")` vs `(source="A", stdin="\\0B")`
+  hash distinctly.
   """
-  @spec key(String.t()) :: sha()
-  def key(source) when is_binary(source) do
-    :crypto.hash(:sha256, source) |> Base.encode16(case: :lower)
+  @spec key(String.t(), String.t()) :: sha()
+  def key(source, stdin) when is_binary(source) and is_binary(stdin) do
+    :crypto.hash(:sha256, source <> <<0>> <> stdin)
+    |> Base.encode16(case: :lower)
   end
 
   @doc """
@@ -118,6 +135,7 @@ defmodule Eval.PythonCache do
         nil
       else
         File.mkdir_p!(Path.dirname(cache_path))
+        maybe_clean_legacy_caches(Path.dirname(cache_path), cache_path)
 
         unless rebuild do
           load_existing(cache_path, python_version, hashseed)
@@ -162,6 +180,39 @@ defmodule Eval.PythonCache do
     |> Map.put_new_lazy("created_at", fn ->
       DateTime.utc_now() |> DateTime.to_iso8601()
     end)
+  end
+
+  # One-shot legacy cache wipe. The pre-T7 schema keyed entries on
+  # `sha256(source)` alone; the new schema keys on
+  # `sha256(source <> "\0" <> stdin)`. Mixing the two would silently
+  # serve stale entries (same source, different stdin), so we delete
+  # `python.jsonl` outright the first time this module starts up under
+  # the new code. Legacy `microsoft_rStar-Coder--*.jsonl` files belong
+  # to the old `priv/python/dataset_stream.py` path that no longer
+  # exists; remove them too.
+  defp maybe_clean_legacy_caches(cache_dir, python_jsonl_path) do
+    sentinel = Path.join(cache_dir, @schema_sentinel)
+
+    unless File.exists?(sentinel) do
+      if File.exists?(python_jsonl_path) do
+        File.rm(python_jsonl_path)
+
+        IO.puts(
+          "[python_cache] removing #{python_jsonl_path} from previous schema; rebuilding from scratch"
+        )
+      end
+
+      legacy_glob = Path.join(cache_dir, "microsoft_rStar-Coder--*.jsonl")
+
+      legacy_glob
+      |> Path.wildcard()
+      |> Enum.each(fn legacy_path ->
+        File.rm(legacy_path)
+        IO.puts("[python_cache] removing legacy dataset cache #{legacy_path}")
+      end)
+
+      File.write!(sentinel, "")
+    end
   end
 
   defp load_existing(path, current_pyver, current_hashseed) do
