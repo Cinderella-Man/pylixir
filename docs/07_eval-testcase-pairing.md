@@ -306,8 +306,8 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 ### Phase 1 — Foundation (data ingestion)
 
 - [x] T1. `tools/eval/mix.exs`: add `{:explorer, "~> 0.10"}`, `{:req, "~> 0.5"}`.
-- [x] T2. Create `tools/eval/lib/eval/dataset.ex`: module attrs (repo, shard counts), `cache_dir/0`, `download_shard/2` (`:req` chunked → `.partial` → atomic rename, ~5%/5s progress, retry-from-scratch), `read_sft_shard/2` (column projection), `read_testcase_shard/2` (filter pushdown on qid set).
-- [x] T3. Create `tools/eval/lib/eval/corpus.ex`: `build/1` enumerable; cold path = scan all seed_sft shards → filter `is_passed`, dedup by `(qid, sha256(source))` → scan K seed_testcase shards → join; cache to `cache/corpus_v1.term.gz` (gzip `term_to_binary`, header `%{shards_loaded, parquet_mtimes}`, atomic `.partial` rename); warm path = restore if header matches K + no parquet newer; yield `%{id: "<qid>--<sha8>", source, testcases}`; track `testcase_shard_missing` count for qids whose testcase shard not loaded.
+- [x] T2. Create `tools/eval/lib/eval/dataset.ex`: module attrs (repo, shard counts), `cache_dir/0`, `download_shard/2` (`:req` chunked → `.partial` → atomic rename, ~5%/5s progress, retry-from-scratch), `read_sft_shard/2` (column projection), `read_testcase_shard/2` (filter pushdown on qid set). **V1 follow-up:** Req's `:into` callback fires for *every* response in the redirect chain — the 302's HTML body ("Found. Redirecting to …") was being written to the parquet file, prefixing the real bytes and producing "Invalid thrift" on parse. Fix: filter `write_chunk` to `status in 200..299`. Also clamped the progress-% display to `bytes <= total` to avoid 41 000 000 % output when the captured `Content-Length` belonged to the 302.
+- [x] T3. Create `tools/eval/lib/eval/corpus.ex`: `build/1` enumerable; cold path = scan all seed_sft shards → filter `is_passed`, dedup by `(qid, sha256(source))` → scan K seed_testcase shards → join; cache to `cache/corpus_v1.term.gz` (gzip `term_to_binary`, header `%{shards_loaded, parquet_mtimes}`, atomic `.partial` rename); warm path = restore if header matches K + no parquet newer; yield `%{id: "<qid>--<sha8>", source, testcases}`; track `testcase_shard_missing` count for qids whose testcase shard not loaded. **V1 follow-up:** `inputs` / `outputs` columns are *JSON-encoded lists of strings* — one element per testcase, packed into one row per qid. The first pass treated each row's entire JSON string as a single testcase's stdin, so Python's `int(input())` got the literal JSON list and crashed with `ValueError` 100 % of the time. Fix: `parse_testcases/2` decodes both lists, zips by index, and drops non-string entries (function-call-style testcases).
 
 ### Phase 2 — Execution surface (stdin everywhere)
 
@@ -361,11 +361,10 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 7 — Verification (post-implementation)
 
-- [ ] V1. Cold cache run: `PYLIXIR_PYTHON=python3.14 mix eval.run --limit 20 --samples-per-bucket 5`. Confirm:
-  - `tools/eval/cache/parquet/seed_sft/data-00000-of-00020.parquet` populated.
-  - `tools/eval/cache/parquet/seed_testcase/data-00000-of-00030.parquet` populated.
-  - `tools/eval/cache/python.jsonl` populated.
-  - `summary.json`: `schema_version: 3`, `comparison_mode: "executed"`, `:ok` rate ≫ 1.8%.
-- [ ] V2. Warm cache rerun: `mix eval.run --limit 20`. Confirm Python invocations only for cache misses.
-- [ ] V3. Manual `:ok` cross-check: `python3.14 reports/run-*/ok/001.py < reports/run-*/ok/001.testcase_0.stdin.txt | diff - reports/run-*/ok/001.testcase_0.expected.txt`.
-- [ ] V4. Sanity: `mix test test/pylixir/golden_corpus_test.exs` still green.
+- [x] V1. Cold cache run: `PYLIXIR_PYTHON=python3.14 mix eval.run --limit 20 --samples-per-bucket 5`. Confirmed:
+  - 20 seed_sft shards (~12 GB) + 1 seed_testcase shard (~7 GB) downloaded into `cache/parquet/`. **Note:** actual shard sizes are ~10× the doc's `~50 MB compressed` estimate — total cold download is ~19 GB (~9 min on this network), not the implied <1 GB. Once cached, the corpus warm path takes <3 s.
+  - `cache/python.jsonl` populated; `cache/corpus_v1.term.gz` written (149 MB gzipped).
+  - `summary.json`: `schema_version: 3` ✓, `comparison_mode: "executed"` ✓, `:ok` = 9/20 = **45 %** (vs 1.8 % baseline) ✓. `testcases_run: 144`, `testcases_passed: 100`, `testcase_shard_missing: 110121` (expected — only 1 of 30 testcase shards loaded).
+- [x] V2. Warm cache rerun: `mix eval.run --limit 20 --samples-per-bucket 5 --save-ok 5`. Corpus warm-cache hit; total elapsed **2.9 s**. Same bucket distribution as V1 (9 :ok / 11 `elixir_runtime_error--MatchError`). Python cache is consulted instead of subprocesses — confirmed by elapsed time.
+- [x] V3. Manual `:ok` cross-check on all 5 saved samples: `python3.14 reports/.../ok/<NNN>.py < ok/<NNN>.testcase_0.stdin.txt` vs `ok/<NNN>.testcase_0.expected.txt`, normalising `\r\n → \n` and trimming trailing whitespace (matching the harness's `compare_lenient`). All 5 match. **Note:** required a tiny T10 follow-up — `write_ok_samples` now also emits `<NNN>.testcase_0.{stdin,expected}.txt` so the spot-check works as written. Raw `diff` without normalisation reports divergence because the dataset's `expected` uses CRLF line endings.
+- [x] V4. Sanity: `mix test test/pylixir/golden_corpus_test.exs` — 185 tests, 0 failures.

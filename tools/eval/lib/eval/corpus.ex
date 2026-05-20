@@ -157,6 +157,12 @@ defmodule Eval.Corpus do
     end)
   end
 
+  # `inputs` and `outputs` are *JSON-encoded lists of strings* — one
+  # element per testcase. The dataset packs all of a qid's testcases
+  # into a single row (matched by index across the two lists). Decode
+  # both, zip into `%{stdin, expected}` pairs, and append to the qid's
+  # bucket. Rows whose JSON doesn't decode to matched string lists
+  # (e.g. function-call-style testcases) are dropped.
   defp accumulate_testcases(df, acc) do
     qids = df |> DF.pull("question_id") |> Explorer.Series.to_list()
     inputs = df |> DF.pull("inputs") |> Explorer.Series.to_list()
@@ -165,13 +171,43 @@ defmodule Eval.Corpus do
     [qids, inputs, outputs]
     |> Enum.zip()
     |> Enum.reduce(acc, fn
-      {nil, _stdin, _expected}, acc -> acc
-      {_qid, nil, _expected}, acc -> acc
-      {_qid, _stdin, nil}, acc -> acc
-      {qid, stdin, expected}, acc ->
-        tc = %{stdin: stdin, expected: expected}
-        Map.update(acc, qid, [tc], &[tc | &1])
+      {nil, _, _}, acc ->
+        acc
+
+      {_qid, nil, _}, acc ->
+        acc
+
+      {_qid, _, nil}, acc ->
+        acc
+
+      {qid, inputs_json, outputs_json}, acc ->
+        case parse_testcases(inputs_json, outputs_json) do
+          [] -> acc
+          tcs -> Map.update(acc, qid, tcs, &(tcs ++ &1))
+        end
     end)
+  end
+
+  defp parse_testcases(inputs_json, outputs_json) do
+    with {:ok, stdins} <- Jason.decode(inputs_json),
+         {:ok, expecteds} <- Jason.decode(outputs_json),
+         true <- is_list(stdins) and is_list(expecteds),
+         true <- length(stdins) == length(expecteds) do
+      stdins
+      |> Enum.zip(expecteds)
+      |> Enum.flat_map(fn
+        {stdin, expected} when is_binary(stdin) and is_binary(expected) ->
+          [%{stdin: stdin, expected: expected}]
+
+        _ ->
+          # Non-string entries indicate a function-call-style testcase
+          # (args list / dict). Skip — the harness only evaluates the
+          # stdin/stdout path.
+          []
+      end)
+    else
+      _ -> []
+    end
   end
 
   # --- Cache I/O -------------------------------------------------------

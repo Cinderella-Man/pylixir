@@ -389,7 +389,29 @@ defmodule Eval.Report do
           nil -> :ok
           src -> File.write!(ex_path, src)
         end
+
+        # Also write the first testcase's stdin/expected so reviewers
+        # can spot-check the `:ok` claim:
+        #   python3.14 reports/.../ok/001.py < ok/001.testcase_0.stdin.txt
+        #     | diff - ok/001.testcase_0.expected.txt
+        write_ok_first_testcase(ok_dir, padded, entry)
       end)
+    end
+  end
+
+  defp write_ok_first_testcase(ok_dir, padded, entry) do
+    case Map.get(entry.metadata, :per_testcase, []) do
+      [first | _] ->
+        meta = tc_meta(first)
+        File.write!(Path.join(ok_dir, "#{padded}.testcase_0.stdin.txt"), meta[:stdin] || "")
+
+        File.write!(
+          Path.join(ok_dir, "#{padded}.testcase_0.expected.txt"),
+          meta[:expected] || ""
+        )
+
+      [] ->
+        :ok
     end
   end
 

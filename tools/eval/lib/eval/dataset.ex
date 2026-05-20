@@ -174,7 +174,17 @@ defmodule Eval.Dataset do
     end
   end
 
-  defp write_chunk({:data, chunk}, {req, resp}) do
+  # Req's `:into` callback fires for each chunk of every response in
+  # the redirect chain — including the 302's HTML body ("Found.
+  # Redirecting to ..."). Writing those chunks corrupts the parquet
+  # (it ends up prefixed with the redirect body). Filter to 2xx
+  # responses only; the redirect chain still happens, we just don't
+  # let intermediate bodies hit the file. Same filter resets the
+  # content-length capture so we grab the *final* response's length
+  # (the 302's content-length is the size of its own HTML body, not
+  # the parquet).
+  defp write_chunk({:data, chunk}, {req, %{status: status} = resp})
+       when status in 200..299 do
     state = Process.get(@progress_key)
 
     IO.binwrite(state.handle, chunk)
@@ -184,6 +194,10 @@ defmodule Eval.Dataset do
     state = maybe_log_progress(state, bytes, total)
 
     Process.put(@progress_key, %{state | bytes: bytes, total_bytes: total})
+    {:cont, {req, resp}}
+  end
+
+  defp write_chunk({:data, _chunk}, {req, resp}) do
     {:cont, {req, resp}}
   end
 
@@ -206,19 +220,20 @@ defmodule Eval.Dataset do
     now = System.monotonic_time(:millisecond)
     elapsed_ms = now - state.last_ms
 
+    # `total` is the captured `Content-Length`. If the response is
+    # transfer-encoded (gzip, chunked) or content-length is otherwise
+    # inaccurate, `bytes` can exceed `total` — guard against the
+    # "41,000,000%" output that produces.
+    pct_known? = is_integer(total) and total > 0 and bytes <= total
+
     pct_threshold_hit? =
-      case total do
-        nil -> false
-        n when n > 0 -> bytes * 100 >= state.next_pct * n
-        _ -> false
-      end
+      pct_known? and bytes * 100 >= state.next_pct * total
 
     if pct_threshold_hit? or elapsed_ms >= 5_000 do
       pct_str =
-        case total do
-          nil -> "?%"
-          n -> "#{trunc(bytes * 100 / n)}%"
-        end
+        if pct_known?,
+          do: "#{trunc(bytes * 100 / total)}%",
+          else: "?%"
 
       mb = :erlang.float_to_binary(bytes / 1_048_576, decimals: 1)
       IO.puts("[dataset] #{state.label}: #{pct_str} (#{mb} MB)")
