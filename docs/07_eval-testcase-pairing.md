@@ -349,8 +349,8 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 5 — Cleanup (deletions)
 
-- [ ] T11. Delete `tools/eval/priv/python/dataset_stream.py`.
-- [ ] T12. Delete `tools/eval/lib/eval/stream.ex`.
+- [x] T11. Delete `tools/eval/priv/python/dataset_stream.py` (also removed now-empty `priv/python/` and `priv/`).
+- [x] T12. Delete `tools/eval/lib/eval/stream.ex`.
 
 ### Phase 6 — Tests
 
