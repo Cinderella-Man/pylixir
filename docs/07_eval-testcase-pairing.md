@@ -311,13 +311,13 @@ Tracking checklist. All tasks executed in one pass; list is for self-management.
 
 ### Phase 2 — Execution surface (stdin everywhere)
 
-- [ ] T4. `tools/eval/lib/eval/execute.ex`:
+- [x] T4. `tools/eval/lib/eval/execute.ex`:
   - `run_python/2`: accept `:stdin`, write sibling `.stdin` tmp, `... < tmp.stdin`, `try/after` cleanup.
   - `run_elixir/3`: accept `:stdin`, wrap call in `ExUnit.CaptureIO.capture_io(stdin_string, fn -> ... end)` (pattern at `test/pylixir/runtime_helpers_test.exs:10`).
   - Add `compare_lenient/2` (trim trailing `\n`, normalize `\r\n` → `\n`, byte-equal). Keep strict `compare_outputs/2`.
-- [ ] T5. `tools/eval/lib/eval/compile.ex`:
+- [x] T5. `tools/eval/lib/eval/compile.ex`:
   - Add `check_and_execute_testcases(source, testcases, elixir_timeout_ms, on_testcase)`: compile once in one `CompilePool` slot, iterate testcases invoking `on_testcase` per testcase, `try/after` delete + purge module.
-  - Delete `check/1` and `check_and_execute/2` (single-output / `--no-execute` only).
+  - Delete `check_and_execute/2` (single-output / `--no-execute` only). **Deviation from doc:** `check/1` retained — `Mix.Tasks.Eval.Probe` (developer probe) still depends on it; the doc's deletion rationale missed this caller.
 
 ### Phase 3 — Classification + caching
 

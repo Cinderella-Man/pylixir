@@ -6,25 +6,34 @@ defmodule Eval.Execute do
   ## Python execution
 
   Spawns `python3` (resolved via `PYLIXIR_PYTHON`, default `python3`)
-  through `sh -c` so we can redirect stdin from `/dev/null`. On
-  timeout the direct child PID is SIGKILL'd. Process descendants
-  spawned by the sample (rare in this corpus) may briefly leak
-  before BEAM exit reaps them.
+  through `sh -c`. Stdin is redirected either from a per-call `.stdin`
+  tmp file (when `:stdin` is supplied) or from `/dev/null`. On timeout
+  the direct child PID is SIGKILL'd. Process descendants spawned by
+  the sample (rare in this corpus) may briefly leak before BEAM exit
+  reaps them.
 
   ## Elixir execution
 
-  Invokes `module.py_main()` inside `ExUnit.CaptureIO.capture_io/1`,
-  inside `Task.async/1`. `Task.yield/2` enforces the wall-clock
-  budget; `Task.shutdown(:brutal_kill)` aborts a hung run. The
-  `{:pylixir_exit, code}` throw used by Pylixir's translated
+  Invokes `module.py_main()` inside `ExUnit.CaptureIO.capture_io/2`,
+  inside `Task.async/1`. When `:stdin` is supplied, it's fed to
+  `capture_io` so the runtime-helper readers (`py_input/0`,
+  `py_stdin_readline/0`) consume it. `Task.yield/2` enforces the
+  wall-clock budget; `Task.shutdown(:brutal_kill)` aborts a hung run.
+  The `{:pylixir_exit, code}` throw used by Pylixir's translated
   `sys.exit()` codegen (see `lib/pylixir/converter.ex:3038-3041`) is
   caught and treated as a clean exit.
 
   ## Output comparison
 
-  Strict byte-equal after `\\r\\n → \\n` normalization. Mismatches
-  carry a first-divergent-line fingerprint plus a human-readable
-  summary string saved to the report.
+  Two flavours:
+
+    * `compare_outputs/2` — strict byte-equal after `\\r\\n → \\n`
+      normalization. Used for the Python ⟷ Elixir leg.
+    * `compare_lenient/2` — additionally trims trailing newlines. Used
+      for the Python ⟷ dataset-`expected` leg (dataset noise tolerated).
+
+  Mismatches carry a first-divergent-line fingerprint plus a
+  human-readable summary string saved to the report.
   """
 
   # `Port.open(... env: ...)` requires charlists, not binaries, on the
@@ -53,22 +62,35 @@ defmodule Eval.Execute do
   # --- Public API ------------------------------------------------------
 
   @doc """
-  Run `source` under CPython with stdin from `/dev/null` and
-  PYTHONHASHSEED=0. Returns `{:ok, stdout}` on a 0 exit, `{:exit,
-  status, output}` on a non-zero exit (stdout+stderr combined), or
-  `:timeout` if it exceeded `:timeout_ms`.
+  Run `source` under CPython with PYTHONHASHSEED=0. Returns
+  `{:ok, stdout}` on a 0 exit, `{:exit, status, output}` on a non-zero
+  exit (stdout+stderr combined), or `:timeout` if it exceeded
+  `:timeout_ms`.
+
+  ## Options
+
+    * `:timeout_ms` (required) — wall-clock budget.
+    * `:stdin` — string content to feed on stdin. Written to a sibling
+      `.stdin` tmp file and redirected via shell `< file`. Default is
+      to redirect `< /dev/null` (preserves the pre-testcase behaviour
+      for stdin-less corpora).
   """
   @spec run_python(String.t(), keyword()) :: python_result()
   def run_python(source, opts) when is_binary(source) do
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
+    stdin = Keyword.get(opts, :stdin)
+
     tmp = tmp_path()
+    stdin_path = if stdin, do: tmp <> ".stdin", else: nil
 
     try do
       File.mkdir_p!(Path.dirname(tmp))
       File.write!(tmp, source)
-      do_run_python(tmp, timeout_ms)
+      if stdin_path, do: File.write!(stdin_path, stdin)
+      do_run_python(tmp, stdin_path, timeout_ms)
     after
       File.rm(tmp)
+      if stdin_path, do: File.rm(stdin_path)
     end
   end
 
@@ -77,21 +99,36 @@ defmodule Eval.Execute do
   caller is responsible for ensuring the module is loaded and that
   this is called from inside the `CompilePool` slot that owns its
   alias (so the module isn't purged mid-run).
+
+  ## Options
+
+    * `:stdin` — string fed to `module.py_main()` via
+      `ExUnit.CaptureIO.capture_io(stdin, fn -> ... end)`. The
+      runtime-helper stdin readers (`Pylixir.RuntimeHelpers.py_input/0`
+      et al) are GL-swap friendly, so concurrent workers don't bleed
+      input. When `nil` (default), no stdin is supplied.
   """
-  @spec run_elixir(module(), pos_integer()) :: elixir_result()
-  def run_elixir(module, timeout_ms) do
+  @spec run_elixir(module(), pos_integer(), keyword()) :: elixir_result()
+  def run_elixir(module, timeout_ms, opts \\ []) do
+    stdin = Keyword.get(opts, :stdin)
+
     task =
       Task.async(fn ->
+        runner = fn ->
+          try do
+            module.py_main()
+            :ok
+          catch
+            :throw, {:pylixir_exit, _code} -> :ok
+          end
+        end
+
         try do
           stdout =
-            ExUnit.CaptureIO.capture_io(fn ->
-              try do
-                module.py_main()
-                :ok
-              catch
-                :throw, {:pylixir_exit, _code} -> :ok
-              end
-            end)
+            case stdin do
+              nil -> ExUnit.CaptureIO.capture_io(runner)
+              s when is_binary(s) -> ExUnit.CaptureIO.capture_io(s, runner)
+            end
 
           {:ok, stdout}
         rescue
@@ -109,10 +146,11 @@ defmodule Eval.Execute do
   end
 
   @doc """
-  Compare two stdout strings byte-equal after `\\r\\n → \\n`
-  normalization. Returns `:equal_empty` when both sides are empty
-  (after trimming trailing newlines), `:equal` otherwise on a match,
-  or `{:differ, fingerprint, summary}` on a mismatch.
+  Strict comparison for the Python ⟷ Elixir leg. Two stdout strings
+  must be byte-equal after `\\r\\n → \\n` normalization. Returns
+  `:equal_empty` when both sides are empty (after trimming trailing
+  newlines), `:equal` otherwise on a match, or `{:differ, fingerprint,
+  summary}` on a mismatch.
   """
   @spec compare_outputs(String.t(), String.t()) :: compare_result()
   def compare_outputs(python_stdout, elixir_stdout) do
@@ -126,13 +164,33 @@ defmodule Eval.Execute do
     end
   end
 
+  @doc """
+  Lenient comparison for the Python ⟷ dataset-`expected` leg. After
+  `\\r\\n → \\n` normalization, **all** trailing newlines are trimmed
+  from both sides before byte-comparing — the dataset's `outputs`
+  field carries inconsistent trailing whitespace that shouldn't drive
+  bucket assignment. Same return shape as `compare_outputs/2`.
+  """
+  @spec compare_lenient(String.t(), String.t()) :: compare_result()
+  def compare_lenient(actual, expected) do
+    a = lenient_normalize(actual)
+    e = lenient_normalize(expected)
+
+    cond do
+      a == e and a == "" -> :equal_empty
+      a == e -> :equal
+      true -> diff(e, a)
+    end
+  end
+
   # --- Internals -------------------------------------------------------
 
-  defp do_run_python(tmp, timeout_ms) do
+  defp do_run_python(tmp, stdin_path, timeout_ms) do
     sh = find_executable!("sh")
     py = python_cmd()
 
-    cmd = "exec " <> sh_quote(py) <> " " <> sh_quote(tmp) <> " < /dev/null"
+    redirect = if stdin_path, do: sh_quote(stdin_path), else: "/dev/null"
+    cmd = "exec " <> sh_quote(py) <> " " <> sh_quote(tmp) <> " < " <> redirect
 
     port =
       Port.open(
@@ -211,6 +269,12 @@ defmodule Eval.Execute do
   defp sh_quote(s), do: "'" <> String.replace(s, "'", "'\\''") <> "'"
 
   defp normalize(s), do: String.replace(s, "\r\n", "\n")
+
+  defp lenient_normalize(s) do
+    s
+    |> normalize()
+    |> String.trim_trailing("\n")
+  end
 
   defp empty?(s), do: String.trim_trailing(s, "\n") == ""
 

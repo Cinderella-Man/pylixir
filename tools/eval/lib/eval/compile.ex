@@ -1,94 +1,98 @@
 defmodule Eval.Compile do
   @moduledoc """
-  Compile-check generated Elixir source.
+  Compile generated Elixir source and execute its `py_main/0` against
+  every testcase of a sample inside a single `CompilePool` slot.
 
   Adapted from `Pylixir.TranspileHelpers.run_source/1` in the main test
   support tree, but trimmed:
 
-    * No invocation of `py_main/0` — v1 of the harness measures
-      transpile + compile success, not behavioural equivalence.
     * No `ExUnit` dependency, so this can run from a Mix task.
     * Returns diagnostics or an exception rather than raising.
+    * Always runs in testcase mode — the harness now has only one mode.
 
-  Return shape:
+  ## Slot lifetime
 
-    * `{:ok, diagnostics}` — `Code.compile_quoted/1` returned normally;
-      `diagnostics` is whatever `Code.with_diagnostics/1` collected
-      (may include warnings).
-    * `{:error, exception}` — anything raised during parse / rewrite /
-      compile bubbled out.
+  One `CompilePool` slot is held across `compile → ∀ testcase: run →
+  delete + purge`. The slot guarantees the alias is stable for the
+  duration, so the module can't be replaced under our feet by another
+  worker, and the next compile of the same alias *replaces* this one
+  cleanly (see `Eval.CompilePool` for why this matters for
+  `export_staged_index`).
   """
 
   @type result ::
           {:ok, diagnostics :: [map()]}
           | {:error, Exception.t()}
 
-  @type execute_result ::
-          {:ok, diagnostics :: [map()], stdout :: String.t()}
-          | {:raised, diagnostics :: [map()], Exception.t() | atom()}
-          | {:timeout, diagnostics :: [map()]}
+  @type testcases_result ::
+          {:executed_testcases, diagnostics :: [map()], per_tc :: [any()]}
           | {:error, Exception.t()}
 
+  @doc """
+  Compile-only check. Returns `{:ok, diagnostics}` on a clean compile,
+  `{:error, exception}` on parse/compile failure. The module is purged
+  before this returns — callers must not assume it's loaded afterwards.
+
+  Retained for `Mix.Tasks.Eval.Probe`, which compiles + runs in two
+  separate steps. The main harness uses
+  `check_and_execute_testcases/4` instead.
+  """
   @spec check(String.t()) :: result()
   def check(source) when is_binary(source) do
     Eval.CompilePool.with_slot(fn alias_atom ->
-      compile_with_alias(source, alias_atom)
+      {compile_outcome, diagnostics} = do_compile(source, alias_atom)
+      purge_module(alias_atom)
+
+      case compile_outcome do
+        :ok -> {:ok, diagnostics}
+        {:raised, e} -> {:error, e}
+      end
     end)
   end
 
   @doc """
-  Compile-and-execute. Runs `module.py_main()` inside the same
-  `CompilePool` slot, before `:code.delete`/`:code.purge`, so the
-  module is guaranteed to be loaded for the duration of the call
-  and replaced cleanly on the next checkout of the same alias.
+  Compile `source`, then invoke `on_testcase.(module, testcase)` for
+  each entry in `testcases`. Per-testcase classification is the
+  caller's responsibility (the callback's return value is returned
+  verbatim in the `per_tc` list).
 
   Returns:
 
-    * `{:ok, diagnostics, stdout}` — compile clean, run finished
-      under `timeout_ms`.
-    * `{:raised, diagnostics, exception}` — compile clean, run
-      raised at runtime.
-    * `{:timeout, diagnostics}` — compile clean, run exceeded the
-      budget.
-    * `{:error, exception}` — compile itself failed.
+    * `{:executed_testcases, diagnostics, per_tc}` — compile clean.
+      `per_tc` has one entry per input `testcases`, in order.
+    * `{:error, exception}` — compile itself failed; the callback was
+      never invoked.
+
+  The slot is held for the entire compile + all testcase runs + purge.
+  Worst case at 16 testcases × 5 s/timeout ≈ 80 s — keep
+  `:elixir_timeout` honest.
   """
-  @spec check_and_execute(String.t(), pos_integer()) :: execute_result()
-  def check_and_execute(source, timeout_ms)
-      when is_binary(source) and is_integer(timeout_ms) and timeout_ms > 0 do
+  @spec check_and_execute_testcases(
+          String.t(),
+          [map()],
+          pos_integer(),
+          (module(), map() -> any())
+        ) :: testcases_result()
+  def check_and_execute_testcases(source, testcases, elixir_timeout_ms, on_testcase)
+      when is_binary(source) and is_list(testcases) and is_integer(elixir_timeout_ms) and
+             elixir_timeout_ms > 0 and is_function(on_testcase, 2) do
     Eval.CompilePool.with_slot(fn alias_atom ->
-      compile_and_execute_with_alias(source, alias_atom, timeout_ms)
-    end)
-  end
+      {compile_outcome, diagnostics} = do_compile(source, alias_atom)
+      module = Module.concat(Elixir, alias_atom)
 
-  defp compile_with_alias(source, alias_atom) do
-    {compile_outcome, diagnostics} = do_compile(source, alias_atom)
-    purge_module(alias_atom)
+      try do
+        case compile_outcome do
+          :ok ->
+            per_tc = Enum.map(testcases, &on_testcase.(module, &1))
+            {:executed_testcases, diagnostics, per_tc}
 
-    case compile_outcome do
-      :ok -> {:ok, diagnostics}
-      {:raised, e} -> {:error, e}
-    end
-  end
-
-  defp compile_and_execute_with_alias(source, alias_atom, timeout_ms) do
-    {compile_outcome, diagnostics} = do_compile(source, alias_atom)
-    module = Module.concat(Elixir, alias_atom)
-
-    try do
-      case compile_outcome do
-        :ok ->
-          case Eval.Execute.run_elixir(module, timeout_ms) do
-            {:ok, stdout} -> {:ok, diagnostics, stdout}
-            {:raised, e} -> {:raised, diagnostics, e}
-            :timeout -> {:timeout, diagnostics}
-          end
-
-        {:raised, e} ->
-          {:error, e}
+          {:raised, e} ->
+            {:error, e}
+        end
+      after
+        purge_module(alias_atom)
       end
-    after
-      purge_module(alias_atom)
-    end
+    end)
   end
 
   defp do_compile(source, alias_atom) do
