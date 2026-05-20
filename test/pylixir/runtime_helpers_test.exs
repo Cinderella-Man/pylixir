@@ -223,4 +223,113 @@ defmodule Pylixir.RuntimeHelpersTest do
       assert H.py_abs(false) == 0
     end
   end
+
+  describe "py_alist_* — frozen-list (alist) primitives" do
+    test "py_alist_new wraps an enumerable as a tagged tuple of its elements" do
+      assert H.py_alist_new([1, 2, 3]) == {:py_alist, {1, 2, 3}}
+      assert H.py_alist_new([]) == {:py_alist, {}}
+      assert H.py_alist_new(1..3) == {:py_alist, {1, 2, 3}}
+    end
+
+    test "py_getitem on an alist is O(1)-shaped and respects Python indexing" do
+      a = H.py_alist_new(Enum.to_list(0..999))
+      assert H.py_getitem(a, 0) == 0
+      assert H.py_getitem(a, 999) == 999
+      assert H.py_getitem(a, -1) == 999
+      assert H.py_getitem(a, -1000) == 0
+    end
+
+    test "py_getitem returns nil for out-of-range indices (matches existing list behaviour)" do
+      a = H.py_alist_new([10, 20, 30])
+      assert H.py_getitem(a, 5) == nil
+      assert H.py_getitem(a, -4) == nil
+    end
+
+    test "py_len returns tuple_size; does not accidentally hit the is_tuple clause" do
+      a = H.py_alist_new([:a, :b, :c, :d])
+      assert H.py_len(a) == 4
+      assert H.py_len(H.py_alist_new([])) == 0
+    end
+
+    test "py_in checks membership against the unwrapped element list" do
+      a = H.py_alist_new([1, 2, 3])
+      assert H.py_in(2, a)
+      refute H.py_in(99, a)
+    end
+
+    test "py_iter_to_list unwraps an alist back to a regular list" do
+      assert H.py_iter_to_list(H.py_alist_new([1, 2, 3])) == [1, 2, 3]
+    end
+
+    test "py_slice on an alist returns a regular Elixir list (Python: slice of a list is a list)" do
+      a = H.py_alist_new([0, 1, 2, 3, 4, 5])
+      assert H.py_slice(a, 1, 4, nil) == [1, 2, 3]
+      assert H.py_slice(a, 0, 6, 2) == [0, 2, 4]
+      assert H.py_slice(a, nil, nil, -1) == [5, 4, 3, 2, 1, 0]
+    end
+
+    test "py_str / py_repr render an alist as list-style `[...]`, not tuple-style `(...)`" do
+      a = H.py_alist_new([1, 2, 3])
+      assert H.py_str(a) == "[1, 2, 3]"
+      assert H.py_repr(a) == "[1, 2, 3]"
+    end
+
+    test "py_eq normalises both sides through py_iter_to_list" do
+      a = H.py_alist_new([1, 2, 3])
+      assert H.py_eq(a, [1, 2, 3])
+      assert H.py_eq([1, 2, 3], a)
+      assert H.py_eq(a, a)
+      refute H.py_eq(a, [1, 2, 99])
+    end
+
+    test "py_eq stays on plain `==` when neither side is alist" do
+      assert H.py_eq(1, 1)
+      assert H.py_eq("foo", "foo")
+      refute H.py_eq([1, 2], [1, 2, 3])
+    end
+
+    test "indexed read is fast on a 100k-element alist (O(1) per read)" do
+      a = H.py_alist_new(Enum.to_list(0..99_999))
+      # 100k random-ish reads — should be effectively instant. Just
+      # assert correctness; the implicit timing guard is the test
+      # finishing within ExUnit's default timeout.
+      assert Enum.all?(0..99_999//7, fn i -> H.py_getitem(a, i) == i end)
+    end
+  end
+
+  describe "py_copy/1 — shallow copy for `.copy()` dispatch" do
+    test "list copy is equal to source; mutating the copy doesn't affect the original" do
+      xs = [1, 2, 3]
+      ys = H.py_copy(xs)
+      assert ys == xs
+      ys2 = List.delete(ys, 2)
+      assert xs == [1, 2, 3]
+      assert ys2 == [1, 3]
+    end
+
+    test "map copy preserves entries; mutating the copy doesn't affect the original" do
+      d = %{"a" => 1, "b" => 2}
+      e = H.py_copy(d)
+      assert e == d
+      e2 = Map.put(e, "a", 99)
+      assert d == %{"a" => 1, "b" => 2}
+      assert e2 == %{"a" => 99, "b" => 2}
+    end
+
+    test "MapSet copy preserves elements; mutating the copy doesn't affect the original" do
+      s = MapSet.new([1, 2, 3])
+      t = H.py_copy(s)
+      assert t == s
+      t2 = MapSet.delete(t, 2)
+      assert s == MapSet.new([1, 2, 3])
+      assert t2 == MapSet.new([1, 3])
+    end
+
+    test "alist copy unwraps to a fresh regular list" do
+      a = H.py_alist_new([1, 2, 3])
+      copy = H.py_copy(a)
+      assert copy == [1, 2, 3]
+      assert is_list(copy)
+    end
+  end
 end

@@ -26,6 +26,11 @@ defmodule Pylixir.Context do
       to decide whether to emit a `defp` (`:module_top`), defer to T21's
       anonymous-fn handling (`:nested_fn`), or raise (`:other` — function
       definitions inside control flow are not supported).
+    * `:freezable_names` — `MapSet` of Python names in the current scope
+      whose `xs = list(...)` binding is safe to wrap in `py_alist_new`
+      (the alist optimisation, see `Pylixir.AlistAnalysis`). Populated
+      when the converter enters a function body; restored on exit. Empty
+      until `Pylixir.Nodes.Assign` is wired in P5.
   """
 
   @type def_position :: :module_top | :nested_fn | :other
@@ -56,7 +61,8 @@ defmodule Pylixir.Context do
           types: %{optional(String.t()) => term()},
           type_stack: [{type_frame_kind(), %{optional(String.t()) => term()}}],
           fn_signatures: %{optional(String.t()) => {[term()], term()}},
-          heap_types: %{optional(String.t()) => term()}
+          heap_types: %{optional(String.t()) => term()},
+          freezable_names: MapSet.t(String.t())
         }
 
   @enforce_keys [:scopes]
@@ -81,7 +87,8 @@ defmodule Pylixir.Context do
             types: %{},
             type_stack: [],
             fn_signatures: %{},
-            heap_types: %{}
+            heap_types: %{},
+            freezable_names: MapSet.new()
 
   @doc """
   Build a fresh context with a single empty scope and the given set of

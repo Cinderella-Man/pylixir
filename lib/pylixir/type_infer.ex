@@ -22,6 +22,7 @@ defmodule Pylixir.TypeInfer do
           | {:str}
           | {:none}
           | {:list, t()}
+          | {:py_alist, t()}
           | {:tuple, [t()] | :any_arity}
           | {:dict, t(), t()}
           | {:set}
@@ -44,6 +45,12 @@ defmodule Pylixir.TypeInfer do
 
   @spec is_list?(t()) :: boolean()
   def is_list?({:list, _}), do: true
+  # `{:py_alist, _}` is deliberately NOT treated as a list here —
+  # `coerce_iter/2` skips its `py_iter_to_list` wrap when the type
+  # is_list? is true, but an alist DOES need the wrap (Enum.* on a
+  # `{:py_alist, t}` would crash). Returning false routes all
+  # iteration consumers through `py_iter_to_list/1`, which has an
+  # alist clause that unwraps to a plain list.
   def is_list?(_), do: false
 
   @spec is_dict?(t()) :: boolean()
@@ -88,6 +95,11 @@ defmodule Pylixir.TypeInfer do
 
   # containers
   def lub({:list, a}, {:list, b}), do: {:list, lub(a, b)}
+  # Two alists meeting in a phi stay an alist; the element type is
+  # the lub of the per-branch element types. Without this clause the
+  # type tracker would fall through to `union/1`, which is fine for
+  # soundness but kills downstream alist-aware specialisation.
+  def lub({:py_alist, a}, {:py_alist, b}), do: {:py_alist, lub(a, b)}
   def lub({:dict, ka, va}, {:dict, kb, vb}), do: {:dict, lub(ka, kb), lub(va, vb)}
 
   def lub({:tuple, ta}, {:tuple, tb}) when is_list(ta) and is_list(tb) do
@@ -139,6 +151,7 @@ defmodule Pylixir.TypeInfer do
 
   @spec elem_of(t()) :: t()
   def elem_of({:list, e}), do: e
+  def elem_of({:py_alist, e}), do: e
   def elem_of({:str}), do: {:str}
   def elem_of({:tuple, ts}) when is_list(ts), do: lub_all(ts)
   def elem_of({:tuple, :any_arity}), do: :any

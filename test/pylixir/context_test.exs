@@ -34,5 +34,9 @@ defmodule Pylixir.ContextTest do
     test "starts at :module_top so the first FunctionDef encountered is a top-level def" do
       assert Context.new().def_position == :module_top
     end
+
+    test "freezable_names defaults to an empty MapSet" do
+      assert Context.new().freezable_names == MapSet.new()
+    end
   end
 end

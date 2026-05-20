@@ -106,9 +106,26 @@ defmodule Pylixir.Converter do
     # emitted as `name = fn ... end` lambda bindings via the
     # `:nested_fn` path — that closes over the surrounding py_main
     # scope, which is what Python's `def` semantics require here.
-    context = %{context | def_position: :nested_fn}
+    # Module-top freezable names (alist optimisation, P4) — runtime
+    # statements form the body of the synthetic `py_main` scope, so
+    # the safety check runs over them just like a regular function
+    # body. Restored after the conversion. The set is consulted by
+    # `Pylixir.Nodes.Assign` when P5 lands.
+    saved_freezable_names = context.freezable_names
+
+    context = %{
+      context
+      | def_position: :nested_fn,
+        freezable_names: Pylixir.AlistAnalysis.freezable_names(analysis.runtime_statements)
+    }
+
     {stmt_asts, context} = convert_each(analysis.runtime_statements, context)
-    context = %{context | def_position: :module_top}
+
+    context = %{
+      context
+      | def_position: :module_top,
+        freezable_names: saved_freezable_names
+    }
 
     # M3 — drop empty `{:__block__, [], []}` and noop sentinels that
     # surface as stray `nil` lines in the output (e.g. a hoisted

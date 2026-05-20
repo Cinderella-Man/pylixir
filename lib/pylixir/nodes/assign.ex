@@ -458,10 +458,34 @@ defmodule Pylixir.Nodes.Assign do
         :no ->
           value_type = TypeInfer.infer_expr(value, context)
           {value_ast, context} = Converter.convert(value, context)
-          context = TypeInfer.bind(context, id, value_type)
+
+          # Alist freeze (P5): when the safety check (P3) has put
+          # this name in `freezable_names` AND the RHS is a `list(...)`
+          # builtin call, wrap the converted value in `py_alist_new/1`
+          # and switch the bound type to `{:py_alist, elem_t}`. Every
+          # downstream consumer either handles alists via the helper
+          # clauses added in P1 or routes through `coerce_iter`
+          # (`is_list?({:py_alist, _})` returns false, P2). Bail on
+          # any other RHS shape — the analysis's allowlist is built
+          # around the `list(...)` form specifically.
+          {emitted_value_ast, bound_type} =
+            if MapSet.member?(context.freezable_names, id) and
+                 python_calls_list_builtin?(value) do
+              elem_t =
+                case value_type do
+                  {:list, e} -> e
+                  _ -> :any
+                end
+
+              {{:py_alist_new, [], [value_ast]}, {:py_alist, elem_t}}
+            else
+              {value_ast, value_type}
+            end
+
+          context = TypeInfer.bind(context, id, bound_type)
           context = Converter.bind_name(context, id)
           {target_ast, context} = Converter.convert(target, context)
-          {{:=, [], [target_ast, value_ast]}, context}
+          {{:=, [], [target_ast, emitted_value_ast]}, context}
       end
     end
   end
@@ -546,8 +570,22 @@ defmodule Pylixir.Nodes.Assign do
   #
   # `detect_mutating_method_call/2` powers the Name-target clause's
   # `x = obj.method(args)` destructure path (mutating class methods
-  # return `{value, updated_self}`). Lives below the catch-all so it
-  # doesn't split the `single_target_assign/4` clause cluster.
+  # return `{value, updated_self}`). `python_calls_list_builtin?/1`
+  # powers the alist-freeze emission (P5). Both live below the
+  # catch-all so they don't split the `single_target_assign/4` clause
+  # cluster.
+
+  # Python-AST shape predicate: is this a call to the builtin
+  # `list(<anything>)`? Mirrors `Pylixir.AlistAnalysis`'s candidate
+  # filter so emission and safety check agree on the RHS shape we
+  # freeze.
+  defp python_calls_list_builtin?(%{
+         "_type" => "Call",
+         "func" => %{"_type" => "Name", "id" => "list"}
+       }),
+       do: true
+
+  defp python_calls_list_builtin?(_), do: false
 
   defp detect_mutating_method_call(
          %{

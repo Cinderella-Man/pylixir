@@ -1210,16 +1210,27 @@ defmodule Pylixir.ModuleAnalysis do
     end)
   end
 
-  defp mutates_name?(%{"_type" => "Assign", "targets" => targets, "value" => value}, name) do
+  @doc """
+  True iff `node` is a single AST node that mutates the Python name
+  `name`. Handles every shape recognised by Pylixir: `xs = ...`,
+  `xs += ...`, `xs.append(...)`, `xs[i] = ...`, `xs[i][j].append(...)`,
+  `for xs in ...`, `del xs[i]`, plus the stdlib mutating-call
+  recognisers (`heappush(xs, ...)`, `bisect.insort(xs, ...)`).
+
+  Public for reuse by `Pylixir.AlistAnalysis`, which gates the alist
+  optimisation on "is `xs` never mutated in this scope?".
+  """
+  @spec mutates_name?(map(), String.t()) :: boolean()
+  def mutates_name?(%{"_type" => "Assign", "targets" => targets, "value" => value}, name) do
     Enum.any?(targets, &target_mentions?(&1, name)) or
       capture_return_mutates?(value, name)
   end
 
-  defp mutates_name?(%{"_type" => "AugAssign", "target" => target}, name) do
+  def mutates_name?(%{"_type" => "AugAssign", "target" => target}, name) do
     aug_target_root_name(target) == name
   end
 
-  defp mutates_name?(
+  def mutates_name?(
          %{
            "_type" => "Expr",
            "value" => %{
@@ -1239,7 +1250,7 @@ defmodule Pylixir.ModuleAnalysis do
   # `coll[i].method(args)` — `Pylixir.Nodes.Mutations` rebinds `coll`,
   # so `coll` must NOT be promoted to a module attribute even though
   # its initial Assign is a literal.
-  defp mutates_name?(
+  def mutates_name?(
          %{
            "_type" => "Expr",
            "value" => %{
@@ -1261,7 +1272,7 @@ defmodule Pylixir.ModuleAnalysis do
 
   # `coll[i][j].method(args)` — depth-2 form. Same rebind shape via
   # `Mutations.emit_subscript2`.
-  defp mutates_name?(
+  def mutates_name?(
          %{
            "_type" => "Expr",
            "value" => %{
@@ -1284,12 +1295,12 @@ defmodule Pylixir.ModuleAnalysis do
        when method in @mutation_methods,
        do: target_name == name
 
-  defp mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
+  def mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
     do: target == name
 
   # `del coll[k]` — rebinds `coll`, so a top-level dict/list that's
   # later `del`'d-from must not be promoted to a module attribute.
-  defp mutates_name?(%{"_type" => "Delete", "targets" => targets}, name) do
+  def mutates_name?(%{"_type" => "Delete", "targets" => targets}, name) do
     Enum.any?(targets, fn
       %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => target_name}} ->
         target_name == name
@@ -1304,7 +1315,7 @@ defmodule Pylixir.ModuleAnalysis do
   # Expr clause. ModuleAnalysis runs before stdlib aliases are tracked,
   # so the recognizer accepts the bare-Name form heuristically — see
   # `Pylixir.Stdlib.Heapq.statement_mutation_call/2` for the contract.
-  defp mutates_name?(%{"_type" => "Expr", "value" => value}, name) do
+  def mutates_name?(%{"_type" => "Expr", "value" => value}, name) do
     case Pylixir.Stdlib.Heapq.statement_mutation_call(value, nil) do
       {:ok, ^name, _, _} ->
         true
@@ -1317,7 +1328,7 @@ defmodule Pylixir.ModuleAnalysis do
     end
   end
 
-  defp mutates_name?(_, _), do: false
+  def mutates_name?(_, _), do: false
 
   # `x = coll.pop()` / `a, b = coll.pop()` — Converter's `single_target_assign`
   # rebinds `coll` via `{popped, coll} = py_pop_*(coll, ...)`. Mirror the

@@ -75,11 +75,14 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   # --- Immutability no-ops -----------------------------------------------
 
-  # `xs.copy()` / `d.copy()` / `s.copy()` — Elixir is immutable, so the
-  # copy is the value itself. The target_ast is emitted *as the
-  # expression* — single-eval semantics are preserved because the
-  # surrounding expression evaluates it once.
-  defp do_dispatch("copy", target, [], _kw, _node), do: target
+  # `xs.copy()` / `d.copy()` / `s.copy()` — Elixir's lists, maps, and
+  # MapSets are immutable, so the helper is identity for them: the
+  # original is preserved by Pylixir's mutation-rewrite (`xs = xs ++
+  # [y]` etc.) rebinding the name. Routed through `py_copy/1` rather
+  # than emitting the target directly so a future representation
+  # (frozen-tuple alists) can extend the helper with an unwrap clause
+  # without retouching this dispatch table.
+  defp do_dispatch("copy", target, [], _kw, _node), do: {:py_copy, [], [target]}
 
   # --- Integer methods ---------------------------------------------------
 

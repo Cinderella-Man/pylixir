@@ -361,6 +361,9 @@ defmodule Pylixir.RuntimeHelpers do
   def apply_zero_pad(s, diff), do: String.duplicate("0", diff) <> s
 
   # === Collection access ===
+  # Frozen alist: leading clause keeps `{:py_alist, _}` from matching
+  # the trailing `is_tuple` clause and returning a wrong size.
+  def py_len({:py_alist, t}), do: tuple_size(t)
   def py_len(x) when is_list(x), do: length(x)
   def py_len(x) when is_binary(x), do: String.length(x)
   def py_len(%MapSet{} = x), do: MapSet.size(x)
@@ -379,9 +382,21 @@ defmodule Pylixir.RuntimeHelpers do
     indices = py_slice_indices(start_i, stop_i, step_v)
 
     cond do
-      is_list(coll) -> Enum.map(indices, &Enum.at(coll, &1))
-      is_binary(coll) -> Enum.map_join(indices, "", &String.at(coll, &1))
-      is_tuple(coll) -> indices |> Enum.map(&elem(coll, &1)) |> List.to_tuple()
+      is_list(coll) ->
+        Enum.map(indices, &Enum.at(coll, &1))
+
+      is_binary(coll) ->
+        Enum.map_join(indices, "", &String.at(coll, &1))
+
+      # Alist branch MUST come before `is_tuple` (a `{:py_alist, _}`
+      # tag is structurally a tuple). Python's "slice of a list is a
+      # list" — return a regular list, not another alist.
+      match?({:py_alist, _}, coll) ->
+        {:py_alist, t} = coll
+        Enum.map(indices, &elem(t, &1))
+
+      is_tuple(coll) ->
+        indices |> Enum.map(&elem(coll, &1)) |> List.to_tuple()
     end
   end
 
@@ -414,6 +429,20 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_getitem(c, k) when is_list(c), do: Enum.at(c, k)
   def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
+  # Alist: O(1) `elem/2`, but bounds-checked because the existing
+  # list semantics return `nil` for out-of-range — `elem/2` would
+  # raise ArgumentError otherwise. Negative indices wrap by length.
+  # Leading clauses keep `{:py_alist, _}` away from the trailing
+  # tuple clauses.
+  def py_getitem({:py_alist, t}, k) when k >= 0 do
+    if k < tuple_size(t), do: elem(t, k), else: nil
+  end
+
+  def py_getitem({:py_alist, t}, k) do
+    idx = tuple_size(t) + k
+    if idx >= 0, do: elem(t, idx), else: nil
+  end
+
   def py_getitem(c, k) when is_tuple(c) and k >= 0, do: elem(c, k)
   def py_getitem(c, k) when is_tuple(c), do: elem(c, tuple_size(c) + k)
   # Maps: return `nil` for missing keys (not `Map.fetch!`/raise). This
@@ -441,6 +470,9 @@ defmodule Pylixir.RuntimeHelpers do
   def py_in(x, c) when is_binary(c), do: String.contains?(c, x)
   def py_in(x, %MapSet{} = c), do: MapSet.member?(c, x)
   def py_in(x, c) when is_map(c), do: Map.has_key?(c, x)
+  # Alist clause MUST precede the `is_tuple` clause so a frozen list
+  # doesn't get matched as a Python tuple.
+  def py_in(x, {:py_alist, t}), do: x in Tuple.to_list(t)
   def py_in(x, c) when is_tuple(c), do: py_in(x, Tuple.to_list(c))
 
   # Iterator handle (positive int returned by `py_iter_make/1`). Check
@@ -455,6 +487,47 @@ defmodule Pylixir.RuntimeHelpers do
   end
 
   def py_in(x, c), do: Enum.member?(c, x)
+
+  # Python's `xs.copy()` / `d.copy()` / `s.copy()` — shallow copy. For
+  # regular Elixir-backed values this is identity: lists, maps, and
+  # MapSets are immutable, and Pylixir's mutation rewrites rebind the
+  # name (`xs = xs ++ [y]`, `d = Map.put(d, ...)`), so the original is
+  # untouched. The `{:py_alist, _}` clause unwraps the frozen tuple to
+  # a fresh regular list — callers want a mutable copy back.
+  def py_copy({:py_alist, t}), do: Tuple.to_list(t)
+  def py_copy(x), do: x
+
+  # === Alist (frozen-list representation) ===
+  # A `{:py_alist, t}` tagged tuple is a Python list whose backing
+  # storage has been frozen to an Elixir tuple — gives O(1) indexed
+  # reads against a value the compile-time safety check (see
+  # `Pylixir.AlistAnalysis`) has proven is never mutated, aliased,
+  # leaked, or referenced from a nested scope. Externally it behaves
+  # like a Python list: `str(x)` renders `[...]`, `for v in x` yields
+  # the elements in order, etc. Internally `x[i]` is `elem(t, i)` and
+  # skips the linked-list walk.
+  #
+  # The tag matters — a bare tuple would collide with Python tuples
+  # (`isinstance(x, list)` would say no, `str(x)` would render as
+  # `(...)`).
+  #
+  # IMPORTANT clause-ordering: every helper that gates on `is_tuple/1`
+  # has a leading `{:py_alist, _}` clause so the tagged tuple isn't
+  # mistaken for a Python tuple. Watch for `is_tuple` in `py_getitem`,
+  # `py_len`, `py_in`, `py_iter_to_list`, `py_slice`, `py_str`,
+  # `py_repr`.
+  def py_alist_new(enum), do: {:py_alist, enum |> Enum.to_list() |> List.to_tuple()}
+
+  # Cross-type structural equality. `{:py_alist, t1} == [1, 2, 3]` is
+  # false under Elixir's `==/2` (one's a tuple-shaped term, the other
+  # a list), but in Python the corresponding values would compare
+  # equal. Normalise both sides via `py_iter_to_list/1` when either
+  # could be alist-shaped. Compare nodes only route through this
+  # helper when at least one operand's static type is `{:py_alist,
+  # _}`; everything else stays on plain `==/2`.
+  def py_eq({:py_alist, _} = a, b), do: py_iter_to_list(a) == py_iter_to_list(b)
+  def py_eq(a, {:py_alist, _} = b), do: py_iter_to_list(a) == py_iter_to_list(b)
+  def py_eq(a, b), do: a == b
 
   # === Type conversion ===
   def py_int(true), do: 1
@@ -499,6 +572,9 @@ defmodule Pylixir.RuntimeHelpers do
   def py_str(nil), do: "None"
   def py_str(x) when is_atom(x), do: Atom.to_string(x)
   def py_str(x) when is_list(x), do: py_repr(x)
+  # Alist renders Python-list-style (`"[1, 2, 3]"`), NOT tuple-style
+  # — leading clause keeps it out of the `is_tuple` clause below.
+  def py_str({:py_alist, _} = a), do: py_repr(a)
   def py_str(x) when is_tuple(x), do: py_repr(x)
   def py_str(%MapSet{} = s), do: py_repr(s)
   def py_str(x) when is_map(x) and not is_struct(x), do: py_repr(x)
@@ -649,6 +725,10 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_repr(x) when is_list(x),
     do: "[" <> Enum.map_join(x, ", ", &py_repr/1) <> "]"
+
+  # Alist renders identically to a regular list — the freeze is an
+  # internal optimisation, not user-visible.
+  def py_repr({:py_alist, t}), do: py_repr(Tuple.to_list(t))
 
   def py_repr(x) when is_tuple(x) do
     items = Tuple.to_list(x)
@@ -1348,6 +1428,10 @@ defmodule Pylixir.RuntimeHelpers do
   # No-op for lists — the common case, called every for-loop iter.
   def py_iter_to_list(l) when is_list(l), do: l
   def py_iter_to_list(s) when is_binary(s), do: String.graphemes(s)
+  # Alist clause MUST precede `is_tuple` so a frozen list iterates as
+  # `[v0, v1, ...]` rather than as a Python tuple's elements (the
+  # outer behaviour is the same shape, but the type-tag would leak).
+  def py_iter_to_list({:py_alist, t}), do: Tuple.to_list(t)
   def py_iter_to_list(t) when is_tuple(t), do: Tuple.to_list(t)
   # Python iterates dicts by KEYS, not entries. `Enum.to_list/1` on a
   # map yields `[{k, v}, ...]` which is `dict.items()` shape — wrong

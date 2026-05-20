@@ -338,4 +338,121 @@ defmodule Pylixir.Nodes.AssignTest do
       assert value == [10, 99, 30]
     end
   end
+
+  # Alist freeze (P5) — `xs = list(<iter>)` followed by read-only uses
+  # gets wrapped in `py_alist_new` so indexed reads downgrade from
+  # O(n) `Enum.at` walks to O(1) `elem/2` lookups. Negative cases
+  # (RHS isn't a `list(...)` call, or `xs` is later mutated) leave
+  # the emitted RHS untouched. See `docs/08_o1-indexed-lists-py-alist.md`.
+  describe "alist freeze emission" do
+    defp list_call_of(arg_id),
+      do: %{
+        "_type" => "Call",
+        "func" => name("list"),
+        "args" => [name(arg_id)],
+        "keywords" => []
+      }
+
+    defp subscript_read(target_id, idx),
+      do: %{"_type" => "Subscript", "value" => name(target_id), "slice" => const(idx)}
+
+    test "freezable name with `xs = list(<iter>)` RHS emits py_alist_new(...)" do
+      ast =
+        module_with([
+          assign([name("src")], %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}),
+          assign([name("xs")], list_call_of("src")),
+          subscript_read("xs", 0)
+        ])
+
+      out = Pylixir.to_source(ast)
+      assert out =~ "py_alist_new("
+    end
+
+    test "non-freezable name (later .append) does NOT wrap RHS in py_alist_new" do
+      ast =
+        module_with([
+          assign([name("src")], %{"_type" => "List", "elts" => [const(1), const(2)]}),
+          assign([name("xs")], list_call_of("src")),
+          %{
+            "_type" => "Expr",
+            "value" => %{
+              "_type" => "Call",
+              "func" => %{"_type" => "Attribute", "value" => name("xs"), "attr" => "append"},
+              "args" => [const(99)],
+              "keywords" => []
+            }
+          }
+        ])
+
+      out = Pylixir.to_source(ast)
+      refute out =~ "py_alist_new("
+    end
+
+    test "list-literal RHS (xs = [1, 2, 3]) is not the freezable shape, no wrap" do
+      ast =
+        module_with([
+          assign(
+            [name("xs")],
+            %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}
+          ),
+          subscript_read("xs", 0)
+        ])
+
+      out = Pylixir.to_source(ast)
+      refute out =~ "py_alist_new("
+    end
+
+    test "PYLIXIR_DISABLE_ALIST=1 suppresses the freeze even when otherwise eligible" do
+      ast =
+        module_with([
+          assign([name("src")], %{"_type" => "List", "elts" => [const(1), const(2)]}),
+          assign([name("xs")], list_call_of("src")),
+          subscript_read("xs", 0)
+        ])
+
+      System.put_env("PYLIXIR_DISABLE_ALIST", "1")
+
+      try do
+        out = Pylixir.to_source(ast)
+        refute out =~ "py_alist_new("
+      after
+        System.delete_env("PYLIXIR_DISABLE_ALIST")
+      end
+    end
+
+    test "end-to-end: frozen list still reads, lens, and iterates correctly" do
+      ast =
+        module_with([
+          assign([name("src")], %{"_type" => "List", "elts" => [const(10), const(20), const(30)]}),
+          assign([name("xs")], list_call_of("src")),
+          # `xs[1] + len(xs) + sum(xs)` — exercises py_getitem, py_len, py_iter_to_list
+          %{
+            "_type" => "BinOp",
+            "op" => op("Add"),
+            "left" => %{
+              "_type" => "BinOp",
+              "op" => op("Add"),
+              "left" => subscript_read("xs", 1),
+              "right" => %{
+                "_type" => "Call",
+                "func" => name("len"),
+                "args" => [name("xs")],
+                "keywords" => []
+              }
+            },
+            "right" => %{
+              "_type" => "Call",
+              "func" => name("sum"),
+              "args" => [name("xs")],
+              "keywords" => []
+            }
+          }
+        ])
+
+      {out, value, _, diagnostics} = TranspileHelpers.transpile_and_run(ast)
+      assert out =~ "py_alist_new("
+      assert value == 20 + 3 + 60
+      assert diagnostics == []
+    end
+  end
 end

@@ -157,6 +157,23 @@ defmodule Pylixir.TypeInferTest do
     test ":any_arity tuple → :any" do
       assert TypeInfer.elem_of({:tuple, :any_arity}) == :any
     end
+
+    test "alist element type passes through" do
+      assert TypeInfer.elem_of({:py_alist, {:int}}) == {:int}
+    end
+  end
+
+  describe "{:py_alist, _} type variant" do
+    test "is_list? returns false so coerce_iter wraps it in py_iter_to_list" do
+      refute TypeInfer.is_list?({:py_alist, {:int}})
+    end
+
+    test "lub of two alists stays an alist with joined element type" do
+      assert TypeInfer.lub({:py_alist, {:int}}, {:py_alist, {:int}}) == {:py_alist, {:int}}
+
+      assert TypeInfer.lub({:py_alist, {:int}}, {:py_alist, {:str}}) ==
+               {:py_alist, {:union, MapSet.new([{:int}, {:str}])}}
+    end
   end
 
   describe "bind_pattern/3" do

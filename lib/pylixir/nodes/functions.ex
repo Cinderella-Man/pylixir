@@ -182,6 +182,7 @@ defmodule Pylixir.Nodes.Functions do
     saved_def_position = context.def_position
     saved_return_mode = context.return_mode
     saved_types = context.types
+    saved_freezable_names = context.freezable_names
 
     new_scope = MapSet.new(param_names)
 
@@ -204,7 +205,8 @@ defmodule Pylixir.Nodes.Functions do
       | scopes: [new_scope | context.scopes],
         def_position: :nested_fn,
         return_mode: return_mode,
-        types: primed_types
+        types: primed_types,
+        freezable_names: Pylixir.AlistAnalysis.freezable_names(body, py_name)
     }
 
     {doc, stripped_body} = extract_docstring(body)
@@ -225,7 +227,8 @@ defmodule Pylixir.Nodes.Functions do
           saved_scopes,
           saved_def_position,
           saved_return_mode,
-          saved_types
+          saved_types,
+          saved_freezable_names
         )
 
       :no ->
@@ -236,7 +239,8 @@ defmodule Pylixir.Nodes.Functions do
           | scopes: saved_scopes,
             def_position: saved_def_position,
             return_mode: saved_return_mode,
-            types: saved_types
+            types: saved_types,
+            freezable_names: saved_freezable_names
         }
 
         body_block =
@@ -323,7 +327,8 @@ defmodule Pylixir.Nodes.Functions do
          saved_scopes,
          saved_def_position,
          saved_return_mode,
-         saved_types
+         saved_types,
+         saved_freezable_names
        ) do
     [param_ast] = param_asts
     [%{"_type" => "Name", "id" => param_name}, _] = test_node["args"]
@@ -342,7 +347,8 @@ defmodule Pylixir.Nodes.Functions do
         | scopes: saved_scopes,
           def_position: saved_def_position,
           return_mode: saved_return_mode,
-          types: saved_types
+          types: saved_types,
+          freezable_names: saved_freezable_names
       }
 
       single_def = {:def, [], [{fn_name_atom, [], param_asts}, [do: body_ast]]}
@@ -369,7 +375,8 @@ defmodule Pylixir.Nodes.Functions do
         | scopes: saved_scopes,
           def_position: saved_def_position,
           return_mode: saved_return_mode,
-          types: saved_types
+          types: saved_types,
+          freezable_names: saved_freezable_names
       }
 
       guard = isinstance_guard(type_ref, param_ast)
