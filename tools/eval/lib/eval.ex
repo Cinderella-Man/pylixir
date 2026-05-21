@@ -26,7 +26,7 @@ defmodule Eval do
   `Eval.Bucket` for the severity ladder and bucket keys.
   """
 
-  alias Eval.{Bucket, Compile, Corpus, Execute, PythonCache}
+  alias Eval.{Bucket, Compile, Corpus, Execute, PythonCache, TraceCache}
 
   @type accumulator :: %{
           counts: %{Bucket.bucket_key() => non_neg_integer()},
@@ -65,6 +65,8 @@ defmodule Eval do
           | {:on_sample, (map() -> any())}
           | {:samples, Enumerable.t()}
           | {:corpus_stats, map()}
+          | {:no_examples, boolean()}
+          | {:max_examples, pos_integer()}
         ]
 
   @default_concurrency_multiplier 2
@@ -111,7 +113,9 @@ defmodule Eval do
 
     attempt_opts = [
       python_timeout_ms: python_timeout,
-      elixir_timeout_ms: elixir_timeout
+      elixir_timeout_ms: elixir_timeout,
+      no_examples: Keyword.get(opts, :no_examples, false),
+      max_examples: Keyword.get(opts, :max_examples, 3)
     ]
 
     initial = %{
@@ -168,9 +172,26 @@ defmodule Eval do
 
   defp run_attempt(source, testcases, opts) do
     elixir_timeout = Keyword.fetch!(opts, :elixir_timeout_ms)
+    python_timeout = Keyword.fetch!(opts, :python_timeout_ms)
+
+    # Pre-warm the python and trace caches in one pass so the library's
+    # transpile call can read trace_events from the cache instead of
+    # re-running the tracer per example (docs/09 step 8.1).
+    no_examples = Keyword.get(opts, :no_examples, false)
+    max_examples = Keyword.get(opts, :max_examples, 3)
+
+    unless no_examples do
+      testcases
+      |> Enum.take(max_examples)
+      |> Enum.each(fn %{stdin: stdin} ->
+        prewarm_caches(source, stdin, python_timeout)
+      end)
+    end
+
+    examples = examples_from_testcases(source, testcases, opts)
 
     try do
-      elixir_source = Pylixir.transpile(source)
+      elixir_source = Pylixir.transpile(source, examples: examples)
 
       result =
         Compile.check_and_execute_testcases(
@@ -193,6 +214,31 @@ defmodule Eval do
   end
 
   # --- Per-testcase classification (4-way truth table) -----------------
+
+  defp examples_from_testcases(source, testcases, opts) do
+    if Keyword.get(opts, :no_examples, false) do
+      []
+    else
+      max = Keyword.get(opts, :max_examples, 3)
+
+      testcases
+      |> Enum.take(max)
+      |> Enum.flat_map(fn %{stdin: stdin, expected: expected} ->
+        sha = PythonCache.key(source, stdin)
+
+        case TraceCache.lookup(sha) do
+          {:hit, envelope} ->
+            [%{stdin: stdin, stdout: expected, trace_events: envelope}]
+
+          :miss ->
+            # Cache miss after the pre-warm pass means the tracer
+            # failed (timeout / crash); drop this example so seed/4
+            # doesn't re-invoke the tracer pointlessly.
+            []
+        end
+      end)
+    end
+  end
 
   defp testcase_outcome(module, %{stdin: stdin, expected: expected}, source, opts) do
     python_timeout = Keyword.fetch!(opts, :python_timeout_ms)
@@ -278,9 +324,79 @@ defmodule Eval do
         entry_to_outcome(entry)
 
       :miss ->
+        # Pre-warm path may have already populated both caches; double
+        # check the python entry before paying for another CPython
+        # invocation.
+        prewarm_caches(source, stdin, timeout_ms)
+
+        case PythonCache.lookup(sha) do
+          {:hit, entry} -> entry_to_outcome(entry)
+          :miss -> entry_to_outcome(%{"outcome" => "nondeterministic"})
+        end
+    end
+  end
+
+  # Populate `Eval.PythonCache` (stdout) and `Eval.TraceCache` (trace
+  # envelope) for one `(source, stdin)` pair. Folds the tracer run and
+  # CPython preflight into a single CPython invocation when the tracer
+  # succeeds; falls back to the two-CPython determinism check when the
+  # tracer crashes / times out.
+  #
+  # Side-car semantics (resolution 5): the `python.jsonl` cache may
+  # already have a hit (legacy stdout-only entry); in that case we
+  # still need to lazily populate `python_traces.jsonl`.
+  defp prewarm_caches(source, stdin, timeout_ms) do
+    sha = PythonCache.key(source, stdin)
+    python_hit? = PythonCache.lookup(sha) != :miss
+    trace_hit? = TraceCache.lookup(sha) != :miss
+
+    cond do
+      python_hit? and trace_hit? ->
+        :ok
+
+      python_hit? ->
+        # Stdout is cached; only the tracer needs to run.
+        case Pylixir.ExampleInference.run_tracer_with_stdout(source, stdin,
+               trace_timeout_ms: timeout_ms
+             ) do
+          {:ok, {_tracer_stdout, envelope}} ->
+            TraceCache.put(sha, envelope)
+
+          {:error, _reason} ->
+            # Cache a "tracer failed" marker so subsequent eval runs
+            # skip the retry. Treated as an empty trace downstream.
+            TraceCache.put(sha, %{"events" => [], "uncaught" => nil, "truncated" => false})
+        end
+
+      true ->
+        run_and_cache_both(source, stdin, timeout_ms, sha)
+    end
+  end
+
+  defp run_and_cache_both(source, stdin, timeout_ms, sha) do
+    case Pylixir.ExampleInference.run_tracer_with_stdout(source, stdin,
+           trace_timeout_ms: timeout_ms
+         ) do
+      {:ok, {tracer_stdout, envelope}} ->
+        # Confirm determinism via a second plain CPython run.
+        case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
+          {:ok, ^tracer_stdout} ->
+            PythonCache.put(sha, %{"outcome" => "ok", "stdout" => tracer_stdout})
+            TraceCache.put(sha, envelope)
+
+          {:ok, _other} ->
+            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
+
+          {:exit, _code, _output} ->
+            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
+
+          :timeout ->
+            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
+        end
+
+      {:error, _reason} ->
         entry = run_python_twice(source, stdin, timeout_ms)
         PythonCache.put(sha, entry)
-        entry_to_outcome(entry)
     end
   end
 

@@ -111,9 +111,9 @@ defmodule Pylixir.ExampleInference.LatticeMap do
   @doc """
   Cross-envelope merge of per-function signatures. Per param slot and
   return slot, lubs observations across examples. Slots whose lub
-  collapses to a `{:union, _}` of concrete types raise
-  `Pylixir.ExampleConflictError`; slots that collapse to `:any` are
-  passed through unchanged.
+  collapses to a `{:union, _}` of concrete types are demoted to `:any`
+  (consistent with the softened conflict policy from `bind/3`); arity
+  disagreements drop the function entirely.
   """
   @spec merge_fn_signatures([map()]) :: %{optional(String.t()) => {[term()], term()}}
   def merge_fn_signatures(envelopes) when is_list(envelopes) do
@@ -123,41 +123,34 @@ defmodule Pylixir.ExampleInference.LatticeMap do
       Enum.reduce(sigs, acc, fn {scope, {params, ret}}, acc2 ->
         {existing_params, existing_ret} = Map.get(acc2, scope, {nil, :bottom})
 
-        new_params =
-          cond do
-            is_nil(existing_params) ->
-              params
+        cond do
+          not is_nil(existing_params) and not is_nil(params) and
+              length(params) != length(existing_params) ->
+            # Arity disagreement — drop the function from the merged
+            # map. Existing inference will still see annotation
+            # /caller-driven sigs.
+            Map.delete(acc2, scope)
 
-            is_nil(params) ->
-              existing_params
+          true ->
+            new_params =
+              cond do
+                is_nil(existing_params) -> params
+                is_nil(params) -> existing_params
+                true ->
+                  Enum.zip(existing_params, params)
+                  |> Enum.map(fn {a, b} -> soften_lub(TypeInfer.lub(a, b)) end)
+              end
 
-            length(params) != length(existing_params) ->
-              # Arity disagreement is itself a conflict; surface it.
-              raise Pylixir.ExampleConflictError,
-                name: "__arity__",
-                scope: scope,
-                observed: [length(params), length(existing_params)]
-
-            true ->
-              Enum.zip(existing_params, params)
-              |> Enum.map(fn {a, b} -> check_lub!(scope, "param", TypeInfer.lub(a, b)) end)
-          end
-
-        new_ret = check_lub!(scope, "return", TypeInfer.lub(existing_ret, ret))
-        Map.put(acc2, scope, {new_params, new_ret})
+            new_ret = soften_lub(TypeInfer.lub(existing_ret, ret))
+            Map.put(acc2, scope, {new_params, new_ret})
+        end
       end)
     end)
     |> finalize_signatures()
   end
 
-  defp check_lub!(scope, slot, {:union, set}) do
-    raise Pylixir.ExampleConflictError,
-      name: slot,
-      scope: scope,
-      observed: MapSet.to_list(set)
-  end
-
-  defp check_lub!(_scope, _slot, t), do: t
+  defp soften_lub({:union, _}), do: :any
+  defp soften_lub(t), do: t
 
   defp finalize_signatures(sigs) do
     Map.new(sigs, fn {scope, {params, ret}} ->
@@ -196,7 +189,7 @@ defmodule Pylixir.ExampleInference.LatticeMap do
     end)
   end
 
-  defp stable_type(name, scope, obs_list) do
+  defp stable_type(_name, _scope, obs_list) do
     has_none? = Enum.any?(obs_list, &(&1 == {:none}))
 
     concretes =
@@ -211,11 +204,13 @@ defmodule Pylixir.ExampleInference.LatticeMap do
         lub = Enum.reduce(concretes, :bottom, &TypeInfer.lub/2)
 
         case lub do
+          # Concrete-vs-concrete disagreement softens to :unstable
+          # (the name is excluded) rather than raising. The harness
+          # routinely supplies testcases whose runtime types diverge
+          # across stdins; a hard raise would convert otherwise-fine
+          # samples into example_conflict failures.
           {:union, _} ->
-            raise Pylixir.ExampleConflictError,
-              name: name,
-              scope: scope,
-              observed: Enum.uniq(concretes)
+            :unstable
 
           :any ->
             :unstable

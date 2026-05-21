@@ -127,7 +127,13 @@ class TraceState:
         if self.module_frame is None or frame is self.module_frame:
             return "module"
         if frame.f_back is self.module_frame:
-            return frame.f_code.co_name
+            name = frame.f_code.co_name
+            # Q6 (A): comprehensions, lambdas, genexprs out of scope.
+            # CPython names them "<listcomp>", "<setcomp>", "<dictcomp>",
+            # "<genexpr>", "<lambda>" — all start with "<".
+            if name.startswith("<"):
+                return None
+            return name
         return None
 
     def record(self, event: dict) -> None:

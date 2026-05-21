@@ -96,6 +96,7 @@ defmodule Pylixir.Context do
           pvec_names: %{optional(String.t()) => map()},
           assume_types: %{optional(:module | String.t()) => %{optional(String.t()) => term()}},
           assume_types_scope: :module | String.t() | nil,
+          assume_types_partial?: boolean(),
           assume_fn_signatures: %{optional(String.t()) => {[term()], term()}},
           boundary_sites: %{optional(non_neg_integer()) => {String.t(), term()}}
         }
@@ -129,6 +130,7 @@ defmodule Pylixir.Context do
             pvec_names: %{},
             assume_types: %{},
             assume_types_scope: :module,
+            assume_types_partial?: false,
             assume_fn_signatures: %{},
             boundary_sites: %{}
 

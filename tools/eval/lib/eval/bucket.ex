@@ -87,6 +87,7 @@ defmodule Eval.Bucket do
           | :parse_error
           | {:compile_error, String.t()}
           | {:internal, atom()}
+          | {:example_conflict, String.t()}
 
   @spec classify(sample(), outcome()) :: {bucket_key(), metadata()}
 
@@ -154,6 +155,11 @@ defmodule Eval.Bucket do
     {:parse_error, %{message: e.message, lineno: e.lineno, col_offset: e.col_offset}}
   end
 
+  def classify(_sample, {:transpile_raised, %Pylixir.ExampleConflictError{} = e}) do
+    reason = "#{e.name}_#{inspect(e.scope)}"
+    {{:example_conflict, reason}, %{name: e.name, scope: e.scope, observed: e.observed}}
+  end
+
   def classify(_sample, {:transpile_raised, exception}) do
     {{:internal, exception.__struct__}, %{message: Exception.message(exception)}}
   end
@@ -192,6 +198,8 @@ defmodule Eval.Bucket do
 
   def slug(:python_timeout), do: "python_timeout"
   def slug(:nondeterministic_observed), do: "nondeterministic_observed"
+
+  def slug({:example_conflict, reason}), do: "example_conflict--" <> sanitize(reason)
 
   # --- Worst-of rollup -------------------------------------------------
 

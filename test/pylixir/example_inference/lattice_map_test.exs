@@ -2,7 +2,6 @@ defmodule Pylixir.ExampleInference.LatticeMapTest do
   use ExUnit.Case, async: true
 
   alias Pylixir.ExampleInference.LatticeMap
-  alias Pylixir.ExampleConflictError
 
   defp module_env(locals) do
     %{
@@ -108,12 +107,11 @@ defmodule Pylixir.ExampleInference.LatticeMapTest do
       assert LatticeMap.merge_examples(envs) == %{module: %{"n" => {:int}}}
     end
 
-    test "non-None obs disagreeing concretely → raises ExampleConflictError" do
+    test "non-None obs disagreeing concretely → name excluded (softened)" do
       envs = [module_env(%{"x" => "int"}), module_env(%{"x" => "str"})]
-
-      assert_raise ExampleConflictError, ~r/example_conflict/, fn ->
-        LatticeMap.merge_examples(envs)
-      end
+      # Softened behavior: instead of raising, the conflicting name is
+      # dropped. Other names (none in this case) still merge.
+      assert LatticeMap.merge_examples(envs) == %{}
     end
 
     test "concrete + None → stable as union with :none" do

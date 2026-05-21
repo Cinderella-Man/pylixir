@@ -36,13 +36,17 @@ defmodule Pylixir.ExampleInference.BoundaryGuard do
   defp guard_clauses({:list, elem_type}, name) do
     case scalar_guard(elem_type) do
       {:ok, guard_fn} ->
+        # Elixir list-pattern AST for `[h | _]` is a one-element list
+        # containing a `:|` cons cell.
+        head_tail_pattern = [{:|, [], [{:h, [], nil}, {:_, [], nil}]}]
+
         clauses = [
           {:->, [],
            [
              [
                {:when, [],
                 [
-                  {:=, [], [{:|, [], [{:h, [], nil}, {:_, [], nil}]}, {:v, [], nil}]},
+                  {:=, [], [head_tail_pattern, {:v, [], nil}]},
                   {guard_fn, [], [{:h, [], nil}]}
                 ]}
              ],

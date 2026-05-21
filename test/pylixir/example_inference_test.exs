@@ -41,6 +41,49 @@ defmodule Pylixir.ExampleInferenceTest do
       result = ExampleInference.seed([], [%{stdin: "5\n"}], ctx, source: nil)
       assert result.assume_types == %{}
     end
+
+    test "envelope with uncaught → ctx.assume_types_partial? = true" do
+      ctx = Context.new()
+
+      env =
+        %{module_env(%{"n" => "int"}) | "uncaught" => %{"type" => "ValueError", "lineno" => 2}}
+
+      result =
+        ExampleInference.seed(
+          [],
+          [%{stdin: "x\n", stdout: "", trace_events: env}],
+          ctx,
+          source: nil
+        )
+
+      assert result.assume_types_partial? == true
+    end
+
+    test "all-successful envelopes → assume_types_partial? = false" do
+      ctx = Context.new()
+      env = module_env(%{"n" => "int"})
+
+      result =
+        ExampleInference.seed([], [%{stdin: "5\n", stdout: "", trace_events: env}], ctx,
+          source: nil
+        )
+
+      assert result.assume_types_partial? == false
+    end
+  end
+
+  describe "run_tracer/3 failure modes" do
+    test "tracer crash on syntax error returns {:error, _}" do
+      assert {:error, _} = ExampleInference.run_tracer("def )\n", "")
+    end
+
+    test "tracer timeout returns {:error, :timeout}" do
+      # 1ms timeout will trigger before even Python boots.
+      assert {:error, :timeout} =
+               ExampleInference.run_tracer("import time\ntime.sleep(5)\n", "",
+                 trace_timeout_ms: 1
+               )
+    end
   end
 
   describe "TypeInfer.bind/3 with assume_types (softened A′)" do

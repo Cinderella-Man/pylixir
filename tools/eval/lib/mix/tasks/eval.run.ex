@@ -74,6 +74,8 @@ defmodule Mix.Tasks.Eval.Run do
     elixir_timeout: :integer,
     no_python_cache: :boolean,
     rebuild_python_cache: :boolean,
+    no_examples: :boolean,
+    max_examples: :integer,
     out: :string
   ]
 
@@ -113,6 +115,11 @@ defmodule Mix.Tasks.Eval.Run do
       rebuild: opts[:rebuild_python_cache] || false
     )
 
+    Eval.TraceCache.ensure_started(
+      path: default_trace_cache_path(),
+      no_cache: opts[:no_python_cache] || false
+    )
+
     eval_opts = [
       limit: opts[:limit],
       skip: opts[:skip],
@@ -121,7 +128,9 @@ defmodule Mix.Tasks.Eval.Run do
       save_ok: opts[:save_ok],
       testcase_shards: opts[:testcase_shards] || @default_testcase_shards,
       python_timeout_ms: opts[:python_timeout] || @default_python_timeout_ms,
-      elixir_timeout_ms: opts[:elixir_timeout] || @default_elixir_timeout_ms
+      elixir_timeout_ms: opts[:elixir_timeout] || @default_elixir_timeout_ms,
+      no_examples: opts[:no_examples] || false,
+      max_examples: opts[:max_examples] || 3
     ]
 
     progress = start_progress(opts[:limit])
@@ -139,6 +148,9 @@ defmodule Mix.Tasks.Eval.Run do
 
   defp default_python_cache_path,
     do: Path.join([File.cwd!(), "cache", "python.jsonl"])
+
+  defp default_trace_cache_path,
+    do: Path.join([File.cwd!(), "cache", "python_traces.jsonl"])
 
   defp start_progress(limit) do
     ref = :counters.new(1, [:atomics])

@@ -24,7 +24,7 @@ The eval harness already has per-sample `%{stdin, expected}` testcase data but d
 | Q4 | Boundary-site detection | **(C)** tree-walk: any RHS expression containing `input()` / `sys.stdin.*` / `sys.argv` marks the LHS Name as a boundary site; type comes from the trace's observation at that lineno |
 | Q5 | Trace-stable filter | **(B)** None-aware uniformity: a name is stable iff all non-None observations across all examples agree on a single type `T`. Store as `{:union, [{:none}, T]}` if any None observed, else `T`. Sentinels (`0`, `""`, `[]`) are NOT treated as neutral — only `None` is. |
 | Q6 | Scope coverage | **(A)** top-level user `def`s + module-level only. Demoted nested defs, lambdas, comprehensions, methods → trace data dropped silently; existing inference handles. |
-| Q7 | Conflict eagerness | **(A — softened at conversion-time)** Cross-example seed-time conflicts raise during `ExampleInference.seed`; mid-conversion `bind/3` conflicts **demote the name** from `assume_types` rather than raise. Seed-time raise still produces `example_conflict--<reason>` harness bucket. |
+| Q7 | Conflict eagerness | **(softened in full)** Both seed-time cross-example conflicts AND mid-conversion `bind/3` conflicts **drop the name** from `assume_types`/`assume_fn_signatures` rather than raise. Eval-driven examples come from real testcases (not user-curated), so concrete-vs-concrete divergence is normal data and shouldn't fail-loud. The `example_conflict--*` bucket and `ExampleConflictError` exist for future tooling but are not raised by the live merge path. |
 | Q8 | Harness integration | **(A2)** examples always on; `Eval.PythonCache` extended to store `%{stdout, trace_events}` per `(source, stdin)`. Tracer + preflight collapse into one CPython run per `(source, stdin)`. `--no-examples` opt-out. |
 | Q9 | Validation semantics | **(B)** internal `transpile/2`, run every example via `runner`, collect ALL mismatches; return `{:error, [%{idx, expected, actual}, ...]}` or `:ok` |
 
@@ -122,19 +122,30 @@ Calls `Pylixir.transpile(source, examples: examples)` internally. Iterates ALL e
 
 `Eval.PythonCache` today stores per `sha256(source <> "\0" <> stdin)` in `tools/eval/cache/python.jsonl`: `%{"outcome" => "ok", "stdout" => "..."}`. **Schema unchanged.**
 
-A new **side-car cache** `tools/eval/cache/python_traces.jsonl` is introduced, keyed by the same sha256, storing:
+A side-car cache `tools/eval/cache/python_traces.jsonl` (module `Eval.TraceCache`) is introduced, keyed by the same sha256, storing one envelope per entry:
 
 ```elixir
 %{
-  "trace_events" => [%{event, scope, lineno, locals}, ...],
-  "truncated" => boolean(),
-  "uncaught" => nil | %{type, lineno}
+  "sha256" => "...",
+  "envelope" => %{
+    "events" => [%{event, scope, lineno, locals}, ...],
+    "truncated" => boolean(),
+    "uncaught" => nil | %{type, lineno}
+  },
+  "python_version" => "...",
+  "created_at" => "..."
 }
 ```
 
-Lookup merges both files: stdout from `python.jsonl`, trace data from `python_traces.jsonl`. Cache hits in `python.jsonl` are NOT invalidated — existing entries serve as before. Trace data is filled in lazily on cache miss.
+Lookup merges both files: stdout from `python.jsonl`, trace data from `python_traces.jsonl`. Cache hits in `python.jsonl` are NOT invalidated — existing entries serve as before. Trace data is filled in lazily.
 
-`Eval.run_python_twice` is updated to: **one tracer run** (`trace.py`, captures stdout + trace_events) + **one plain CPython run** (stdout only). Nondeterminism check is preserved on stdout equality only — trace_events are downstream type info, not a determinism signal. Halves tracer overhead per cache miss vs. running the tracer twice.
+`Eval.run_attempt/3` calls `prewarm_caches/3` once per testcase up to `max_examples` before invoking `Pylixir.transpile/2`. The prewarm:
+
+* If both caches hit → no-op.
+* If `python.jsonl` hits but `python_traces.jsonl` doesn't → tracer-only run; cache trace (or a `%{"events" => []}` failure marker so subsequent eval runs skip the retry).
+* If both miss → **one tracer run** captures stdout + trace_events, then **one plain CPython run** confirms determinism. Nondeterminism check stays on stdout equality only.
+
+The library's `Pylixir.ExampleInference.seed/4` reads `:trace_events` from each example's map (populated by `examples_from_testcases/2`), avoiding any extra tracer invocations inside `transpile/2`.
 
 `Eval.attempt/2` (line 162) is modified: `Pylixir.transpile(source)` becomes `Pylixir.transpile(source, examples: examples_from_testcases(record))`, where `examples_from_testcases` shapes the per-sample testcases into `%{stdin, stdout}` (renaming the field) and lazily fetches `trace_events` from `PythonCache` per testcase. The library's `ExampleInference.seed/4` accepts pre-computed trace events as an opt to avoid re-running the tracer when the harness already has them.
 
@@ -147,7 +158,7 @@ Lookup merges both files: stdout from `python.jsonl`, trace data from `python_tr
 | Tracer JSON has `uncaught` | Use partial trace, mark `ctx.assume_types[:partial?] = true` |
 | Tracer wall-clock > timeout (`:trace_timeout_ms`, default 2000) | Kill, drop that example, merge remaining |
 | Tracer hits size cap | Use truncated trace, log warning |
-| Cross-example concrete disagreement | Raise `Pylixir.ExampleConflictError` during seed (Q7 A) |
+| Cross-example concrete disagreement | Drop the disagreeing name from `assume_types` (or fn-sig slot); fall through to existing inference. No raise. |
 | Mid-conversion concrete disagreement (source path examples didn't reach) | `bind/3` **demotes** the name from `assume_types`; downstream binds fall through to existing inference. No raise. |
 | Unrepresentable Python type (generator, file handle, bytes, range, custom class) | Map to `:any`; name fails (A′) filter; no raise |
 | Boundary guard fires at runtime | Raise `BoundaryViolationError` with name, expected type, observed value |

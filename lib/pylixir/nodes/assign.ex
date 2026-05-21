@@ -1066,9 +1066,21 @@ defmodule Pylixir.Nodes.Assign do
 
   defp maybe_wrap_boundary(value_ast, name, node, context) do
     lineno = Map.get(node, "lineno")
+    scope = context.assume_types_scope
+
+    in_assume? =
+      case scope do
+        nil -> false
+        key -> Map.has_key?(Map.get(context.assume_types, key, %{}), name)
+      end
 
     case Map.get(context.boundary_sites, lineno) do
-      {^name, type} ->
+      {^name, type} when in_assume? ->
+        # `bind/3` softened path: if the syntactic bind conflicted with
+        # the trace, `name` is no longer in `assume_types`. In that
+        # case, skip the guard — the runtime would always fail the
+        # check because the emitted RHS has a different shape (e.g.
+        # py_alist_new wrapper) than the trace's plain list.
         case BoundaryGuard.wrap(value_ast, name, type) do
           {:ok, wrapped} -> wrapped
           :skip -> value_ast

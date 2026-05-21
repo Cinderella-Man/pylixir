@@ -37,6 +37,11 @@ Python source  ──┐
                     module_doc}
                  │  Pylixir.Context.new(known_functions)
                  ▼
+        Pylixir.ExampleInference.seed(body, examples, ctx, …)   (no-op when
+                 │                                                examples == [])
+                 │  shells out to priv/python/trace.py per example, writes
+                 │  ctx.assume_types / ctx.assume_fn_signatures / ctx.boundary_sites
+                 ▼
         Pylixir.Converter.convert(module_ast, ctx, analysis)
                  │  recursive walk; per-node dispatch
                  ▼
@@ -48,7 +53,8 @@ Python source  ──┐
 
 `Pylixir.transpile/1` runs the full chain. `Pylixir.to_source/1` skips the
 shell-out and starts from an AST map (this is the seam most tests use —
-no python3.14 required).
+no python3.14 required). Both have arity-2 variants accepting an `:examples`
+option (see *Example-driven type inference* below).
 
 ---
 
@@ -179,6 +185,11 @@ lib/pylixir/
 │   ├── builtin_signatures.ex # return-type tables for Python builtins/methods + HOF arg recovery
 │   ├── signatures.ex         # bounded fixed-point pass producing Context.fn_signatures
 │   └── isinstance_narrowing.ex # `if isinstance(x, T):` → narrowed ctx.types[x]
+├── example_inference.ex      # entry point: seed/4 (writes ctx.assume_types, …, boundary_sites)
+├── example_inference/
+│   ├── lattice_map.ex        # trace JSON → TypeInfer.t(), cross-example merge + filter
+│   ├── boundary_analysis.ex  # AST walk to find input()/sys.stdin/sys.argv boundary sites
+│   └── boundary_guard.ex     # AST emission for runtime boundary checks
 ├── ast/
 │   ├── walk.ex               # scope-aware pre-order traversal
 │   ├── trivial.ex            # "safe to duplicate?" predicate
@@ -190,7 +201,12 @@ lib/pylixir/
 │   └── regex.ex              # py_re_findall/search/match/sub/split
 ├── helpers_codegen.ex        # reads all helpers files at compile time + slices
 ├── formatter.ex              # final Macro.to_string → format step
-└── errors.ex                 # UnsupportedNodeError, PythonParseError
+└── errors.ex                 # UnsupportedNodeError, PythonParseError,
+                              #   ExampleConflictError, BoundaryViolationError
+
+priv/python/
+├── serialize.py              # parse Python source → JSON AST envelope
+└── trace.py                  # exec under sys.settrace → trace events JSON envelope
 ```
 
 Mental model: **node modules and stdlib modules are leaves; Converter
@@ -467,6 +483,243 @@ for the follow-on slimming work.
 
 ---
 
+## Example-driven type inference (`Pylixir.ExampleInference`)
+
+Static inference is bounded by what syntax reveals. Anything that flows
+through `input()` / `sys.stdin.*` / `sys.argv` is opaque, so the output
+keeps a polymorphic helper (`py_add(n, 1)` instead of `n + 1`).
+`Pylixir.transpile/2`'s `:examples` opt closes that gap by **running the
+Python program once per supplied example, observing the actual runtime
+types**, and feeding that data back into the inference pass.
+
+Design notes are in [docs/09](docs/09_example-driven-type-inference.md).
+Short version:
+
+```
+examples: [%{stdin, stdout}]
+        │  Eval harness (or library caller) supplies the list
+        ▼
+priv/python/trace.py             ── per (source, stdin), shell out
+        │  exec under sys.settrace, JSON envelope to a file
+        ▼
+%{"events" => [ {event, scope, lineno, locals, [params]} … ],
+  "uncaught" => nil | {…}, "truncated" => bool}
+        │  LatticeMap.merge_examples/1
+        │  + LatticeMap.merge_fn_signatures/1
+        ▼
+ctx.assume_types          (per-scope per-name TypeInfer.t())
+ctx.assume_fn_signatures  (per-fn {[param_types], return_type})
+ctx.boundary_sites        (per-lineno {name, observed_type})
+        │  consumed by Converter / TypeInfer during conversion
+        ▼
+Specialised Elixir output
+```
+
+### `priv/python/trace.py`
+
+Standalone Python script invoked as `trace.py SOURCE STDIN_PATH OUT_PATH`.
+Wires the stdin file to `sys.stdin`, installs a `sys.settrace`
+callback, then `exec`s the user source. The trace callback records a
+JSON event per `call` / `line` / `return` (plus a synthetic
+`module_end` event with final module-level locals so the consumer always
+has an end-of-program snapshot).
+
+Scope filtering (Q6 in [docs/09](docs/09_example-driven-type-inference.md)):
+
+- The first `call` event captures the **module frame**; everything in
+  it is `scope: "module"`.
+- A `call` whose `frame.f_back is module_frame` is a **top-level user
+  def**; `scope` is the function name.
+- Anything else (nested defs, lambdas, comprehensions —
+  CPython names these `<listcomp>` / `<genexpr>` / `<lambda>` — methods
+  inside class defs, stdlib helper frames) returns `None` from the
+  scope check, which disables tracing for that frame and its children.
+
+`type_repr` mapping: scalars as short tags (`"int"`, `"str"`, …);
+lists / tuples / dicts as `{"kind": …, "elems"|"items": […]}` sampling
+up to 8 elements at depth ≤ 3; sets opaque; everything unrepresentable
+(generators, file handles, custom classes, …) collapses to `"any"`.
+
+Failure modes are non-fatal:
+
+- Uncaught exception in the user program → catch, populate
+  `"uncaught"`, exit 0 with the events accumulated so far. Partial
+  trace is still usable.
+- Envelope size exceeds ~1MB → drop further events, set
+  `"truncated": true`.
+- Wall-clock exceeds `:trace_timeout_ms` (default 2000ms) → the
+  invoking `Task.shutdown(:brutal_kill)` aborts; caller returns
+  `{:error, :timeout}` and skips that example.
+
+### `Pylixir.ExampleInference.seed/4`
+
+The orchestration entry point, called from `Pylixir.to_source/2` between
+`Context.new(…)` and `Converter.convert(…)`:
+
+```
+seed(body, examples, ctx, source: src) :: Context.t()
+```
+
+For each example:
+
+1. If the example map already carries `:trace_events` (eval harness
+   pre-warmed the cache — see below), use it directly.
+2. Otherwise shell out to `trace.py` via `run_tracer/3` and decode the
+   envelope. Tracer failures surface as `Logger.warning` and the
+   example is dropped from the merge.
+
+The retained envelopes flow through three orthogonal channels:
+
+- `LatticeMap.merge_examples/1` → `ctx.assume_types`
+- `LatticeMap.merge_fn_signatures/1` → `ctx.assume_fn_signatures`
+- `BoundaryAnalysis.analyze/1` + a per-scope lookup → `ctx.boundary_sites`
+
+### `Pylixir.ExampleInference.LatticeMap`
+
+Pure module. Maps each tracer `type_repr` value to a
+`Pylixir.TypeInfer.t()` lattice entry (scalars by tag, container kinds
+mapped to `{:list, …}` / `{:tuple, …}` / `{:dict, …, …}` / `{:set}`,
+unknown → `:any`).
+
+Cross-example merge applies the **None-aware uniformity filter**
+(Q5 B): for each `(scope, name)`, lub the non-None / non-`:any`
+observations.
+
+- All observations agree on a single concrete type `T` → keep
+  `assume_types[scope][name] = T` (or `{:union, [{:none}, T]}` if any
+  observation was `{:none}`).
+- The lub collapses to a `{:union, …}` of pure concrete types
+  (e.g. `{:int}` vs `{:str}` — concrete-vs-concrete disagreement) →
+  **drop the name silently**. The harness uses real testcases as
+  examples, where this divergence is normal data rather than user
+  error; failing the whole transpile would convert good samples into
+  bad-bucket regressions.
+- All observations were `:none` / `:any` → name excluded.
+
+`merge_fn_signatures/1` is the parallel pipeline for `call` and
+`return` events. Per `(scope, slot)`, lubs across examples; a union
+softens to `:any`; arity disagreement drops the function entirely.
+
+`Pylixir.ExampleConflictError` and `Pylixir.BoundaryViolationError`
+are declared in `errors.ex` for future tooling (the eval harness still
+has an `example_conflict--*` bucket) but the live merge path never
+raises — both kinds of disagreement soften as described above.
+
+### The three trace-data channels in `Context`
+
+| Field | Shape | Consumed by |
+|---|---|---|
+| `:assume_types` | `%{scope_key => %{name => type}}` | `TypeInfer.bind/3` (override syntactic with trace), `TypeInfer.demote/2` (skip for trace-stable names) |
+| `:assume_types_scope` | `:module \| String.t() \| nil` | Tells `bind/3` which scope key to look up. `nil` while emitting a non-top-level scope (nested def / lambda / comp / class) so the lookup misses. |
+| `:assume_types_partial?` | `boolean()` | Diagnostic marker — set when any envelope had `"uncaught"` populated. |
+| `:assume_fn_signatures` | `%{fn_name => {[param_types], return_type}}` | Merged into `Signatures.collect_annotated_sigs/2`; example-derived sigs fill any slot the syntactic annotation left as `:any` and survive `compute_round`'s `Map.put` overwrite by entering through the annotation channel. |
+| `:boundary_sites` | `%{lineno => {name, observed_type}}` | `Pylixir.Nodes.Assign.maybe_wrap_boundary/4` wraps the RHS in a runtime guard at lowering time. |
+
+### `bind/3` softened consultation
+
+```elixir
+def bind(ctx, name, syntactic_type) do
+  case lookup_assume(ctx, name) do
+    :none -> # normal bind, ctx.types[name] = syntactic_type
+    {:ok, trace_type} ->
+      cond do
+        weak_syntactic?(syntactic_type) -> # use trace_type (trace wins for :any / :bottom / etc.)
+        syntactic_type == trace_type    -> # agree, use trace_type
+        true ->
+          # Concrete-vs-concrete conflict at conversion time:
+          # drop name from assume_types AND bind syntactic_type.
+          # Existing inference takes over for downstream binds.
+      end
+  end
+end
+```
+
+`weak_syntactic?/1` accepts `:any`, `:bottom`, `{:list, :any}`,
+`{:dict, :any, :any}`, `{:tuple, :any_arity}`. The softening is
+load-bearing: it lets samples whose branches the example didn't
+exercise still transpile cleanly. Without it, any source-path the
+trace didn't reach would raise mid-conversion and convert an
+ok-transpile into a bucketed failure.
+
+`TypeInfer.demote/2` symmetrically becomes a no-op when the name is in
+`assume_types` — the trace already observed the *final* container
+element type after all mutations, so the post-`xs.append(…)` demotion
+to `{:list, :any}` would throw that information away.
+
+### `BoundaryAnalysis` + `BoundaryGuard`
+
+`BoundaryAnalysis.analyze/1` tree-walks the module body (own recursive
+descent — does **not** use `AST.Walk.walk_scope/3` because it needs to
+look inside comprehensions for `input()` references) and returns
+`%{lineno => name}` for every top-level `Assign` whose RHS reaches
+`input(...)`, `sys.stdin.*`, or `sys.argv`. Tuple destructure LHS is
+deliberately skipped — the type benefit lands via `bind_pattern/3`
+recursing to Name leaves, no single LHS expression to wrap.
+
+`ExampleInference.seed/4` cross-references the analysis output with
+`assume_types[:module]` to produce `ctx.boundary_sites`.
+
+`BoundaryGuard.wrap/3` emits a `case` expression that pattern-matches
+on the wrapped value:
+
+```elixir
+n = case py_int(py_input("")) do
+  v when is_integer(v) -> v
+  other -> raise Pylixir.BoundaryViolationError,
+    name: "n", expected: :int, observed: other
+end
+```
+
+For `{:list, T}` it uses a head-check (`[h | _] = v when is_T?(h)`)
+with an empty-list fallthrough. Other container shapes
+(`{:dict, _, _}`, `{:tuple, _}`, `{:set}`) currently fall through to
+unguarded emission — the `assume_types` channel still propagates the
+type, just no runtime check. Unions / `:any` / `{:none}` skip too.
+
+`Pylixir.Nodes.Assign.maybe_wrap_boundary/4` is the consumer. It
+intentionally checks whether the name is *still* in `assume_types`
+after `TypeInfer.bind/3` runs — when bind softened the name out (due
+to a conflict between the trace type and the syntactic type, e.g. the
+alist optimisation wrapping a list as `{:py_alist, _}`), the guard is
+skipped too. Otherwise we'd emit a runtime check that would always
+fire because the RHS no longer has the trace's expected shape.
+
+### Eval harness integration (`tools/eval`)
+
+The eval harness (`tools/eval`, a separate Mix app) wires examples in
+automatically — every sample's testcases become the example list for
+that sample's transpile, capped at `--max-examples N` (default 3).
+`--no-examples` opts out.
+
+To avoid running the tracer per example per eval run, the harness
+maintains a **side-car cache** of trace envelopes:
+
+- `tools/eval/cache/python.jsonl` (existing) — stdout cache keyed by
+  `sha256(source <> "\0" <> stdin)`.
+- `tools/eval/cache/python_traces.jsonl` (new) — trace-envelope cache
+  keyed by the **same** sha256. Lives in `Eval.TraceCache`, an ETS+
+  JSONL twin of `Eval.PythonCache`.
+
+`Eval.attempt/2` pre-warms both caches for the first
+`max_examples` testcases of each sample, then calls
+`Pylixir.transpile/2` with `examples` whose maps already carry
+`:trace_events`. Pre-warm folds the tracer run and the CPython
+determinism check into one CPython invocation when the tracer
+succeeds: tracer captures stdout + trace_events, a follow-up plain
+CPython run confirms determinism on stdout equality only. Tracer
+failures (timeout, crash, JSON decode failure) cache an empty
+envelope marker so subsequent eval runs skip the retry rather than
+re-paying the failed-tracer cost.
+
+`Pylixir.validate_transpile/3` is a library helper that transpiles
+with examples then iterates them through a caller-supplied runner,
+collecting every stdout mismatch. The runner contract
+(`(elixir_source, stdin) -> {:ok, stdout} | {:error, term}`) keeps the
+library pure — sandboxing and `Code.eval_string` are the caller's
+problem.
+
+---
+
 ## Control flow via throw/catch (`Pylixir.ControlFlow`)
 
 Four Python early-exit constructs lower to Erlang throws caught by an
@@ -574,6 +827,8 @@ unused public ones don't.
 | Add a new **topic submodule** of helpers | New file under `lib/pylixir/runtime_helpers/`; add path to `@helper_files` in `HelpersCodegen` |
 | New **AST node type** Pylixir doesn't yet translate | New `Pylixir.Nodes.<X>` module + a `convert/2` clause delegating to it |
 | New **control-flow construct** that needs throw/catch | Add `throw_<x>/1` + `catch_<x>/2` in `Pylixir.ControlFlow`; everyone emits/catches through the constructors |
+| Support a new **container kind in the tracer** (e.g. specialise Counter / defaultdict) | Add a clause in `priv/python/trace.py`'s `type_repr/2` to emit a structured `type_repr` for the new shape; add a matching `repr_to_type/1` clause in `Pylixir.ExampleInference.LatticeMap` |
+| Add a new **boundary-guard shape** (dict/tuple/set runtime check) | New clause in `Pylixir.ExampleInference.BoundaryGuard.guard_clauses/2` returning `{:ok, clauses}`; the existing `:skip` fallthrough already handles unsupported types gracefully |
 
 Each path is one-file plus one entry in a registry/dispatch map. No
 edits across the whole codebase.
@@ -682,6 +937,13 @@ If you've never touched this codebase before:
 8. **Pick a node module that interests you** — `loop.ex` for tricky
    lowerings, `functions.ex` for the return-wrap heuristic, `if_stmt.ex`
    for state-tuple threading, `assign.ex` for the destructure zoo.
+9. **For example-driven inference**: `priv/python/trace.py` first (the
+   IO contract); then `lib/pylixir/example_inference.ex` (orchestration);
+   then `lattice_map.ex` (where trace events become lattice types);
+   finally `boundary_analysis.ex` + `boundary_guard.ex` for the
+   runtime-guard side. The integration sites — `bind/3` and `demote/2`
+   in `type_infer.ex`, `collect_annotated_sigs/2` in `signatures.ex`,
+   `maybe_wrap_boundary/4` in `nodes/assign.ex` — are each ~20 lines.
 
 A new Python construct, from scratch: write a fixture under
 `test/fixtures/python/` first (just CPython behaviour), let the

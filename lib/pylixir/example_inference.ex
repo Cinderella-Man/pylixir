@@ -10,7 +10,10 @@ defmodule Pylixir.ExampleInference do
 
   alias Pylixir.{Context, ExampleInference.BoundaryAnalysis, ExampleInference.LatticeMap}
 
+  require Logger
+
   @default_python "python3.14"
+  @default_trace_timeout_ms 2_000
 
   @doc """
   Populate example-derived fields of `ctx` from `examples`.
@@ -42,15 +45,20 @@ defmodule Pylixir.ExampleInference do
         assume_types = LatticeMap.merge_examples(envelopes)
         assume_fn_signatures = LatticeMap.merge_fn_signatures(envelopes)
         boundary_sites = build_boundary_sites(body, assume_types)
+        partial? = Enum.any?(envelopes, &has_uncaught?/1)
 
         %{
           ctx
           | assume_types: assume_types,
             assume_fn_signatures: assume_fn_signatures,
+            assume_types_partial?: partial?,
             boundary_sites: boundary_sites
         }
     end
   end
+
+  defp has_uncaught?(%{"uncaught" => x}) when not is_nil(x), do: true
+  defp has_uncaught?(_), do: false
 
   defp build_boundary_sites(body, assume_types) do
     candidates = BoundaryAnalysis.analyze(body)
@@ -68,12 +76,37 @@ defmodule Pylixir.ExampleInference do
 
   defp envelope_for(%{stdin: stdin}, source) when is_binary(source) and is_binary(stdin) do
     case run_tracer(source, stdin) do
-      {:ok, env} -> env
-      {:error, _reason} -> nil
+      {:ok, env} ->
+        if Map.get(env, "truncated") == true do
+          Logger.warning("pylixir tracer hit size cap; using truncated trace")
+        end
+
+        env
+
+      {:error, :timeout} ->
+        Logger.warning("pylixir tracer timeout (>#{@default_trace_timeout_ms}ms); skipping example")
+        nil
+
+      {:error, {:tracer_exit, code, output}} ->
+        Logger.warning(
+          "pylixir tracer exited #{code}; skipping example. stderr_tail=#{inspect(tail(output))}"
+        )
+
+        nil
+
+      {:error, reason} ->
+        Logger.warning("pylixir tracer error #{inspect(reason)}; skipping example")
+        nil
     end
   end
 
   defp envelope_for(_other, _source), do: nil
+
+  defp tail(s) when is_binary(s) do
+    if byte_size(s) > 512, do: binary_part(s, byte_size(s) - 512, 512), else: s
+  end
+
+  defp tail(s), do: inspect(s)
 
   @doc """
   Invoke `priv/python/trace.py` with the given Python source and stdin,
@@ -83,27 +116,72 @@ defmodule Pylixir.ExampleInference do
   `trace.py`'s module docstring, or `{:error, reason}` on failure
   (tracer crash, JSON decode failure, etc.).
   """
-  @spec run_tracer(String.t(), String.t()) ::
-          {:ok, map()} | {:error, {:tracer_exit, integer(), String.t()} | {:decode, term()}}
-  def run_tracer(source, stdin) when is_binary(source) and is_binary(stdin) do
+  @spec run_tracer(String.t(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:error,
+             :timeout
+             | {:tracer_exit, integer(), String.t()}
+             | {:decode, term()}}
+  def run_tracer(source, stdin, opts \\ []) when is_binary(source) and is_binary(stdin) do
+    case run_tracer_with_stdout(source, stdin, opts) do
+      {:ok, {_stdout, envelope}} -> {:ok, envelope}
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
+  Variant of `run_tracer/3` that also returns the user program's
+  captured stdout. Used by the eval harness to fold the tracer run and
+  CPython preflight into one CPython invocation.
+  """
+  @spec run_tracer_with_stdout(String.t(), String.t(), keyword()) ::
+          {:ok, {String.t(), map()}}
+          | {:error,
+             :timeout
+             | {:tracer_exit, integer(), String.t()}
+             | {:decode, term()}}
+  def run_tracer_with_stdout(source, stdin, opts \\ [])
+      when is_binary(source) and is_binary(stdin) do
     python = System.get_env("PYLIXIR_PYTHON") || @default_python
     script = Path.join([:code.priv_dir(:pylixir), "python", "trace.py"])
+    timeout_ms = Keyword.get(opts, :trace_timeout_ms, @default_trace_timeout_ms)
 
     {source_path, stdin_path, out_path} = mktemps()
     File.write!(source_path, source)
     File.write!(stdin_path, stdin)
 
     try do
-      case System.cmd(python, [script, source_path, stdin_path, out_path], stderr_to_stdout: true) do
-        {_user_stdout, 0} ->
+      task =
+        Task.async(fn ->
+          # stderr_to_stdout: false so the user program's stdout isn't
+          # contaminated with tracer warnings; on failure we surface
+          # the (combined) output from a second System.cmd below.
+          System.cmd(python, [script, source_path, stdin_path, out_path],
+            stderr_to_stdout: false
+          )
+        end)
+
+      case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {user_stdout, 0}} ->
           case File.read(out_path) do
-            {:ok, ""} -> {:error, {:tracer_exit, 0, "empty out file"}}
-            {:ok, payload} -> decode(payload)
-            {:error, reason} -> {:error, {:tracer_exit, 0, "out file unreadable: #{inspect(reason)}"}}
+            {:ok, ""} ->
+              {:error, {:tracer_exit, 0, "empty out file"}}
+
+            {:ok, payload} ->
+              case Jason.decode(payload) do
+                {:ok, envelope} -> {:ok, {user_stdout, envelope}}
+                {:error, reason} -> {:error, {:decode, reason}}
+              end
+
+            {:error, reason} ->
+              {:error, {:tracer_exit, 0, "out file unreadable: #{inspect(reason)}"}}
           end
 
-        {output, code} ->
+        {:ok, {output, code}} ->
           {:error, {:tracer_exit, code, output}}
+
+        nil ->
+          {:error, :timeout}
       end
     after
       for path <- [source_path, stdin_path, out_path], do: File.rm(path)
@@ -120,10 +198,4 @@ defmodule Pylixir.ExampleInference do
     }
   end
 
-  defp decode(payload) do
-    case Jason.decode(payload) do
-      {:ok, envelope} -> {:ok, envelope}
-      {:error, reason} -> {:error, {:decode, reason}}
-    end
-  end
 end

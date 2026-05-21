@@ -87,6 +87,49 @@ defmodule Pylixir do
     |> to_source(opts)
   end
 
+  @doc """
+  Transpile `source` with `examples`, then run each example through
+  `runner` and compare its stdout to the example's `:stdout`. Returns
+  `:ok` when every example matches, otherwise `{:error, mismatches}`
+  with one entry per failing example.
+
+    * `runner :: (elixir_source, stdin) -> {:ok, stdout} | {:error, term}`
+
+  Library stays pure — no `Code.eval_string`. The caller owns process
+  sandboxing, timeouts, and stdout capture (docs/09 Q9 B).
+  """
+  @spec validate_transpile(String.t(), [map()], (String.t(), String.t() -> {:ok, String.t()} | {:error, term()})) ::
+          :ok | {:error, [map()]}
+  def validate_transpile(source, examples, runner)
+      when is_binary(source) and is_list(examples) and is_function(runner, 2) do
+    elixir_source = transpile(source, examples: examples)
+
+    mismatches =
+      examples
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {%{stdin: stdin, stdout: expected} = _ex, idx}, acc ->
+        case runner.(elixir_source, stdin) do
+          {:ok, ^expected} ->
+            acc
+
+          {:ok, actual} ->
+            [
+              %{idx: idx, expected: expected, actual: actual, elixir_source: elixir_source}
+              | acc
+            ]
+
+          {:error, err} ->
+            [
+              %{idx: idx, expected: expected, actual: {:error, err}, elixir_source: elixir_source}
+              | acc
+            ]
+        end
+      end)
+      |> Enum.reverse()
+
+    if mismatches == [], do: :ok, else: {:error, mismatches}
+  end
+
   @doc false
   @spec python_ast(String.t()) :: map()
   def python_ast(python_source) when is_binary(python_source) do
