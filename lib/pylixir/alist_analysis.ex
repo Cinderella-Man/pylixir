@@ -156,6 +156,47 @@ defmodule Pylixir.AlistAnalysis do
 
   defp freezable_rhs?(_), do: false
 
+  # Self-concat rebind: `xs = [<lit>] + xs` or `xs = xs + [<lit>]`.
+  # The competitive-programming "shift to 1-based indexing" idiom and
+  # related patterns rebind the name to itself concatenated with a
+  # list literal. The result is a fresh list, the storage stays
+  # logically the same, and downstream reads behave identically to
+  # the original — so we admit this shape as a non-mutating rebind
+  # that doesn't disqualify the alist freeze. The Assign converter
+  # emits it as `name = py_alist_new(<lit> ++ py_iter_to_list(name))`
+  # (or the symmetric form), preserving alist-O(1) reads.
+  defp self_concat_rebind?(
+         %{
+           "_type" => "Assign",
+           "targets" => [%{"_type" => "Name", "id" => target_id}],
+           "value" => %{
+             "_type" => "BinOp",
+             "op" => %{"_type" => "Add"},
+             "left" => %{"_type" => "List"},
+             "right" => %{"_type" => "Name", "id" => src_id}
+           }
+         },
+         name
+       ),
+       do: target_id == name and src_id == name
+
+  defp self_concat_rebind?(
+         %{
+           "_type" => "Assign",
+           "targets" => [%{"_type" => "Name", "id" => target_id}],
+           "value" => %{
+             "_type" => "BinOp",
+             "op" => %{"_type" => "Add"},
+             "left" => %{"_type" => "Name", "id" => src_id},
+             "right" => %{"_type" => "List"}
+           }
+         },
+         name
+       ),
+       do: target_id == name and src_id == name
+
+  defp self_concat_rebind?(_, _), do: false
+
   # === Per-candidate decision ========================================
 
   defp decide(name, body, binding_node, scope_name) do
@@ -191,10 +232,18 @@ defmodule Pylixir.AlistAnalysis do
   defp mutates_deep?(node, _name, binding_node) when node == binding_node, do: false
 
   defp mutates_deep?(%{"_type" => _} = node, name, binding_node) do
-    ModuleAnalysis.mutates_name?(node, name) or
-      node
-      |> Map.delete("_type")
-      |> Enum.any?(fn {_k, v} -> mutates_deep?(v, name, binding_node) end)
+    cond do
+      self_concat_rebind?(node, name) ->
+        # Admitted as a non-mutating rebind. Don't recurse — the inner
+        # `Name(name)` reference is part of the idiom, not a leak.
+        false
+
+      true ->
+        ModuleAnalysis.mutates_name?(node, name) or
+          node
+          |> Map.delete("_type")
+          |> Enum.any?(fn {_k, v} -> mutates_deep?(v, name, binding_node) end)
+    end
   end
 
   defp mutates_deep?(list, name, binding_node) when is_list(list) do
@@ -214,14 +263,17 @@ defmodule Pylixir.AlistAnalysis do
     Enum.any?(body, &leak_in?(&1, name))
   end
 
-  # The candidate's own freezable Assign (`xs = list(...)`,
-  # `xs = [<expr> for ... in ...]`, `xs = sorted(...)`) — the target
-  # `Name(xs)` is the bind site, not a leak. Walk only the value so
-  # any embedded `xs` reference inside the RHS still gets caught
-  # via descent. A reassignment that matches this shape was already
-  # rejected upstream by the "multiple bindings" check, so it never
-  # reaches the leak detector.
-  defp leak_in?(
+  # Self-concat rebind (`xs = [<lit>] + xs` or `xs = xs + [<lit>]`) —
+  # admitted as a non-mutating rebind (see `mutates_deep?/3`). The
+  # inner `Name(xs)` reference is part of the idiom; don't recurse
+  # into the value or the embedded `Name(xs)` would flag as a leak.
+  defp leak_in?(node, name) do
+    if self_concat_rebind?(node, name),
+      do: false,
+      else: leak_in_dispatch(node, name)
+  end
+
+  defp leak_in_dispatch(
          %{
            "_type" => "Assign",
            "targets" => [%{"_type" => "Name", "id" => target_id}],
@@ -255,14 +307,14 @@ defmodule Pylixir.AlistAnalysis do
   # slot may be `Name(xs)` directly without counting as a leak; the
   # `slice` slot is checked normally (any `xs` inside the index
   # expression IS a leak — `xs[xs]` would be).
-  defp leak_in?(%{"_type" => "Subscript", "value" => value, "slice" => slice}, name) do
+  defp leak_in_dispatch(%{"_type" => "Subscript", "value" => value, "slice" => slice}, name) do
     leak_in_value_slot?(value, name) or leak_in?(slice, name)
   end
 
   # Compare: only `_ in xs` / `_ not in xs` shapes give the right
   # operand a safe slot. Other operators (`==`, `<`, etc.) checking
   # `xs` mean the value escapes — bail.
-  defp leak_in?(
+  defp leak_in_dispatch(
          %{"_type" => "Compare", "left" => left, "ops" => ops, "comparators" => comps},
          name
        ) do
@@ -287,7 +339,7 @@ defmodule Pylixir.AlistAnalysis do
 
   # For: `for v in xs:` lets `xs` sit in the `iter` slot. body /
   # orelse get walked normally.
-  defp leak_in?(
+  defp leak_in_dispatch(
          %{"_type" => "For", "target" => target, "iter" => iter, "body" => body} = node,
          name
        ) do
@@ -302,7 +354,7 @@ defmodule Pylixir.AlistAnalysis do
   # Call to an allowlisted builtin (`len(xs)`, `sum(xs)`, etc.):
   # each direct `Name(xs)` arg is safe. Non-Name arguments get
   # walked (so `len(xs + ys)` leaks via the BinOp).
-  defp leak_in?(
+  defp leak_in_dispatch(
          %{
            "_type" => "Call",
            "func" => %{"_type" => "Name", "id" => fname},
@@ -330,7 +382,7 @@ defmodule Pylixir.AlistAnalysis do
   # exactly the candidate; otherwise (`other.copy(xs)`, or any
   # non-allowlisted method) we fall through to the generic descent
   # so a `Name(xs)` in the args still flags as a leak.
-  defp leak_in?(
+  defp leak_in_dispatch(
          %{
            "_type" => "Call",
            "func" => %{
@@ -357,20 +409,20 @@ defmodule Pylixir.AlistAnalysis do
   # rebinding to the same name reads here as if it referred to the
   # outer name, which over-bails in pathological cases but never
   # produces an incorrect freeze.
-  defp leak_in?(%{"_type" => "Name", "id" => id}, name) when id == name, do: true
+  defp leak_in_dispatch(%{"_type" => "Name", "id" => id}, name) when id == name, do: true
 
   # Generic node: descend into every child slot.
-  defp leak_in?(%{"_type" => _} = node, name) do
+  defp leak_in_dispatch(%{"_type" => _} = node, name) do
     node
     |> Map.delete("_type")
     |> Enum.any?(fn {_k, v} -> leak_in?(v, name) end)
   end
 
-  defp leak_in?(list, name) when is_list(list) do
+  defp leak_in_dispatch(list, name) when is_list(list) do
     Enum.any?(list, &leak_in?(&1, name))
   end
 
-  defp leak_in?(_leaf, _name), do: false
+  defp leak_in_dispatch(_leaf, _name), do: false
 
   # A "value slot" (Subscript.value, For.iter, allowlisted-builtin
   # arg) treats a direct `Name(xs)` as safe but still walks any

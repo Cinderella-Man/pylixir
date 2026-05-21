@@ -170,6 +170,93 @@ defmodule Pylixir.AlistAnalysisTest do
     end
   end
 
+  describe "self-concat rebind admitted (`xs = [lit] + xs` for 1-based indexing)" do
+    # Competitive-programming idiom: `L = list(...); L = [0] + L` to
+    # shift L to 1-based indexing. Without admitting the rebind as
+    # freezable, L stays a plain list and `L[i]` becomes O(n) via
+    # `Enum.at` — for n in the hundreds of thousands that's O(n²)
+    # total (the `seed_13048` sample 005 timeout in the eval corpus).
+
+    defp bin_op_add(left, right),
+      do: %{"_type" => "BinOp", "op" => %{"_type" => "Add"}, "left" => left, "right" => right}
+
+    test "xs = list(...); xs = [0] + xs; xs[0] → frozen" do
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(list_literal([const(0)]), name("xs"))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+    end
+
+    test "xs = list(...); xs = xs + [0]; xs[0] → frozen (append side)" do
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(name("xs"), list_literal([const(0)]))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+    end
+
+    test "multiple self-concat rebinds OK" do
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(list_literal([const(0)]), name("xs"))),
+        assign("xs", bin_op_add(list_literal([const(1)]), name("xs"))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])
+    end
+
+    test "rebind from a different name (not self-concat) bails" do
+      # `xs = [0] + ys` is a fresh binding that drops the old xs —
+      # the new xs is structurally a different list. Not the idiom.
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(list_literal([const(0)]), name("ys"))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+    end
+
+    test "rebind from a non-list-literal (e.g. xs + xs) bails" do
+      # `xs = xs + xs` doesn't fit the idiom (both operands are the
+      # name itself). Conservative bail.
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(name("xs"), name("xs"))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+    end
+
+    test "rebind without an initial freezable bind bails" do
+      # No `xs = list(...)` first — the rebind alone isn't enough
+      # to admit `xs` as a freeze candidate.
+      body = [
+        assign("xs", bin_op_add(list_literal([const(0)]), name("xs"))),
+        expr(subscript_read("xs", 0))
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+    end
+
+    test "self-concat rebind interleaved with mutation still bails" do
+      body = [
+        list_call_bind("xs"),
+        assign("xs", bin_op_add(list_literal([const(0)]), name("xs"))),
+        method_call("xs", "append", [const(99)])
+      ]
+
+      assert AlistAnalysis.freezable_names(body) == MapSet.new()
+    end
+  end
+
   describe "leak / alias disqualifiers" do
     test "aliasing y = xs bails (y could be mutated, sharing reference)" do
       body = [

@@ -473,37 +473,31 @@ defmodule Pylixir.Nodes.Assign do
               {{:=, [], [target_ast, pvec_ast]}, ctx2}
 
             :no ->
-              {value_ast, context} = Converter.convert(value, context)
-
-              # Alist freeze (P5): when the safety check (P3) has put
-              # this name in `freezable_names` AND the RHS is one of
-              # the freezable shapes (`list(...)`, list comprehension,
-              # `sorted(...)`), wrap the converted value in
-              # `py_alist_new/1` and switch the bound type to
-              # `{:py_alist, elem_t}`. Every downstream consumer either
-              # handles alists via the helper clauses or routes
-              # through `coerce_iter` (`is_list?({:py_alist, _})`
-              # returns false).
-              {emitted_value_ast, bound_type} =
-                if MapSet.member?(context.freezable_names, id) and
-                     python_freezable_rhs?(value) do
-                  elem_t =
-                    case value_type do
-                      {:list, e} -> e
-                      _ -> :any
-                    end
-
-                  {{:py_alist_new, [], [value_ast]}, {:py_alist, elem_t}}
+              # Self-concat rebind path (`xs = [<lit>] + xs` /
+              # `xs = xs + [<lit>]`): admitted as freezable by
+              # `AlistAnalysis.self_concat_rebind?`. Emit
+              # `name = py_alist_new(<lit> ++ py_iter_to_list(name))`
+              # so the alist representation survives the rebind —
+              # otherwise `py_add` would fall back to the catch-all
+              # and the result would be a plain list with O(n)
+              # `Enum.at` reads.
+              maybe_self_concat =
+                if MapSet.member?(context.freezable_names, id) do
+                  python_self_concat_rebind(value, id)
                 else
-                  {value_ast, value_type}
+                  :no
                 end
 
-              context = TypeInfer.bind(context, id, bound_type)
-              context = Converter.bind_name(context, id)
-              {target_ast, context} = Converter.convert(target, context)
+              case maybe_self_concat do
+                {:ok, list_part, :left} ->
+                  emit_self_concat_rebind(id, list_part, :left, node, context)
 
-              guarded_value_ast = maybe_wrap_boundary(emitted_value_ast, id, node, context)
-              {{:=, [], [target_ast, guarded_value_ast]}, context}
+                {:ok, list_part, :right} ->
+                  emit_self_concat_rebind(id, list_part, :right, node, context)
+
+                :no ->
+                  emit_regular_assign(id, target, value, value_type, node, context)
+              end
           end
       end
     end
@@ -585,6 +579,73 @@ defmodule Pylixir.Nodes.Assign do
       col_offset: Map.get(node, "col_offset")
   end
 
+  # Wraps the previous "convert + maybe-freeze" lowering. Extracted
+  # so the self-concat path can sit beside it without nesting.
+  defp emit_regular_assign(id, target, value, value_type, node, context) do
+    {value_ast, context} = Converter.convert(value, context)
+
+    # Alist freeze (P5): when the safety check (P3) has put this
+    # name in `freezable_names` AND the RHS is one of the freezable
+    # shapes (`list(...)`, list comprehension, `sorted(...)`), wrap
+    # the converted value in `py_alist_new/1` and switch the bound
+    # type to `{:py_alist, elem_t}`. Every downstream consumer either
+    # handles alists via the helper clauses or routes through
+    # `coerce_iter` (`is_list?({:py_alist, _})` returns false).
+    {emitted_value_ast, bound_type} =
+      if MapSet.member?(context.freezable_names, id) and
+           python_freezable_rhs?(value) do
+        elem_t =
+          case value_type do
+            {:list, e} -> e
+            _ -> :any
+          end
+
+        {{:py_alist_new, [], [value_ast]}, {:py_alist, elem_t}}
+      else
+        {value_ast, value_type}
+      end
+
+    context = TypeInfer.bind(context, id, bound_type)
+    context = Converter.bind_name(context, id)
+    {target_ast, context} = Converter.convert(target, context)
+
+    guarded_value_ast = maybe_wrap_boundary(emitted_value_ast, id, node, context)
+    {{:=, [], [target_ast, guarded_value_ast]}, context}
+  end
+
+  # `xs = py_alist_new(<list_lit> ++ py_iter_to_list(xs))` (or the
+  # symmetric `xs = py_alist_new(py_iter_to_list(xs) ++ <list_lit>)`).
+  # The inner `py_iter_to_list` unwraps the prior `{:py_alist, _}` to
+  # a plain list so `++` works; the outer `py_alist_new` re-freezes.
+  defp emit_self_concat_rebind(id, list_part, side, node, context) do
+    {list_ast, context} = Converter.convert(list_part, context)
+
+    atom = id |> Pylixir.Naming.rewrite() |> String.to_atom()
+    name_ref = {atom, [], nil}
+    coerced = {:py_iter_to_list, [], [name_ref]}
+
+    concat =
+      case side do
+        :left -> {:++, [], [list_ast, coerced]}
+        :right -> {:++, [], [coerced, list_ast]}
+      end
+
+    elem_t =
+      case TypeInfer.infer_expr(list_part, context) do
+        {:list, e} -> e
+        _ -> :any
+      end
+
+    bound_type = {:py_alist, elem_t}
+
+    context = TypeInfer.bind(context, id, bound_type)
+    context = Converter.bind_name(context, id)
+
+    rhs = {:py_alist_new, [], [concat]}
+    guarded = maybe_wrap_boundary(rhs, id, node, context)
+    {{:=, [], [name_ref, guarded]}, context}
+  end
+
   # --- single-target Assign helpers -------------------------------------
   #
   # `detect_mutating_method_call/2` powers the Name-target clause's
@@ -619,6 +680,37 @@ defmodule Pylixir.Nodes.Assign do
        do: true
 
   defp python_freezable_rhs?(_), do: false
+
+  # Detects `name = [<lit>] + name` (`:left` side) or
+  # `name = name + [<lit>]` (`:right` side). Returns `{:ok, <list>, :left|:right}`
+  # so the caller can convert the list part and choose the concat
+  # order. Mirrors `Pylixir.AlistAnalysis.self_concat_rebind?/2` —
+  # emission and admission must agree on the RHS shape.
+  defp python_self_concat_rebind(
+         %{
+           "_type" => "BinOp",
+           "op" => %{"_type" => "Add"},
+           "left" => %{"_type" => "List"} = list_part,
+           "right" => %{"_type" => "Name", "id" => src_id}
+         },
+         name
+       )
+       when src_id == name,
+       do: {:ok, list_part, :left}
+
+  defp python_self_concat_rebind(
+         %{
+           "_type" => "BinOp",
+           "op" => %{"_type" => "Add"},
+           "left" => %{"_type" => "Name", "id" => src_id},
+           "right" => %{"_type" => "List"} = list_part
+         },
+         name
+       )
+       when src_id == name,
+       do: {:ok, list_part, :right}
+
+  defp python_self_concat_rebind(_, _), do: :no
 
   # Pvec emission helper. If the candidate name is in `pvec_names`
   # and the RHS matches `[<default>] * <n>` (or the symmetric form

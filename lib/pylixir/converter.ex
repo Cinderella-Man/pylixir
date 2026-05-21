@@ -2504,6 +2504,30 @@ defmodule Pylixir.Converter do
   def tuple_pattern([a, b]), do: {a, b}
   def tuple_pattern(refs), do: {:{}, [], refs}
 
+  @doc """
+  Strip a redundant `Enum.to_list/1` wrap around a `start..stop//step`
+  (or `start..stop`) Range — `range(...)` lowers to
+  `Enum.to_list(start..stop//step)` (see `Pylixir.Builtins`) so
+  consumers that need a concrete list (`len(r)`, `print(r)`, …) see
+  one, but iter-consuming sites (for-loop reduce, list-comp `Enum.map`,
+  …) accept ranges directly. For n in the hundreds of thousands (eval
+  corpus `seed_13048`) the avoided allocation is the difference
+  between fitting and not fitting under the eval-run timeout.
+  No-op on any other expression.
+  """
+  @spec elide_range_to_list(Macro.t()) :: Macro.t()
+  def elide_range_to_list(
+        {{:., _, [{:__aliases__, _, [:Enum]}, :to_list]}, _, [{:..//, _, _} = range]}
+      ),
+      do: range
+
+  def elide_range_to_list(
+        {{:., _, [{:__aliases__, _, [:Enum]}, :to_list]}, _, [{:.., _, _} = range]}
+      ),
+      do: range
+
+  def elide_range_to_list(other), do: other
+
   @doc false
   # Python's throwaway names (`_`, `__`, `___`, …) — emit Elixir's
   # discard pattern, don't bind, don't return in the `names` list.

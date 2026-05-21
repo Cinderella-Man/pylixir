@@ -412,6 +412,7 @@ defmodule Pylixir.Nodes.Loop do
     iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
+    iter_ast = Converter.elide_range_to_list(iter_ast)
 
     elem_t = TypeInfer.elem_of(iter_type)
 
@@ -544,6 +545,7 @@ defmodule Pylixir.Nodes.Loop do
     iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
+    iter_ast = Converter.elide_range_to_list(iter_ast)
 
     # Save scopes BEFORE convert_loop_target (which binds the target)
     # so we can drop the target binding after the loop. Pylixir's

@@ -326,6 +326,76 @@ defmodule Pylixir.SpecializationTest do
       out = Pylixir.transpile(src)
       assert out =~ "py_iter_to_list("
     end
+
+    test "for-loop over range(n) elides the surrounding Enum.to_list (Enum.reduce takes ranges directly)" do
+      # `range(n)` lowers to `Enum.to_list(0..(n-1)//1)` so consumers
+      # that need a concrete list (`len(r)`, `print(r)`) see one. But
+      # `Enum.reduce` / `Enum.each` accept ranges directly — the wrap
+      # is pure overhead in the for-loop iter slot. For n in the
+      # hundreds of thousands (eval corpus `seed_13048` shape), the
+      # avoided allocation is the difference between fitting and not
+      # fitting under the 10s timeout.
+      src = """
+      def f(n):
+          total = 0
+          for j in range(n):
+              total = total + 1
+          return total
+      print(f(10))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "Enum.reduce(0..(n - 1)//1,"
+      refute out =~ "Enum.reduce(Enum.to_list(0..(n - 1)//1)"
+    end
+
+    test "for-loop over range(start, stop, -1) elides the wrap (reverse range)" do
+      src = """
+      def f(n):
+          total = 0
+          for j in range(n - 1, -1, -1):
+              total = total + 1
+          return total
+      print(f(10))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "Enum.reduce((n - 1)..0//-1,"
+      refute out =~ "Enum.reduce(Enum.to_list("
+    end
+
+    test "list comprehension over range elides the Enum.to_list wrap" do
+      src = """
+      def f(n):
+          xs = [i * 2 for i in range(n)]
+          return xs[5]
+      print(f(10))
+      """
+
+      out = Pylixir.transpile(src)
+      # `Enum.map(range, ...)` rather than `Enum.map(Enum.to_list(range), ...)`.
+      assert out =~ "Enum.map(0..(n - 1)//1,"
+      refute out =~ "Enum.map(Enum.to_list("
+    end
+
+    test "for-loop range elision preserves runtime correctness" do
+      src = """
+      def f(n):
+          total = 0
+          for j in range(n):
+              total = total + j
+          for j in range(n - 1, -1, -1):
+              total = total + j
+          return total
+      print(f(100))
+      """
+
+      elixir_src = Pylixir.transpile(src)
+      [{mod, _}] = Code.compile_string(elixir_src)
+      out = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      # sum(0..99) * 2 = 4950 * 2 = 9900
+      assert out == "9900\n"
+    end
   end
 
   describe "PR 5: Compare.pair_ast" do
@@ -693,6 +763,54 @@ defmodule Pylixir.SpecializationTest do
       # `xs = py_alist_new(xs)`.
       assert out =~ "py_alist_new(xs)"
       refute out =~ "py_alist_new(Enum.reverse(xs))"
+    end
+  end
+
+  describe "AlistAnalysis: self-concat rebind (`xs = [lit] + xs`)" do
+    test "1-based-indexing idiom keeps xs as alist; indexed reads stay O(1)" do
+      # The `seed_13048` sample 005 shape: `L = list(...); L = [0] + L`
+      # to shift L to 1-based indexing. Without admitting the rebind as
+      # freezable, L degrades to a plain list and `L[i]` becomes O(n)
+      # → O(n²) total in any subsequent read loop. With the fix, both
+      # binds wrap with `py_alist_new` and the rebind unwraps the prior
+      # alist via `py_iter_to_list` before concatenating + refreezing.
+      src = """
+      def f():
+          L = list(range(5))
+          L = [0] + L
+          return L[3]
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+      # The rebind lowers to a single concat-then-freeze; the alist
+      # gets unwrapped via `py_iter_to_list` before `++`.
+      assert out =~ "var_L = py_alist_new([0] ++ py_iter_to_list(var_L))"
+      # The original list( ) bind is also a freeze (existing behavior).
+      assert out =~ ~r/var_L\s*=\s*py_alist_new\(/
+
+      [{mod, _}] = Code.compile_string(out)
+      stdout = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      # L after rebind: [0, 0, 1, 2, 3, 4]; L[3] = 2.
+      assert stdout == "2\n"
+    end
+
+    test "xs + [lit] (append side) lowers symmetrically" do
+      src = """
+      def f():
+          L = list(range(3))
+          L = L + [-1]
+          return L[3]
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "var_L = py_alist_new(py_iter_to_list(var_L) ++ [-1])"
+
+      [{mod, _}] = Code.compile_string(out)
+      stdout = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      # L = [0, 1, 2, -1]; L[3] = -1.
+      assert stdout == "-1\n"
     end
   end
 end

@@ -40,6 +40,7 @@ defmodule Pylixir.Nodes.Comprehension do
     iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
+    iter_ast = Converter.elide_range_to_list(iter_ast)
     saved_scopes = context.scopes
     saved_types = context.types
     elem_t = TypeInfer.elem_of(iter_type)
@@ -83,6 +84,7 @@ defmodule Pylixir.Nodes.Comprehension do
     iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
+    iter_ast = Converter.elide_range_to_list(iter_ast)
     saved_scopes = context.scopes
     saved_types = context.types
     elem_t = TypeInfer.elem_of(iter_type)
