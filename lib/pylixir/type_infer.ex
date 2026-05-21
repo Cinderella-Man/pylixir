@@ -679,6 +679,24 @@ defmodule Pylixir.TypeInfer do
 
   defp seed_heap_type(_other, ctx), do: ctx
 
+  # ---------------------------------------------------------------------
+  # seed_module_attr_types — bind `ctx.types[name]` for each promoted
+  # module attribute. `ModuleAnalysis` only promotes values that
+  # `Pylixir.LiteralFold` can evaluate, so we route through `fold/1` and
+  # then `type_of_term/1` to recover the lattice type. Used by Pipeline
+  # pre-pass (was a private helper in `Converter` pre-Pipeline).
+  # ---------------------------------------------------------------------
+
+  @spec seed_module_attr_types([{String.t(), map()}], Context.t()) :: Context.t()
+  def seed_module_attr_types(attrs, %Context{} = ctx) do
+    Enum.reduce(attrs, ctx, fn {name, value_node}, acc ->
+      case Pylixir.LiteralFold.fold(value_node) do
+        {:ok, value} -> bind(acc, name, type_of_term(value))
+        _ -> acc
+      end
+    end)
+  end
+
   # The bounded fixed-point pass that populates `Context.fn_signatures`
   # lives in `Pylixir.TypeInfer.Signatures`. Entry point:
   # `Pylixir.TypeInfer.Signatures.infer/3`.

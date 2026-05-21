@@ -64,25 +64,13 @@ defmodule Pylixir.Converter do
         class_methods: class_methods
     }
 
-    # PR 3 — seed heap_types for `mutable_module_dicts` from their
-    # initial top-level assigns. Container tag only; element types
-    # stay `:any` per Q5-C. Must precede any conversion that reads
-    # these names so reads through `process_dict_get` see the type.
-    context = TypeInfer.module_summary(analysis.runtime_statements, context)
-
-    # PR 7 — seed ctx.types from promoted module attributes. Each
-    # `@var_x value` has a `LiteralFold`-derived BEAM term; route
-    # through `type_of_term/1` so subsequent reads of `Name("x")`
-    # return the inferred type and downstream BinOp / call / subscript
-    # sites can specialize.
-    context = seed_module_attr_types(analysis.module_attrs, context)
-
-    # PR 9 — inter-procedural fixed-point. Runs AFTER PR 3/7 seeding
-    # so external callers' args (which may read module attrs / heap
-    # state) are typed during the lub. Recursive calls contribute
-    # `:bottom`; convergence usually in 2–3 rounds.
-    context =
-      TypeInfer.Signatures.infer(analysis.function_defs, analysis.runtime_statements, context)
+    # `TypeInfer.module_summary/2`, `TypeInfer.seed_module_attr_types/2`,
+    # and `TypeInfer.Signatures.infer/3` now run in `Pylixir.Pipeline`
+    # before the Module clause is invoked. The attr_names/class_names/
+    # class_methods setup above stays inline because it depends on
+    # Converter-private helpers (`class_mutating_methods/1` et al.);
+    # the three lifted passes verifiably do NOT read those fields so
+    # the reorder is behaviour-preserving.
 
     {class_asts, context} = convert_class_defs(analysis.class_defs, context)
     {hoisted_asts, context} = emit_hoisted_imports(analysis.hoisted_imports, context)
@@ -3032,14 +3020,8 @@ defmodule Pylixir.Converter do
   # `Pylixir.TypeInfer.IsinstanceNarrowing`. The If clause above
   # delegates via `TypeInfer.IsinstanceNarrowing.narrow/2`.
 
-  defp seed_module_attr_types(attrs, context) do
-    Enum.reduce(attrs, context, fn {name, value_node}, ctx ->
-      case Pylixir.LiteralFold.fold(value_node) do
-        {:ok, value} -> TypeInfer.bind(ctx, name, TypeInfer.type_of_term(value))
-        _ -> ctx
-      end
-    end)
-  end
+  # `seed_module_attr_types` moved to `Pylixir.TypeInfer.seed_module_attr_types/2`
+  # so `Pylixir.Pipeline` can call it as a pre-pass.
 
   defp convert_module_attrs([], context), do: {[], context}
 

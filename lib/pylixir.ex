@@ -5,7 +5,7 @@ defmodule Pylixir do
   See `docs/rfc.md` for the full specification.
   """
 
-  alias Pylixir.{Context, Converter, Formatter, ModuleAnalysis, PythonParseError}
+  alias Pylixir.{Converter, Formatter, Pipeline, PythonParseError}
 
   @default_python "python3.14"
 
@@ -14,15 +14,15 @@ defmodule Pylixir do
 
   Pipeline (RFC §10.11):
 
-    1. Run `Pylixir.ModuleAnalysis.analyze/1` over the module body — single
-       pass that produces module attributes, function defs, runtime
-       statements, and known-function names.
-    2. Seed a fresh `Pylixir.Context` with the known-function set so call
-       sites can forward-reference module-level defs.
-    3. Dispatch via `Pylixir.Converter.convert/3` (Module clause consumes
-       the analysis directly). Subsequent recursive calls use
-       `Pylixir.Converter.convert/2`.
-    4. Render the resulting Elixir AST through `Pylixir.Formatter.format/1`.
+    1. `Pylixir.Pipeline.run/3` runs the ordered module-top pre-passes
+       — LiteralPropagation, ModuleAnalysis, Context init,
+       ExampleInference, module_summary, seed_module_attr_types,
+       Signatures.infer. See `Pylixir.Pipeline` for the full list and
+       the rationale behind what does / does not live there.
+    2. Dispatch via `Pylixir.Converter.convert/3` (Module clause consumes
+       the analysis + pre-seeded context directly). Subsequent recursive
+       calls use `Pylixir.Converter.convert/2`.
+    3. Render the resulting Elixir AST through `Pylixir.Formatter.format/1`.
 
   Raises `Pylixir.UnsupportedNodeError` if the AST contains a node type that
   pylixir does not translate (RFC §4.4).
@@ -42,18 +42,10 @@ defmodule Pylixir do
     examples = Keyword.get(opts, :examples, [])
     source = Keyword.get(opts, :source)
 
-    body = Pylixir.LiteralPropagation.rewrite(python_ast["body"] || [])
+    %{body: body, context: context, analysis: analysis} =
+      Pipeline.run(python_ast["body"] || [], examples, source)
+
     python_ast = Map.put(python_ast, "body", body)
-    analysis = ModuleAnalysis.analyze(body)
-
-    context = %{
-      Context.new(analysis.known_functions)
-      | known_function_arities: analysis.known_function_arities,
-        demoted_functions: analysis.demoted_function_names,
-        mutable_module_dicts: analysis.mutable_module_dicts
-    }
-
-    context = Pylixir.ExampleInference.seed(body, examples, context, source: source)
 
     {elixir_ast, _context} = Converter.convert(python_ast, context, analysis)
     Formatter.format(elixir_ast)
