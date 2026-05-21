@@ -384,7 +384,15 @@ defmodule Pylixir.RuntimeHelpers do
 
     cond do
       is_list(coll) ->
-        Enum.map(indices, &Enum.at(coll, &1))
+        # `Enum.map(indices, &Enum.at(coll, &1))` is O(n²) — `Enum.at`
+        # rewalks from the head each call. Materialize once into a
+        # tuple so per-index lookups are O(1) via `elem/2`; the total
+        # cost stays linear in `len + length(indices)`. For n=100k
+        # this is a ~50× speedup; for the eval-corpus `seed_13048`
+        # `sys.stdin.read().split()` parse path it's the difference
+        # between fitting and not fitting under the elixir timeout.
+        t = List.to_tuple(coll)
+        Enum.map(indices, &elem(t, &1))
 
       is_binary(coll) ->
         Enum.map_join(indices, "", &String.at(coll, &1))
@@ -439,14 +447,23 @@ defmodule Pylixir.RuntimeHelpers do
   # this leading clause. Returning `nil` lets the value flow through
   # `nil`-aware helpers (`py_add(nil, n) == n`, etc.), matching what
   # nested `defaultdict` expressions like `d[c][k]` produce in Python.
-  def py_getitem(nil, _k), do: nil
-  def py_getitem(c, k) when is_list(c), do: Enum.at(c, k)
-  def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
-  # Alist: O(1) `elem/2`, but bounds-checked because the existing
-  # list semantics return `nil` for out-of-range — `elem/2` would
-  # raise ArgumentError otherwise. Negative indices wrap by length.
-  # Leading clauses keep `{:py_alist, _}` away from the trailing
-  # tuple clauses.
+  # Pvec / alist clauses go FIRST — these are the hot-path tags for
+  # eval-corpus competitive code (pvec for `[0] * n` index-write
+  # loops, alist for frozen-list O(1) reads). Earlier clauses cost
+  # one BEAM pattern-test each on every call, so the position
+  # ordering matters for tight loops with 10⁶+ get/set calls. The
+  # bodies are inlined here (rather than delegating to
+  # `py_pvec_get/2` / nothing for alist) so each call is one
+  # dispatch, not two.
+  def py_getitem({:py_pvec, arr}, k) when k >= 0 do
+    if k < :array.size(arr), do: :array.get(k, arr), else: nil
+  end
+
+  def py_getitem({:py_pvec, arr}, k) do
+    idx = :array.size(arr) + k
+    if idx >= 0, do: :array.get(idx, arr), else: nil
+  end
+
   def py_getitem({:py_alist, t}, k) when k >= 0 do
     if k < tuple_size(t), do: elem(t, k), else: nil
   end
@@ -456,11 +473,9 @@ defmodule Pylixir.RuntimeHelpers do
     if idx >= 0, do: elem(t, idx), else: nil
   end
 
-  # Pvec clause — same out-of-bounds / negative-index semantics as
-  # alist. Must come before the `is_tuple` clauses since
-  # `{:py_pvec, _}` is structurally a tuple.
-  def py_getitem({:py_pvec, _} = pv, k), do: py_pvec_get(pv, k)
-
+  def py_getitem(nil, _k), do: nil
+  def py_getitem(c, k) when is_list(c), do: Enum.at(c, k)
+  def py_getitem(c, k) when is_binary(c), do: String.at(c, k)
   def py_getitem(c, k) when is_tuple(c) and k >= 0, do: elem(c, k)
   def py_getitem(c, k) when is_tuple(c), do: elem(c, tuple_size(c) + k)
   # Maps: return `nil` for missing keys (not `Map.fetch!`/raise). This
@@ -473,8 +488,17 @@ defmodule Pylixir.RuntimeHelpers do
   # `Map.get` already — those callers are unaffected.
   def py_getitem(c, k) when is_map(c), do: Map.get(c, k)
 
-  # Pvec clause first — `{:py_pvec, _}` is structurally a tuple.
-  def py_setitem({:py_pvec, _} = pv, k, v), do: py_pvec_set(pv, k, v)
+  # Pvec is the hot tag for `[0] * n` + index-write loops; put it
+  # first to skip 3 BEAM pattern-tests per call. Inlined for the
+  # same single-dispatch reason as `py_getitem`.
+  def py_setitem({:py_pvec, arr}, k, v) when k >= 0 do
+    {:py_pvec, :array.set(k, v, arr)}
+  end
+
+  def py_setitem({:py_pvec, arr}, k, v) do
+    {:py_pvec, :array.set(:array.size(arr) + k, v, arr)}
+  end
+
   # Nested-subscript-write missing-key path: `d[c][k] = v` lowers
   # to `py_setitem(py_getitem(d, c), k, v)`. When `c` is missing,
   # the inner read returns nil (see `py_getitem(nil, _)`), so we
@@ -483,6 +507,29 @@ defmodule Pylixir.RuntimeHelpers do
   def py_setitem(nil, k, v), do: %{k => v}
   def py_setitem(c, k, v) when is_list(c), do: List.replace_at(c, k, v)
   def py_setitem(c, k, v) when is_map(c), do: Map.put(c, k, v)
+
+  # Raw-array variants: used by the for-loop pvec-accumulator
+  # specialization (see `Pylixir.Nodes.Loop`). When the loop's reduce
+  # accumulator is a `{:py_pvec, _}` value, the converter unwraps
+  # once before the loop and threads the underlying `:array` through
+  # the reduce. Each `py_setitem`/`py_getitem` call against that
+  # accumulator becomes one of these helpers — same `:array` work,
+  # but skips the `{:py_pvec, _}` tag-wrap allocation per iter (and
+  # the corresponding unwrap on the next access). For n in the
+  # hundreds of thousands this is the inner-loop cost driver.
+  def py_pvec_arr_get(arr, k) when k >= 0 do
+    if k < :array.size(arr), do: :array.get(k, arr), else: nil
+  end
+
+  def py_pvec_arr_get(arr, k) do
+    idx = :array.size(arr) + k
+    if idx >= 0, do: :array.get(idx, arr), else: nil
+  end
+
+  def py_pvec_arr_set(arr, k, v) when k >= 0, do: :array.set(k, v, arr)
+
+  def py_pvec_arr_set(arr, k, v),
+    do: :array.set(:array.size(arr) + k, v, arr)
 
   # `del coll[k]` — Python's subscript deletion. Polymorphic on the
   # collection: list → `List.delete_at`, map → `Map.delete`,

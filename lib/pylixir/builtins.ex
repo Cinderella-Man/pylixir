@@ -957,6 +957,16 @@ defmodule Pylixir.Builtins do
     end
   end
 
+  # 2-arg `min(a, b)` / `max(a, b)` — emit `Kernel.min/2` / `Kernel.max/2`
+  # rather than `Enum.min([a, b])`. The Enum form builds a 2-element
+  # cons cell and walks it via `Enum.reduce` (~10 BEAM ops); the
+  # Kernel form is a single guard. In hot pvec loops (eval-corpus
+  # `seed_13048` shape: `min_a[i] = min(a[i], min_a[i + 1])`) this is
+  # the inner-loop cost driver.
+  defp minmax_variadic(op, [a, b]) do
+    {op, [], [a, b]}
+  end
+
   defp minmax_variadic(op, args) do
     {{:., [], [{:__aliases__, [], [:Enum]}, op]}, [], [args]}
   end

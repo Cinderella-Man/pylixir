@@ -338,6 +338,38 @@ defmodule Pylixir.RuntimeHelpersTest do
       # finishing within ExUnit's default timeout.
       assert Enum.all?(0..99_999//7, fn i -> H.py_getitem(a, i) == i end)
     end
+
+    test "py_slice on a 100k-element list is O(n), not O(n²)" do
+      # eval-corpus `seed_13048` shape: `data = sys.stdin.read().split();
+      # L = list(map(int, data[1:n+1]))`. A naive
+      # `Enum.map(indices, &Enum.at(list, &1))` is O(n²) — `Enum.at`
+      # traverses from the head every call. For n=100k that's ~5s with
+      # `Enum.at`; the linear lowering (`List.to_tuple` once, then
+      # `elem/2`) finishes in tens of milliseconds.
+      data = Enum.map(0..99_999, &Integer.to_string/1)
+      {time_us, sliced} = :timer.tc(fn -> H.py_slice(data, 1, 100_000, nil) end)
+      assert length(sliced) == 99_999
+      assert hd(sliced) == "1"
+      assert List.last(sliced) == "99999"
+
+      elapsed_ms = div(time_us, 1000)
+
+      assert elapsed_ms < 500,
+             "py_slice on 100k-list took #{elapsed_ms}ms — expected well under 500ms (O(n²) fallback detected)"
+    end
+
+    test "py_slice with negative step on a list stays linear" do
+      data = Enum.to_list(0..49_999)
+      {time_us, sliced} = :timer.tc(fn -> H.py_slice(data, nil, nil, -1) end)
+      assert length(sliced) == 50_000
+      assert hd(sliced) == 49_999
+      assert List.last(sliced) == 0
+
+      elapsed_ms = div(time_us, 1000)
+
+      assert elapsed_ms < 500,
+             "py_slice (step=-1) on 50k-list took #{elapsed_ms}ms — expected well under 500ms"
+    end
   end
 
   describe "py_copy/1 — shallow copy for `.copy()` dispatch" do

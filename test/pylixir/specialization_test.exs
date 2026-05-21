@@ -390,9 +390,13 @@ defmodule Pylixir.SpecializationTest do
       print(f(100))
       """
 
-      elixir_src = Pylixir.transpile(src)
-      [{mod, _}] = Code.compile_string(elixir_src)
-      out = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      # `Pylixir.TranspileHelpers.run_source/1` strips the trailing
+      # `TranslatedCode.py_main()` call before compiling and captures
+      # `py_main`'s stdout cleanly. Doing a bare
+      # `Code.compile_string(src)` would *execute* that trailing call
+      # at compile time with no capture in place, leaking the program's
+      # output into the test runner's stdout.
+      {_, _, out, _} = Pylixir.TranspileHelpers.run_source(Pylixir.transpile(src))
       # sum(0..99) * 2 = 4950 * 2 = 9900
       assert out == "9900\n"
     end
@@ -730,6 +734,193 @@ defmodule Pylixir.SpecializationTest do
     end
   end
 
+  describe "min/max 2-arg variadic uses Kernel.min/2, not Enum.min/1" do
+    # In hot pvec loops (eval-corpus `seed_13048` shape:
+    # `min_a[i] = min(a[i], min_a[i + 1])` n times), the 2-arg form
+    # of `min`/`max` is the inner-loop cost driver. `Enum.min([a, b])`
+    # builds a 2-element cons cell and walks it via `Enum.reduce` —
+    # ~10 BEAM ops vs `Kernel.min/2`'s single guard.
+    test "min(a, b) emits Kernel.min(a, b), not Enum.min" do
+      src = """
+      def f(x, y):
+          return min(x, y)
+      print(f(3, 7))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ ~r/\bmin\(x, y\)/
+      refute out =~ "Enum.min(["
+    end
+
+    test "max(a, b) emits Kernel.max(a, b), not Enum.max" do
+      src = """
+      def f(x, y):
+          return max(x, y)
+      print(f(3, 7))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ ~r/\bmax\(x, y\)/
+      refute out =~ "Enum.max(["
+    end
+
+    test "min(a, b, c) still uses Enum.min (3+ args)" do
+      # 3-arg variadic still uses `Enum.min` since `Kernel.min/2`
+      # doesn't generalize. Regression check that the 2-arg
+      # specialization didn't break the variadic case.
+      src = """
+      def f(x, y, z):
+          return min(x, y, z)
+      print(f(3, 7, 1))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "Enum.min(["
+    end
+
+    test "2-arg variadic runtime correctness" do
+      src = """
+      def f():
+          return [min(3, 7), max(3, 7), min(-5, -10), max("a", "b")]
+      print(f())
+      """
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(Pylixir.transpile(src))
+      assert stdout == "[3, 7, -10, 'b']\n"
+    end
+  end
+
+  describe "pvec accumulator: raw :array threading through for-loop reduce" do
+    # `[0] * n` + index-write loops are the eval-corpus `seed_13048`
+    # hot path. The default lowering does `py_setitem({:py_pvec, _}, ..)`
+    # per iter — a helper call (dispatch + pattern match) plus a
+    # `{:py_pvec, ...}` tag-wrap allocation per write. For n in the
+    # hundreds of thousands these allocations + dispatch are the
+    # inner-loop cost driver. When the for-loop's reduce accumulator
+    # is statically pvec AND the body uses it only via
+    # `py_getitem(acc, k)` / `py_setitem(acc, k, v)`, the converter
+    # unwraps to the raw `:array` once before the loop, threads the
+    # array through the reduce, and rewraps once after.
+
+    test "single-pvec write loop unwraps once, uses raw :array, rewraps once" do
+      src = """
+      def f(n):
+          a = [0] * n
+          for i in range(n):
+              a[i] = i * 2
+          return a[5]
+      print(f(10))
+      """
+
+      out = Pylixir.transpile(src)
+      # Pre-loop unwrap.
+      assert out =~ ~r/\{:py_pvec, a_pvec_arr\} = a/
+      # Loop body uses the raw-array helpers, not the wrapped ones.
+      assert out =~ "py_pvec_arr_set(a_pvec_arr"
+      refute out =~ ~r/Enum\.reduce\([^,]+, a, fn[^>]*->[^>]*py_setitem/
+      # Post-loop rewrap.
+      assert out =~ ~r/a = \{:py_pvec, a_pvec_arr\}/
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      assert stdout == "10\n"
+    end
+
+    test "pvec body with reads AND writes (suffix-min shape from seed_13048)" do
+      src = """
+      def f(n):
+          a = [0] * n
+          for i in range(n):
+              a[i] = i + 1
+          suffix_min = [0] * n
+          suffix_min[n - 1] = a[n - 1]
+          for i in range(n - 2, -1, -1):
+              suffix_min[i] = min(a[i], suffix_min[i + 1])
+          return suffix_min[0]
+      print(f(5))
+      """
+
+      out = Pylixir.transpile(src)
+      # Both loop bodies use the raw-array helpers for their pvec
+      # accumulators. The cross-pvec read of `a` inside `suffix_min`'s
+      # loop body stays as `py_getitem(a, _)` (a is not the
+      # accumulator here). Regexes are whitespace-tolerant because
+      # the formatter wraps long call arg lists.
+      assert out =~ ~r/py_pvec_arr_set\(\s*a_pvec_arr/
+      assert out =~ ~r/py_pvec_arr_set\(\s*suffix_min_pvec_arr/
+      assert out =~ ~r/py_pvec_arr_get\(\s*suffix_min_pvec_arr/
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # a=[1,2,3,4,5]. suffix_min[4]=5; [3]=min(4,5)=4; [2]=min(3,4)=3;
+      # [1]=min(2,3)=2; [0]=min(1,2)=1.
+      assert stdout == "1\n"
+    end
+
+    test "non-subscript use of pvec accumulator bails (safety fallback)" do
+      # `len(a)` reads the whole pvec, not via py_setitem/py_getitem
+      # on the accumulator. The optimization must NOT apply or the
+      # rewriter would lose the pvec wrapper. Falls back to the
+      # default emission.
+      src = """
+      def f(n):
+          a = [0] * n
+          for i in range(n):
+              a[i] = len(a) + i
+          return a[0]
+      print(f(3))
+      """
+
+      out = Pylixir.transpile(src)
+      # The default emission is used (no unwrap/rewrap pair).
+      refute out =~ ~r/\{:py_pvec, a_pvec_arr\} = a/
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # a[0] = len(a) + 0 = 3.
+      assert stdout == "3\n"
+    end
+
+    test "uppercase-first Python name routes through Naming.rewrite (regression)" do
+      # `A_pvec_arr` would parse as an Elixir *alias* (Module name),
+      # not a variable, and the unwrap pattern match would silently
+      # fail. Use `Naming.rewrite(var)` to build the array-side name
+      # so it inherits the `var_`-prefix from the rewrite (e.g.
+      # `A` → `var_A` → `var_A_pvec_arr`, lowercase-first → variable).
+      src = """
+      def f(n):
+          A = [0] * n
+          for i in range(n):
+              A[i] = i * 3
+          return A[2]
+      print(f(5))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "var_A_pvec_arr"
+      refute out =~ ~r/\{:py_pvec, A_pvec_arr\}/
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      assert stdout == "6\n"
+    end
+
+    test "non-pvec accumulator (no [0]*n pattern) is unaffected" do
+      # Regression check: non-pvec accumulators stay on the default
+      # `Enum.reduce(iter, acc, fn ... -> ... end)` emission.
+      src = """
+      def f():
+          total = 0
+          for i in range(10):
+              total = total + i
+          return total
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+      refute out =~ "_pvec_arr"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      assert stdout == "45\n"
+    end
+  end
+
   describe "AppendBuildAnalysis: .sort() as tail finalizer" do
     test "xs = []; for: xs.append; xs.sort(); xs[0] avoids py_append fallback" do
       # Exact shape responsible for the `seed_13048` :elixir_timeout in
@@ -789,8 +980,12 @@ defmodule Pylixir.SpecializationTest do
       # The original list( ) bind is also a freeze (existing behavior).
       assert out =~ ~r/var_L\s*=\s*py_alist_new\(/
 
-      [{mod, _}] = Code.compile_string(out)
-      stdout = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      # Route the run through `TranspileHelpers.run_source/1` (strips
+      # the trailing `TranslatedCode.py_main()` call before compiling
+      # and captures stdout). A bare `Code.compile_string(out)` runs
+      # the call uncaptured and leaks the program output into the
+      # test runner's stdout.
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
       # L after rebind: [0, 0, 1, 2, 3, 4]; L[3] = 2.
       assert stdout == "2\n"
     end
@@ -807,8 +1002,7 @@ defmodule Pylixir.SpecializationTest do
       out = Pylixir.transpile(src)
       assert out =~ "var_L = py_alist_new(py_iter_to_list(var_L) ++ [-1])"
 
-      [{mod, _}] = Code.compile_string(out)
-      stdout = ExUnit.CaptureIO.capture_io(fn -> mod.py_main() end)
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
       # L = [0, 1, 2, -1]; L[3] = -1.
       assert stdout == "-1\n"
     end
