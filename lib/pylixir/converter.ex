@@ -185,6 +185,16 @@ defmodule Pylixir.Converter do
   recursive calls so nested constructs can update scope / counters.
   """
   @spec convert(map(), Context.t()) :: {elixir_ast(), Context.t()}
+  def convert(%{"_type" => "UnaryOp", "op" => %{"_type" => "Not"}, "operand" => operand}, context) do
+    # `not x` — try type-aware emit (e.g. `x == ""` when x is :str)
+    # before falling back to the polymorphic `!truthy?(x)`. Keeps the
+    # rest of the unary ops on the simpler ast-only dispatch.
+    operand_type = TypeInfer.infer_expr(operand, context)
+    {operand_ast, context} = convert(operand, context)
+    {typed_truthy_test(operand_ast, operand_type, :negative) ||
+       {:!, [], [{:truthy?, [], [operand_ast]}]}, context}
+  end
+
   def convert(%{"_type" => "UnaryOp", "op" => op, "operand" => operand} = node, context) do
     {operand_ast, context} = convert(operand, context)
     {unary_op_ast(op, operand_ast, node), context}
@@ -1475,6 +1485,11 @@ defmodule Pylixir.Converter do
     {:!, [], [{:truthy?, [], [operand_ast]}]}
   end
 
+  # Type-aware emit for `not <expr>` — see `unary_op_not/3` below. Kept
+  # as a separate dispatch path because the type-aware version needs
+  # the original operand node + context (to infer type) while the
+  # ast-only `unary_op_ast/3` clauses receive only the converted AST.
+
   defp unary_op_ast(%{"_type" => other}, _operand_ast, node) do
     raise UnsupportedNodeError,
       node_type: other,
@@ -2573,10 +2588,25 @@ defmodule Pylixir.Converter do
 
     wrapped =
       cond do
-        constant_bool_node?(test_node) -> {:truthy?, [], [test_ast]}
-        inferred_type == {:bool} -> test_ast
-        BoolReturning.bool_returning?(test_node) -> test_ast
-        true -> {:truthy?, [], [test_ast]}
+        constant_bool_node?(test_node) ->
+          {:truthy?, [], [test_ast]}
+
+        inferred_type == {:bool} ->
+          test_ast
+
+        BoolReturning.bool_returning?(test_node) ->
+          test_ast
+
+        # Type-aware specialization for the well-defined non-bool
+        # truthy patterns (str empty-check, list/tuple empty-check,
+        # int/float zero-check, set empty-check). Skipping `{:dict, _, _}`
+        # because alist optimisation makes the runtime form
+        # context-dependent.
+        specialized = typed_truthy_test(test_ast, inferred_type, :positive) ->
+          specialized
+
+        true ->
+          {:truthy?, [], [test_ast]}
       end
 
     {wrapped, context}
@@ -2584,6 +2614,58 @@ defmodule Pylixir.Converter do
 
   defp constant_bool_node?(%{"_type" => "Constant", "value" => v}) when is_boolean(v), do: true
   defp constant_bool_node?(_), do: false
+
+  # Specialized truthy/falsy emit for known scalar/container types.
+  # Returns the specialized AST or `nil` (caller falls back to
+  # `truthy?(operand)` for positive or `!truthy?(operand)` for negative).
+  #
+  # `:dict` deliberately omitted — alist-vs-map dispatch deferred.
+  # `:bytes` not in the lattice; bytes-typed expressions infer as `:any`.
+  #
+  # For {:list, _} and {:tuple, _} we route through `Enum.empty?/1` and
+  # `tuple_size/1` rather than `arr == []` / `t == {}`: Elixir's
+  # type-checker (1.18+) treats `non_empty_list(T) == empty_list()` and
+  # `{a, b, c} == {}` as comparisons between distinct types and emits a
+  # diagnostic on common patterns like `arr = [1,2]; if not arr: ...`.
+  # The function-call forms stay opaque to that analysis.
+  defp typed_truthy_test(operand_ast, type, polarity) do
+    op =
+      case polarity do
+        :positive -> :!=
+        :negative -> :==
+      end
+
+    case type do
+      {:str} ->
+        {op, [], [operand_ast, ""]}
+
+      {:int} ->
+        {op, [], [operand_ast, 0]}
+
+      {:int_lit_nonneg} ->
+        {op, [], [operand_ast, 0]}
+
+      {:float} ->
+        {op, [], [operand_ast, 0.0]}
+
+      {:list, _} ->
+        empty_call = {{:., [], [{:__aliases__, [], [:Enum]}, :empty?]}, [], [operand_ast]}
+
+        case polarity do
+          :positive -> {:!, [], [empty_call]}
+          :negative -> empty_call
+        end
+
+      {:tuple, _} ->
+        {op, [], [{:tuple_size, [], [operand_ast]}, 0]}
+
+      {:set} ->
+        {op, [], [{{:., [], [{:__aliases__, [], [:MapSet]}, :size]}, [], [operand_ast]}, 0]}
+
+      _ ->
+        nil
+    end
+  end
 
   @doc false
   def body_to_block([]), do: nil
