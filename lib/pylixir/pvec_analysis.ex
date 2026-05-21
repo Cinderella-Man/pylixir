@@ -353,6 +353,17 @@ defmodule Pylixir.PvecAnalysis do
     args_leak or Enum.any?(kws, &leak_in?(&1, name))
   end
 
+  # `return xs` — admitted as safe. The caller receives the
+  # `{:py_pvec, _}` value as-is; py_getitem/py_setitem and all
+  # iter-consumers handle the tag transparently. Without this clause
+  # a helper function that builds and returns a pvec would fall back
+  # to a plain list lowering (eval-corpus `seed_14984` shape:
+  # `def compute_counts(n): xs = [0] * n; …; return xs` — `s=10⁶`
+  # wedged at O(n²) `List.replace_at` per write).
+  defp leak_in?(%{"_type" => "Return", "value" => %{"_type" => "Name", "id" => id}}, name)
+       when id == name,
+       do: false
+
   # Bare `Name(xs)` not absorbed by a safe-slot clause = leak.
   defp leak_in?(%{"_type" => "Name", "id" => id}, name) when id == name, do: true
 

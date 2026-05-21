@@ -110,6 +110,26 @@ defmodule Pylixir.Nodes.Functions do
     saved_self = context.recursive_self_binding
     saved_return_mode = context.return_mode
 
+    # Run the per-scope analyses on the nested body so emissions
+    # inside the closure see the same optimization opportunities as
+    # a top-level def: `PvecAnalysis` lets `xs = [0] * n` (where `n`
+    # is a parameter) lower to `py_pvec_new`, etc. Without this, a
+    # helper like `def compute_counts(n): xs = [0] * n; ...` lowered
+    # `xs` to a plain list and writes to `List.replace_at` (O(n) per
+    # call → O(n²) per loop). Save/restore mirrors the top-level
+    # `def` path in `function_def/2`.
+    saved_freezable_names = context.freezable_names
+    saved_append_build_names = context.append_build_names
+    saved_append_build_type_refinable = context.append_build_type_refinable
+    saved_append_build_element_types = context.append_build_element_types
+    saved_append_build_freeze_after = context.append_build_freeze_after
+    saved_pvec_names = context.pvec_names
+
+    {append_names, append_freeze_after} = Pylixir.AppendBuildAnalysis.analyze(body, name)
+
+    append_type_refinable =
+      Pylixir.AppendBuildAnalysis.type_refinable_names(body, name)
+
     inner_scope_names =
       if recursive?, do: param_names ++ ["self"], else: param_names
 
@@ -117,16 +137,29 @@ defmodule Pylixir.Nodes.Functions do
       context
       | scopes: [MapSet.new(inner_scope_names) | context.scopes],
         recursive_self_binding: if(recursive?, do: name, else: saved_self),
-        return_mode: return_mode
+        return_mode: return_mode,
+        freezable_names: Pylixir.AlistAnalysis.freezable_names(body, name),
+        append_build_names: append_names,
+        append_build_type_refinable: append_type_refinable,
+        append_build_element_types: %{},
+        append_build_freeze_after: append_freeze_after,
+        pvec_names: Pylixir.PvecAnalysis.analyze(body, name)
     }
 
-    {body_asts, context} = Converter.convert_each(strip_docstring(body), context)
+    {body_asts, context} =
+      Converter.convert_each_with_freezes(strip_docstring(body), context)
 
     context = %{
       context
       | scopes: saved_scopes,
         recursive_self_binding: saved_self,
-        return_mode: saved_return_mode
+        return_mode: saved_return_mode,
+        freezable_names: saved_freezable_names,
+        append_build_names: saved_append_build_names,
+        append_build_type_refinable: saved_append_build_type_refinable,
+        append_build_element_types: saved_append_build_element_types,
+        append_build_freeze_after: saved_append_build_freeze_after,
+        pvec_names: saved_pvec_names
     }
 
     body_block =
@@ -211,6 +244,21 @@ defmodule Pylixir.Nodes.Functions do
     append_type_refinable =
       Pylixir.AppendBuildAnalysis.type_refinable_names(body, py_name)
 
+    pvec_names = Pylixir.PvecAnalysis.analyze(body, py_name)
+
+    # Override the inferred return type with `{:py_pvec, :any}` when
+    # the function ends `return <name>` for any pvec-admitted name.
+    # `Signatures.infer/3` runs before per-fn conversion and so sees
+    # the pre-lowering type (`{:list, _}` for `[0] * n`), which the
+    # ExampleInference trace would also agree with. Without this
+    # override, the call site binds the result as `{:list, _}` and
+    # iter-consumers (`max/sum/min/sorted/...`) skip their
+    # `py_iter_to_list` wrap via `coerce_iter/is_list?` — at runtime
+    # the value is `{:py_pvec, _}` and `Enum.max` crashes with
+    # `Protocol.UndefinedError`.
+    fn_signatures =
+      maybe_override_return_to_pvec(context.fn_signatures, py_name, body, pvec_names)
+
     context = %{
       context
       | scopes: [new_scope | context.scopes],
@@ -222,7 +270,8 @@ defmodule Pylixir.Nodes.Functions do
         append_build_type_refinable: append_type_refinable,
         append_build_element_types: %{},
         append_build_freeze_after: append_freeze_after,
-        pvec_names: Pylixir.PvecAnalysis.analyze(body, py_name)
+        pvec_names: pvec_names,
+        fn_signatures: fn_signatures
     }
 
     {doc, stripped_body} = extract_docstring(body)
@@ -527,6 +576,55 @@ defmodule Pylixir.Nodes.Functions do
        do: {v, rest}
 
   defp extract_docstring(body), do: {nil, body}
+
+  # If any top-level (same-function-scope) `return <name>` returns
+  # a pvec-admitted name, override `fn_signatures[py_name]` so the
+  # call site binds the result as `{:py_pvec, :any}` — matches what
+  # the lowering actually produces. Leaves unrelated entries (and
+  # the param-types portion of the signature) untouched.
+  defp maybe_override_return_to_pvec(fn_signatures, _py_name, _body, pvec_names)
+       when map_size(pvec_names) == 0,
+       do: fn_signatures
+
+  defp maybe_override_return_to_pvec(fn_signatures, py_name, body, pvec_names) do
+    if returns_pvec_name?(body, pvec_names) do
+      case Map.get(fn_signatures, py_name) do
+        {params, _ret} -> Map.put(fn_signatures, py_name, {params, {:py_pvec, :any}})
+        _ -> fn_signatures
+      end
+    else
+      fn_signatures
+    end
+  end
+
+  # Walk body looking for `return <name>` where name is a pvec key.
+  # Don't descend into nested `FunctionDef`/`Lambda` bodies — those
+  # have their own return semantics.
+  defp returns_pvec_name?(body, pvec_names) when is_list(body) do
+    Enum.any?(body, &returns_pvec_name_node?(&1, pvec_names))
+  end
+
+  defp returns_pvec_name_node?(
+         %{"_type" => "Return", "value" => %{"_type" => "Name", "id" => id}},
+         pvec_names
+       ),
+       do: Map.has_key?(pvec_names, id)
+
+  defp returns_pvec_name_node?(%{"_type" => type}, _pvec_names)
+       when type in ["FunctionDef", "AsyncFunctionDef", "Lambda", "ClassDef"],
+       do: false
+
+  defp returns_pvec_name_node?(%{"_type" => _} = node, pvec_names) do
+    node
+    |> Map.delete("_type")
+    |> Enum.any?(fn {_k, v} -> returns_pvec_name_node?(v, pvec_names) end)
+  end
+
+  defp returns_pvec_name_node?(list, pvec_names) when is_list(list) do
+    Enum.any?(list, &returns_pvec_name_node?(&1, pvec_names))
+  end
+
+  defp returns_pvec_name_node?(_, _), do: false
 
   defp self_referential?(body, name) do
     Enum.any?(body, fn stmt ->

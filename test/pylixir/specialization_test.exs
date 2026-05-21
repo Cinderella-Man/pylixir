@@ -790,6 +790,108 @@ defmodule Pylixir.SpecializationTest do
     end
   end
 
+  describe "PvecAnalysis: `return xs` doesn't disqualify pvec freeze" do
+    # Eval-corpus `seed_14984` shape: a helper function builds a
+    # `[0] * n` pvec, fills it via index-writes in a loop, then
+    # `return`s it. Without admitting the bare-`Name` return as
+    # safe, PvecAnalysis flagged it as a leak — the result lowered
+    # to `py_mult([0], n)` (a plain Elixir list) and each `xs[i] = v`
+    # became `List.replace_at` (O(n) per write) → O(n²) per call.
+    # For n=10⁶ the testcase wedged the eval harness for minutes.
+
+    test "helper returns the pvec; caller binds and indexes it" do
+      src = """
+      def f(n):
+          xs = [0] * n
+          for i in range(n):
+              xs[i] = i + 1
+          return xs
+
+      def main():
+          xs = f(5)
+          return xs[3]
+
+      print(main())
+      """
+
+      out = Pylixir.transpile(src)
+      # The bind lowers to `py_pvec_new`, not `py_mult([0], n)`.
+      assert out =~ "py_pvec_new(n, 0)"
+      refute out =~ "py_mult([0]"
+      # And the loop writes don't go through `List.replace_at`
+      # (which is what the non-pvec fallback would emit).
+      refute out =~ "List.replace_at"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      assert stdout == "4\n"
+    end
+
+    test "caller's iter-consuming ops on the returned pvec wrap correctly" do
+      # Regression check for the issue exposed when ExampleInference
+      # was on: the trace observed `compute_counts` returning a
+      # Python list; without updating `fn_signatures` to reflect the
+      # pvec lowering, the call-site bound the result as
+      # `{:list, _}` and `Enum.max(count_x)` skipped the
+      # `py_iter_to_list` wrap (per `coerce_iter`/`is_list?`) — at
+      # runtime `count_x` was `{:py_pvec, _}` and Enum.max crashed.
+      src = """
+      def f(size):
+          xs = [0] * size
+          for i in range(size):
+              xs[i] = i + 1
+          return xs
+
+      def main():
+          xs = f(5)
+          return max(xs) + sum(xs)
+
+      print(main())
+      """
+
+      # `examples` enables ExampleInference, which is what surfaces
+      # the underlying type-mismatch (trace observes Python `list`
+      # return; Pylixir lowering produces `{:py_pvec, _}`).
+      out = Pylixir.transpile(src, examples: [%{stdin: ""}])
+      # The iter-consumers on the returned pvec must wrap with
+      # `py_iter_to_list` (pvec isn't enumerable directly). The
+      # trace observed `f` returning a Python list, but the lowering
+      # produces a pvec — without the wrap, `Enum.max` crashes with
+      # Protocol.UndefinedError at runtime.
+      assert out =~ "Enum.max(py_iter_to_list(xs))"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # max(xs)=5, sum(xs)=15 → 20.
+      assert stdout == "20\n"
+    end
+
+    test "caller iterates the returned pvec" do
+      src = """
+      def f(n):
+          xs = [0] * n
+          for i in range(n):
+              xs[i] = i * i
+          return xs
+
+      def main():
+          ys = f(10)
+          total = 0
+          for i in range(10):
+              total = total + ys[i]
+          return total
+
+      print(main())
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "py_pvec_new(n, 0)"
+      refute out =~ "py_mult([0]"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # sum(i*i for i in range(10)) = 0+1+4+9+16+25+36+49+64+81 = 285.
+      assert stdout == "285\n"
+    end
+  end
+
   describe "pvec accumulator: raw :array threading through for-loop reduce" do
     # `[0] * n` + index-write loops are the eval-corpus `seed_13048`
     # hot path. The default lowering does `py_setitem({:py_pvec, _}, ..)`
