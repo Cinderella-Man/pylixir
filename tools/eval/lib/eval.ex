@@ -69,10 +69,20 @@ defmodule Eval do
           | {:max_examples, pos_integer()}
         ]
 
-  @default_concurrency_multiplier 2
+  # Dropped from 2× — at 2× schedulers, the `seed_13048`-shape pvec
+  # hot loops compete for cores hard enough that their per-process
+  # wall time can balloon past the elixir timeout under any external
+  # CPU contention (editor, browser, concurrent `mix test`). 1× keeps
+  # each scheduler fed without oversubscription. Trade-off: eval runs
+  # take ~2× wall time, acceptable for a maintainer-only harness.
+  @default_concurrency_multiplier 1
   @default_samples_per_bucket 10
   @default_python_timeout_ms 10_000
-  @default_elixir_timeout_ms 10_000
+  # Bumped from 10s — `seed_13048`-shape pvec hot loops sit at
+  # ~1.8s single-process, which even at 1×-schedulers can tip over
+  # 10s under external CPU contention. 30s absorbs the noise while
+  # still flagging genuine algorithmic regressions.
+  @default_elixir_timeout_ms 30_000
 
   @spec run(opts()) :: accumulator()
   def run(opts \\ []) do
@@ -132,13 +142,19 @@ defmodule Eval do
     }
 
     enumerable
-    |> Stream.each(on_sample)
     |> Task.async_stream(
       fn record -> attempt(record, attempt_opts) end,
       max_concurrency: concurrency,
       ordered: false,
       timeout: :infinity
     )
+    # `on_sample` fires per *completed* job, not per record entering
+    # the pipeline. `Task.async_stream` pulls records eagerly to keep
+    # its worker pool full, so under low concurrency the input
+    # enumeration finishes long before the last few slow jobs do —
+    # ticking on input would show "100/100 processed" while five
+    # `seed_13048` workers are still grinding.
+    |> Stream.each(on_sample)
     |> Enum.reduce(initial, fn
       {:ok, {sample, bucket_key, metadata}}, acc ->
         cap = if bucket_key == :ok, do: save_ok, else: samples_per_bucket

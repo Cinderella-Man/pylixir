@@ -692,15 +692,21 @@ defmodule Pylixir.Nodes.Loop do
   end
 
   defp emit_for_reduce_single(iter_ast, target_ast, var, body_asts, pre_ctx, flow, context) do
+    acc_inlineable? = pvec_accumulator_inlinable?(var, body_asts, context)
+    ro_pvec_names = readonly_pvec_names_in_body(body_asts, var, context)
+
     cond do
-      pvec_accumulator_inlinable?(var, body_asts, context) ->
-        emit_for_reduce_single_pvec_inline(
+      acc_inlineable? or ro_pvec_names != [] ->
+        emit_for_reduce_single_pvec_specialized(
           iter_ast,
           target_ast,
           var,
           body_asts,
+          pre_ctx,
           flow,
-          context
+          context,
+          acc_inlineable?,
+          ro_pvec_names
         )
 
       true ->
@@ -741,50 +747,119 @@ defmodule Pylixir.Nodes.Loop do
     {{:=, [], [acc_ref, rhs]}, context}
   end
 
-  # Pvec-accumulator specialization: when the reduce accumulator is
-  # statically `{:py_pvec, _}` and the body uses it only via
-  # `py_getitem(acc, k)` / `py_setitem(acc, k, v)` (with `acc` as
-  # the first arg), unwrap to the raw `:array` once before the loop,
-  # thread the array through the reduce via the `py_pvec_arr_*`
-  # helpers, and rewrap once after. Saves the `{:py_pvec, _}`
-  # allocation per iter.
-  defp emit_for_reduce_single_pvec_inline(
+  # Pvec specialization for a single-accumulator reduce. Handles two
+  # independent rewrites; either or both may fire:
+  #
+  #   1. Accumulator write-spec (`acc_inlineable?`): when the
+  #      accumulator itself is `{:py_pvec, _}` and the body uses it
+  #      only via `py_getitem(acc, k)` / `py_setitem(acc, k, v)`,
+  #      unwrap before the loop, thread the raw `:array` through the
+  #      reduce via `py_pvec_arr_set/get`, rewrap after. Saves the
+  #      `{:py_pvec, _}` tag-wrap allocation per iter.
+  #
+  #   2. Read-only pvec spec (`ro_pvec_names`): for each pvec-typed
+  #      name (other than the accumulator) used in the body via
+  #      `py_getitem(name, _)` only — no writes, no bare references —
+  #      unwrap once before the loop and rewrite reads to the raw
+  #      `py_pvec_arr_get/2` helper. No rewrap needed; the wrapped
+  #      `name` is still in scope outside the loop and is unchanged
+  #      by reads.
+  defp emit_for_reduce_single_pvec_specialized(
          iter_ast,
          target_ast,
          var,
          body_asts,
+         pre_ctx,
          flow,
-         context
+         context,
+         acc_inlineable?,
+         ro_pvec_names
        ) do
-    rewritten = Naming.rewrite(var)
-    var_atom = String.to_atom(rewritten)
-    # Build the array-side name from the *rewritten* var name so we
-    # inherit the "lowercase first letter" guarantee — `Naming.rewrite`
-    # prefixes uppercase-first Python names with `var_` to avoid them
-    # parsing as Elixir aliases (e.g. `A` → `var_A`). Without going
-    # through `rewrite`, `A_pvec_arr` would be an alias, not a
-    # variable, and the unwrap match would silently fail.
-    arr_atom = String.to_atom("#{rewritten}_pvec_arr")
-    var_ref = {var_atom, [], nil}
-    arr_ref = {arr_atom, [], nil}
+    rewritten_var = Naming.rewrite(var)
+    acc_atom = String.to_atom(rewritten_var)
+    acc_ref = {acc_atom, [], nil}
 
-    rewritten_body = Enum.map(body_asts, &rewrite_pvec_acc(&1, var_atom, arr_atom))
+    # Acc-side names (nil when no write-spec).
+    acc_arr_atom =
+      if acc_inlineable?, do: String.to_atom("#{rewritten_var}_pvec_arr"), else: nil
 
-    inner_body = Converter.body_to_block(rewritten_body ++ [arr_ref])
-    inner_body = maybe_continue_iter(inner_body, arr_ref, elem(flow, 1))
+    # Read-only rewrites: list of {name_atom, arr_atom} for each
+    # ro pvec name. Suffix `_ro` makes the intent obvious in the
+    # emitted source.
+    ro_rewrites =
+      Enum.map(ro_pvec_names, fn name ->
+        rw = Naming.rewrite(name)
+        {String.to_atom(rw), String.to_atom("#{rw}_pvec_arr_ro")}
+      end)
 
-    fn_ast = {:fn, [], [{:->, [], [[target_ast, arr_ref], inner_body]}]}
+    # Combined map for body rewriting: covers both the accumulator
+    # (writes + reads) and ro pvecs (reads only).
+    {acc_write_atom, body_acc_arr_atom} =
+      case acc_arr_atom do
+        nil -> {nil, nil}
+        atom -> {acc_atom, atom}
+      end
+
+    rewritten_body =
+      Enum.map(
+        body_asts,
+        &rewrite_for_pvec_specialized(&1, acc_write_atom, body_acc_arr_atom, ro_rewrites)
+      )
+
+    # Accumulator ref used inside the reduce closure.
+    inner_acc_ref =
+      case acc_arr_atom do
+        nil -> acc_ref
+        atom -> {atom, [], nil}
+      end
+
+    inner_body = Converter.body_to_block(rewritten_body ++ [inner_acc_ref])
+    inner_body = maybe_continue_iter(inner_body, inner_acc_ref, elem(flow, 1))
+
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, inner_acc_ref], inner_body]}]}
+
+    # Initial value: the unwrapped raw `:array` (post-unwrap binding)
+    # when acc-spec fires, otherwise the existing `initial_ref` path.
+    initial =
+      case acc_arr_atom do
+        nil -> initial_ref(var, pre_ctx)
+        atom -> {atom, [], nil}
+      end
 
     reduce =
-      {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, arr_ref, fn_ast]}
+      {{:., [], [{:__aliases__, [], [:Enum]}, :reduce]}, [], [iter_ast, initial, fn_ast]}
 
-    rhs = maybe_break_reduce(reduce, arr_ref, elem(flow, 0))
+    rhs = maybe_break_reduce(reduce, inner_acc_ref, elem(flow, 0))
 
-    unwrap = {:=, [], [{:py_pvec, arr_ref}, var_ref]}
-    reduce_assign = {:=, [], [arr_ref, rhs]}
-    rewrap = {:=, [], [var_ref, {:py_pvec, arr_ref}]}
+    # Pre-loop block: read-only unwraps, then acc unwrap (so the acc
+    # unwrap can be the last setup step before the reduce — matches
+    # the order a human would write).
+    ro_unwraps =
+      Enum.map(ro_rewrites, fn {name_atom, arr_atom} ->
+        {:=, [], [{:py_pvec, {arr_atom, [], nil}}, {name_atom, [], nil}]}
+      end)
 
-    block = {:__block__, [], [unwrap, reduce_assign, rewrap]}
+    acc_unwrap =
+      case acc_arr_atom do
+        nil -> []
+        atom -> [{:=, [], [{:py_pvec, {atom, [], nil}}, acc_ref]}]
+      end
+
+    # Reduce + post-loop rewrap (only if acc-spec fires).
+    reduce_and_rewrap =
+      case acc_arr_atom do
+        nil ->
+          [{:=, [], [acc_ref, rhs]}]
+
+        atom ->
+          [
+            {:=, [], [{atom, [], nil}, rhs]},
+            {:=, [], [acc_ref, {:py_pvec, {atom, [], nil}}]}
+          ]
+      end
+
+    stmts = ro_unwraps ++ acc_unwrap ++ reduce_and_rewrap
+    block = {:__block__, [], stmts}
     context = Converter.bind_name(context, var)
     {block, context}
   end
@@ -842,49 +917,161 @@ defmodule Pylixir.Nodes.Loop do
 
   defp safe_subexpr?(_, _), do: true
 
-  # Rewrite step: replace py_getitem / py_setitem on the accumulator
-  # with raw-array helpers, and rename the bare LHS in
-  # `acc = <rhs>` mutations from `var` to `var_arr`.
-  defp rewrite_pvec_acc(
+  # Unified body rewriter for the pvec specialization. Takes the
+  # accumulator's atom + array-side atom (both nil when acc-spec is
+  # not firing) and a list of `{name_atom, arr_atom}` rewrites for
+  # read-only pvec names. Rewrites:
+  #
+  #   - `py_getitem(acc, k)` → `py_pvec_arr_get(acc_arr, k)`
+  #   - `py_setitem(acc, k, v)` → `py_pvec_arr_set(acc_arr, k, v)`
+  #   - LHS of `acc = …` mutations → `acc_arr = …`
+  #   - `py_getitem(ro_name, k)` → `py_pvec_arr_get(ro_arr, k)`
+  #     (no write rewrites for ro names — they're guarded read-only).
+  defp rewrite_for_pvec_specialized(node, acc_atom, acc_arr_atom, ro_rewrites)
+
+  defp rewrite_for_pvec_specialized(
          {:py_getitem, m, [{atom, _, nil}, k]},
-         var_atom,
-         arr_atom
-       )
-       when atom == var_atom do
-    {:py_pvec_arr_get, m, [{arr_atom, [], nil}, rewrite_pvec_acc(k, var_atom, arr_atom)]}
+         acc_atom,
+         acc_arr_atom,
+         ro_rewrites
+       ) do
+    cond do
+      acc_atom != nil and atom == acc_atom ->
+        {:py_pvec_arr_get, m,
+         [
+           {acc_arr_atom, [], nil},
+           rewrite_for_pvec_specialized(k, acc_atom, acc_arr_atom, ro_rewrites)
+         ]}
+
+      arr_atom = Keyword.get(ro_rewrites, atom) ->
+        {:py_pvec_arr_get, m,
+         [
+           {arr_atom, [], nil},
+           rewrite_for_pvec_specialized(k, acc_atom, acc_arr_atom, ro_rewrites)
+         ]}
+
+      true ->
+        {:py_getitem, m,
+         [
+           {atom, [], nil},
+           rewrite_for_pvec_specialized(k, acc_atom, acc_arr_atom, ro_rewrites)
+         ]}
+    end
   end
 
-  defp rewrite_pvec_acc(
+  defp rewrite_for_pvec_specialized(
          {:py_setitem, m, [{atom, _, nil}, k, v]},
-         var_atom,
-         arr_atom
+         acc_atom,
+         acc_arr_atom,
+         ro_rewrites
        )
-       when atom == var_atom do
+       when acc_atom != nil and atom == acc_atom do
     {:py_pvec_arr_set, m,
      [
-       {arr_atom, [], nil},
-       rewrite_pvec_acc(k, var_atom, arr_atom),
-       rewrite_pvec_acc(v, var_atom, arr_atom)
+       {acc_arr_atom, [], nil},
+       rewrite_for_pvec_specialized(k, acc_atom, acc_arr_atom, ro_rewrites),
+       rewrite_for_pvec_specialized(v, acc_atom, acc_arr_atom, ro_rewrites)
      ]}
   end
 
-  defp rewrite_pvec_acc({:=, m, [{atom, _, nil}, rhs]}, var_atom, arr_atom)
-       when atom == var_atom do
-    {:=, m, [{arr_atom, [], nil}, rewrite_pvec_acc(rhs, var_atom, arr_atom)]}
+  defp rewrite_for_pvec_specialized(
+         {:=, m, [{atom, _, nil}, rhs]},
+         acc_atom,
+         acc_arr_atom,
+         ro_rewrites
+       )
+       when acc_atom != nil and atom == acc_atom do
+    {:=, m,
+     [
+       {acc_arr_atom, [], nil},
+       rewrite_for_pvec_specialized(rhs, acc_atom, acc_arr_atom, ro_rewrites)
+     ]}
   end
 
-  defp rewrite_pvec_acc(node, var_atom, arr_atom) when is_tuple(node) do
+  defp rewrite_for_pvec_specialized(node, acc_atom, acc_arr_atom, ro_rewrites)
+       when is_tuple(node) do
     node
     |> Tuple.to_list()
-    |> Enum.map(&rewrite_pvec_acc(&1, var_atom, arr_atom))
+    |> Enum.map(&rewrite_for_pvec_specialized(&1, acc_atom, acc_arr_atom, ro_rewrites))
     |> List.to_tuple()
   end
 
-  defp rewrite_pvec_acc(list, var_atom, arr_atom) when is_list(list) do
-    Enum.map(list, &rewrite_pvec_acc(&1, var_atom, arr_atom))
+  defp rewrite_for_pvec_specialized(list, acc_atom, acc_arr_atom, ro_rewrites)
+       when is_list(list) do
+    Enum.map(list, &rewrite_for_pvec_specialized(&1, acc_atom, acc_arr_atom, ro_rewrites))
   end
 
-  defp rewrite_pvec_acc(other, _, _), do: other
+  defp rewrite_for_pvec_specialized(other, _, _, _), do: other
+
+  # Find pvec-typed names referenced in the body whose use is
+  # *strictly* read-only (every reference appears as the first arg
+  # of `py_getitem(name, _)` — no `py_setitem`, no bare references).
+  # Excludes the accumulator (handled separately by the acc-write
+  # spec). Returns Python names (not atoms) so the caller can use
+  # the same `Naming.rewrite` discipline as elsewhere.
+  defp readonly_pvec_names_in_body(body_asts, exclude_var, context) do
+    Enum.flat_map(context.types, fn {name, type} ->
+      cond do
+        name == exclude_var ->
+          []
+
+        match?({:py_pvec, _}, type) ->
+          name_atom = name |> Naming.rewrite() |> String.to_atom()
+
+          if name_referenced?(body_asts, name_atom) and
+               body_uses_readonly?(body_asts, name_atom) do
+            [name]
+          else
+            []
+          end
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  defp name_referenced?(node, name_atom)
+  defp name_referenced?({atom, _, nil}, name_atom) when atom == name_atom, do: true
+
+  defp name_referenced?(node, name_atom) when is_tuple(node) do
+    node |> Tuple.to_list() |> Enum.any?(&name_referenced?(&1, name_atom))
+  end
+
+  defp name_referenced?(list, name_atom) when is_list(list) do
+    Enum.any?(list, &name_referenced?(&1, name_atom))
+  end
+
+  defp name_referenced?(_, _), do: false
+
+  # True when every reference to `name_atom` in `node` is inside
+  # `py_getitem(name, _)` (read), and no bare references / writes
+  # exist. Mirrors `safe_subexpr?/2` (the accumulator side) but
+  # forbids `py_setitem` entirely.
+  defp body_uses_readonly?(node, name_atom)
+
+  defp body_uses_readonly?({:py_getitem, _, [{atom, _, nil}, k]}, name_atom)
+       when atom == name_atom,
+       do: body_uses_readonly?(k, name_atom)
+
+  defp body_uses_readonly?({:py_setitem, _, [{atom, _, nil}, _, _]}, name_atom)
+       when atom == name_atom,
+       do: false
+
+  defp body_uses_readonly?({atom, _, nil}, name_atom) when atom == name_atom, do: false
+
+  defp body_uses_readonly?({:fn, _, clauses}, name_atom),
+    do: body_uses_readonly?(clauses, name_atom)
+
+  defp body_uses_readonly?(node, name_atom) when is_tuple(node) do
+    node |> Tuple.to_list() |> Enum.all?(&body_uses_readonly?(&1, name_atom))
+  end
+
+  defp body_uses_readonly?(list, name_atom) when is_list(list) do
+    Enum.all?(list, &body_uses_readonly?(&1, name_atom))
+  end
+
+  defp body_uses_readonly?(_, _), do: true
 
   defp emit_for_reduce_tuple(
          iter_ast,

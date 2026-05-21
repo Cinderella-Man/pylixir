@@ -901,6 +901,95 @@ defmodule Pylixir.SpecializationTest do
       assert stdout == "6\n"
     end
 
+    test "read-only pvec in body (non-pvec accumulator) gets unwrapped before loop" do
+      # The third loop in `seed_13048` sample 001: the accumulator
+      # is `count` (int), but `min_a` (a `[0] * n` pvec) is *read*
+      # inside the body. Without read-only specialization, every
+      # `py_getitem(min_a, _)` dispatches through the helper. With
+      # it, `min_a` is unwrapped once before the loop and reads use
+      # the raw-array helper directly.
+      src = """
+      def f(n):
+          xs = [0] * n
+          for i in range(n):
+              xs[i] = i * 10
+          count = 0
+          for j in range(n):
+              if xs[j] > 50:
+                  count = count + 1
+          return count
+      print(f(20))
+      """
+
+      out = Pylixir.transpile(src)
+      # Read-only unwrap of xs before the second loop (no rewrap
+      # since the value is unchanged).
+      assert out =~ ~r/\{:py_pvec, xs_pvec_arr_ro\} = xs/
+      # Body reads use the raw-array helper.
+      assert out =~ "py_pvec_arr_get(xs_pvec_arr_ro"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # xs = [0, 10, 20, ..., 190]. Values > 50: 60, 70, ..., 190 → 14 values.
+      assert stdout == "14\n"
+    end
+
+    test "pvec used both as accumulator AND read elsewhere combines both opts" do
+      # The second loop in `seed_13048` sample 001: `min_a` is the
+      # accumulator (write-spec applied) AND `a` is read in the body
+      # (read-only-spec applied). Both unwraps should fire.
+      src = """
+      def f(n):
+          a = [0] * n
+          for i in range(n):
+              a[i] = i + 1
+          b = [0] * n
+          for i in range(n - 1, -1, -1):
+              b[i] = a[i] * 2
+          return b[3]
+      print(f(5))
+      """
+
+      out = Pylixir.transpile(src)
+      # First loop: a as accumulator (write-spec).
+      assert out =~ ~r/\{:py_pvec, a_pvec_arr\} = a/
+      # Second loop: b as accumulator (write-spec) AND a as read-only.
+      assert out =~ ~r/\{:py_pvec, b_pvec_arr\} = b/
+      assert out =~ ~r/\{:py_pvec, a_pvec_arr_ro\} = a/
+      assert out =~ "py_pvec_arr_get(a_pvec_arr_ro"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # a = [1,2,3,4,5]; b = [2,4,6,8,10]; b[3] = 8.
+      assert stdout == "8\n"
+    end
+
+    test "read-only spec bails when pvec is also written in the body" do
+      # If the body has `py_setitem(name, _, _)` for a name that's
+      # NOT the accumulator, the read-only optimization can't apply
+      # (the writes would lose their effect — no rewrap would
+      # propagate the changes). Falls back to the generic emission.
+      src = """
+      def f(n):
+          a = [0] * n
+          b = [0] * n
+          for i in range(n):
+              b[i] = a[i] + 1
+              a[i] = i  # writes to a — a is NOT read-only here
+          return b[2]
+      print(f(5))
+      """
+
+      out = Pylixir.transpile(src)
+      # b should be accumulator-specialized (only its own assigns).
+      # a should NOT be read-only-specialized (it has a write).
+      refute out =~ "a_pvec_arr_ro"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # Per-iter (Python semantics, b is updated first, then a):
+      # i=0: b[0]=a[0]+1=1; a[0]=0. i=1: b[1]=a[1]+1=1; a[1]=1. Etc.
+      # b = [1,1,1,1,1]; b[2] = 1.
+      assert stdout == "1\n"
+    end
+
     test "non-pvec accumulator (no [0]*n pattern) is unaffected" do
       # Regression check: non-pvec accumulators stay on the default
       # `Enum.reduce(iter, acc, fn ... -> ... end)` emission.
