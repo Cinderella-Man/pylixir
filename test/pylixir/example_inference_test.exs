@@ -88,7 +88,12 @@ defmodule Pylixir.ExampleInferenceTest do
 
   describe "TypeInfer.bind/3 with assume_types (softened A′)" do
     setup do
-      ctx = %{Context.new() | assume_types: %{module: %{"x" => {:int}}}, assume_types_scope: :module}
+      ctx = %{
+        Context.new()
+        | assume_types: %{module: %{"x" => {:int}}},
+          assume_types_scope: :module
+      }
+
       {:ok, ctx: ctx}
     end
 
@@ -103,9 +108,12 @@ defmodule Pylixir.ExampleInferenceTest do
       assert ctx2.types["x"] == {:int}
     end
 
-    test "concrete syntactic disagreeing → drops name from assume_types, binds syntactic", %{ctx: ctx} do
+    test "concrete syntactic disagreeing → drops name from assume_types, binds syntactic", %{
+      ctx: ctx
+    } do
       ctx2 = TypeInfer.bind(ctx, "x", {:str})
       assert ctx2.types["x"] == {:str}
+
       refute Map.has_key?(ctx2.assume_types, :module) and
                Map.has_key?(ctx2.assume_types[:module] || %{}, "x")
     end

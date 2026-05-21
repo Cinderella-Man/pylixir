@@ -84,7 +84,10 @@ defmodule Pylixir.ExampleInference do
         env
 
       {:error, :timeout} ->
-        Logger.warning("pylixir tracer timeout (>#{@default_trace_timeout_ms}ms); skipping example")
+        Logger.warning(
+          "pylixir tracer timeout (>#{@default_trace_timeout_ms}ms); skipping example"
+        )
+
         nil
 
       {:error, {:tracer_exit, code, output}} ->
@@ -156,9 +159,7 @@ defmodule Pylixir.ExampleInference do
           # stderr_to_stdout: false so the user program's stdout isn't
           # contaminated with tracer warnings; on failure we surface
           # the (combined) output from a second System.cmd below.
-          System.cmd(python, [script, source_path, stdin_path, out_path],
-            stderr_to_stdout: false
-          )
+          System.cmd(python, [script, source_path, stdin_path, out_path], stderr_to_stdout: false)
         end)
 
       case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
@@ -191,11 +192,11 @@ defmodule Pylixir.ExampleInference do
   defp mktemps do
     base = :erlang.unique_integer([:positive])
     tmp = System.tmp_dir!()
+
     {
       Path.join(tmp, "pylixir-trace-#{base}.py"),
       Path.join(tmp, "pylixir-trace-#{base}.stdin"),
       Path.join(tmp, "pylixir-trace-#{base}.json")
     }
   end
-
 end

@@ -140,7 +140,9 @@ defmodule Pylixir.Pipeline do
   end
 
   @doc false
-  def run_example_seed(%{body: body, examples: examples, source: source, context: context} = state) do
+  def run_example_seed(
+        %{body: body, examples: examples, source: source, context: context} = state
+      ) do
     %{state | context: ExampleInference.seed(body, examples, context, source: source)}
   end
 

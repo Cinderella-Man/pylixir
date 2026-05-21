@@ -48,6 +48,28 @@ defmodule Pylixir.AppendBuildAnalysis do
   escape hatch as the read-only alist gate — the two analyses share
   a tuning knob since they ship as one optimisation surface).
 
+  ## Tail finalizers
+
+  A single in-place mutation can sit between the last `.append` and
+  the read region without disqualifying the candidate. The currently
+  recognised finalizer is `xs.sort()` with **no args or kwargs**:
+
+      xs = []
+      for v in src:
+          xs.append(...)
+      xs.sort()                    # tail finalizer
+      ...                          # read-only uses follow
+
+  Plain `.sort()` is order-independent on its input, so applying it
+  to the reversed prepend-build of `xs` still produces the correct
+  sorted list. Stability is only observable via `key=`, so kwargs
+  bail (preserves the strict equivalence to the source semantics).
+
+  Per-name kind is recorded in the `freeze_after` value (see below)
+  so the converter can choose the right freeze RHS — `Enum.reverse`
+  for plain append-build, identity for sort-tail (the sort already
+  canonicalized order; reversing would de-sort).
+
   ## Disqualifiers
 
   Bail when any of these are true:
@@ -57,8 +79,9 @@ defmodule Pylixir.AppendBuildAnalysis do
       with args, function-call RHS, etc. all bail.
     * `xs` is reassigned anywhere else (`xs = ...`, `for xs in ...`,
       tuple-destructure target including `xs`).
-    * Any mutation other than `.append`: `.pop()`, `.sort()`, `+=`,
-      `xs[i] = ...`, `del xs[i]`, …
+    * Any mutation other than `.append` or a recognised tail
+      finalizer: `.pop()`, `+=`, `xs[i] = ...`, `del xs[i]`,
+      `xs.sort(key=...)`, more than one finalizer in a row, …
     * Any leak: `y = xs`, `return xs`, `f(xs)` for non-allowlisted
       `f`, `xs + ys`, `xs in <other>`, `[xs]`, etc.
     * Reads and mutations interleaved in the wrong order — a read
@@ -81,8 +104,17 @@ defmodule Pylixir.AppendBuildAnalysis do
 
   @read_only_methods ~w(index count copy)
 
+  @typedoc """
+  Per-name finalizer kind. `:append_tail` means the build ends with
+  `.append` and the freeze must `Enum.reverse` to restore insertion
+  order. `:sort_tail` means the build ends with `xs.sort()`, which
+  already canonicalized order — the freeze wraps `xs` directly.
+  """
+  @type freeze_kind :: :append_tail | :sort_tail
+
   @spec analyze([map()], String.t()) ::
-          {MapSet.t(String.t()), %{non_neg_integer() => MapSet.t(String.t())}}
+          {MapSet.t(String.t()),
+           %{non_neg_integer() => %{optional(String.t()) => freeze_kind()}}}
   def analyze(body, scope_name \\ "(module)") when is_list(body) do
     if disabled?() do
       {MapSet.new(), %{}}
@@ -92,12 +124,12 @@ defmodule Pylixir.AppendBuildAnalysis do
 
       Enum.reduce(binds, {MapSet.new(), %{}}, fn {name, bind_idx}, {names_acc, fm_acc} ->
         case decide(name, bind_idx, indexed) do
-          {:ok, last_mut_idx} ->
+          {:ok, last_mut_idx, kind} ->
             log_decision(scope_name, name, :froze, nil)
             names_acc = MapSet.put(names_acc, name)
 
             fm_acc =
-              Map.update(fm_acc, last_mut_idx, MapSet.new([name]), &MapSet.put(&1, name))
+              Map.update(fm_acc, last_mut_idx, %{name => kind}, &Map.put(&1, name, kind))
 
             {names_acc, fm_acc}
 
@@ -157,23 +189,41 @@ defmodule Pylixir.AppendBuildAnalysis do
 
         true ->
           mut_indices = for {i, :mutates} <- results, do: i
+          finalizer_indices = for {i, :finalizer} <- results, do: i
           read_indices = for {i, :reads} <- results, do: i
 
-          case {mut_indices, read_indices} do
-            {[], _} ->
+          cond do
+            length(finalizer_indices) > 1 ->
+              {:bail, "multiple_finalizers"}
+
+            mut_indices == [] ->
               {:bail, "no_appends"}
 
-            {_, []} ->
-              {:ok, Enum.max(mut_indices)}
+            true ->
+              last_append = Enum.max(mut_indices)
+              finalizer_idx = List.first(finalizer_indices)
 
-            {muts, reads} ->
-              last_mut = Enum.max(muts)
-              first_read = Enum.min(reads)
+              cond do
+                finalizer_idx != nil and finalizer_idx < last_append ->
+                  {:bail, "finalizer_before_appends"}
 
-              if first_read > last_mut do
-                {:ok, last_mut}
-              else
-                {:bail, "interleaved_read_and_mutation"}
+                true ->
+                  last_mut = max(last_append, finalizer_idx || -1)
+
+                  first_read =
+                    case read_indices do
+                      [] -> nil
+                      _ -> Enum.min(read_indices)
+                    end
+
+                  cond do
+                    first_read != nil and first_read <= last_mut ->
+                      {:bail, "interleaved_read_and_mutation"}
+
+                    true ->
+                      kind = if finalizer_idx != nil, do: :sort_tail, else: :append_tail
+                      {:ok, last_mut, kind}
+                  end
               end
           end
       end
@@ -222,18 +272,26 @@ defmodule Pylixir.AppendBuildAnalysis do
   # Each top-level statement falls into exactly one category w.r.t.
   # `name`. `:none` is "doesn't mention name at all". `:mutates` means
   # one-or-more `.append`s and no other interaction. `:reads` means
-  # only read-only uses. `:mixed` is both in the same statement. `:leak`
-  # is any disqualifying use.
+  # only read-only uses. `:finalizer` means a single tail-finalizer
+  # method call (currently just bare `xs.sort()`). `:mixed` is two of
+  # the above in the same statement. `:leak` is any disqualifying use.
   defp classify_stmt(stmt, name) do
-    counts = collect_uses(stmt, name, %{appends: 0, reads: 0, leaks: 0})
+    counts =
+      collect_uses(stmt, name, %{appends: 0, reads: 0, leaks: 0, finalizers: 0})
 
     cond do
       counts.leaks > 0 -> :leak
-      counts.appends > 0 and counts.reads > 0 -> :mixed
+      mixed?(counts) -> :mixed
       counts.appends > 0 -> :mutates
+      counts.finalizers > 0 -> :finalizer
       counts.reads > 0 -> :reads
       true -> :none
     end
+  end
+
+  defp mixed?(%{appends: a, reads: r, finalizers: f}) do
+    used = (if a > 0, do: 1, else: 0) + (if r > 0, do: 1, else: 0) + (if f > 0, do: 1, else: 0)
+    used > 1
   end
 
   # Slot-aware walker — modelled on `AlistAnalysis.leak_in?/2` but
@@ -244,15 +302,16 @@ defmodule Pylixir.AppendBuildAnalysis do
   defp collect_uses(
          %{
            "_type" => "Expr",
-           "value" => %{
-             "_type" => "Call",
-             "func" => %{
-               "_type" => "Attribute",
-               "value" => %{"_type" => "Name", "id" => recv},
-               "attr" => "append"
-             },
-             "args" => args
-           } = call
+           "value" =>
+             %{
+               "_type" => "Call",
+               "func" => %{
+                 "_type" => "Attribute",
+                 "value" => %{"_type" => "Name", "id" => recv},
+                 "attr" => "append"
+               },
+               "args" => args
+             } = call
          },
          name,
          acc
@@ -287,6 +346,31 @@ defmodule Pylixir.AppendBuildAnalysis do
     kws = Map.get(call, "keywords", [])
     acc = Enum.reduce(args, acc, fn a, ac -> collect_uses(a, name, ac) end)
     Enum.reduce(kws, acc, fn k, ac -> collect_uses(k, name, ac) end)
+  end
+
+  # `xs.sort()` with no args and no kwargs — tail finalizer. Plain
+  # sort is order-independent on input, so it's safe to apply to the
+  # reversed prepend-build of xs. Sort with kwargs (e.g. `key=`) is
+  # NOT safe because stability becomes observable on the reversed
+  # input; falls through to the generic clause below as a leak.
+  defp collect_uses(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => recv},
+             "attr" => "sort"
+           },
+           "args" => []
+         } = call,
+         name,
+         acc
+       )
+       when recv == name do
+    case Map.get(call, "keywords", []) do
+      [] -> bump(acc, :finalizers)
+      _ -> bump(acc, :leaks)
+    end
   end
 
   # `xs.<other_method>(...)` — any other method call on xs is a leak
@@ -430,10 +514,14 @@ defmodule Pylixir.AppendBuildAnalysis do
        ) do
     acc =
       case target do
-        %{"_type" => "Name", "id" => ^name} -> bump(acc, :leaks)
+        %{"_type" => "Name", "id" => ^name} ->
+          bump(acc, :leaks)
+
         %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => ^name}} ->
           bump(acc, :leaks)
-        other -> collect_uses(other, name, acc)
+
+        other ->
+          collect_uses(other, name, acc)
       end
 
     collect_uses(value, name, acc)
@@ -443,10 +531,14 @@ defmodule Pylixir.AppendBuildAnalysis do
   defp collect_uses(%{"_type" => "Delete", "targets" => targets}, name, acc) do
     Enum.reduce(targets, acc, fn t, a ->
       case t do
-        %{"_type" => "Name", "id" => ^name} -> bump(a, :leaks)
+        %{"_type" => "Name", "id" => ^name} ->
+          bump(a, :leaks)
+
         %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => ^name}} ->
           bump(a, :leaks)
-        other -> collect_uses(other, name, a)
+
+        other ->
+          collect_uses(other, name, a)
       end
     end)
   end

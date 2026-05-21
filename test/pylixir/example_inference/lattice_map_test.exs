@@ -15,13 +15,14 @@ defmodule Pylixir.ExampleInference.LatticeMapTest do
 
   describe "events_to_observations/1: scalars" do
     test "maps known scalar tags" do
-      env = module_env(%{
-        "n" => "int",
-        "f" => "float",
-        "b" => "bool",
-        "s" => "str",
-        "x" => "none"
-      })
+      env =
+        module_env(%{
+          "n" => "int",
+          "f" => "float",
+          "b" => "bool",
+          "s" => "str",
+          "x" => "none"
+        })
 
       assert LatticeMap.events_to_observations(env) == %{
                :module => %{
@@ -58,7 +59,10 @@ defmodule Pylixir.ExampleInference.LatticeMapTest do
 
     test "tuple keeps positional types" do
       env = module_env(%{"t" => %{"kind" => "tuple", "elems" => ["int", "str"]}})
-      assert LatticeMap.events_to_observations(env) == %{module: %{"t" => {:tuple, [{:int}, {:str}]}}}
+
+      assert LatticeMap.events_to_observations(env) == %{
+               module: %{"t" => {:tuple, [{:int}, {:str}]}}
+             }
     end
 
     test "dict lubs keys and values across items" do
@@ -70,7 +74,9 @@ defmodule Pylixir.ExampleInference.LatticeMapTest do
           }
         })
 
-      assert LatticeMap.events_to_observations(env) == %{module: %{"d" => {:dict, {:str}, {:int}}}}
+      assert LatticeMap.events_to_observations(env) == %{
+               module: %{"d" => {:dict, {:str}, {:int}}}
+             }
     end
 
     test "set is opaque" do

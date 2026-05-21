@@ -109,7 +109,9 @@ defmodule Pylixir.AlistAnalysisTest do
         list_call_bind("xs"),
         expr(call_name("sum", [name("xs")])),
         expr(call_name("sorted", [name("xs")])),
-        expr(call(%{"_type" => "Attribute", "value" => name("xs"), "attr" => "count"}, [const(7)]))
+        expr(
+          call(%{"_type" => "Attribute", "value" => name("xs"), "attr" => "count"}, [const(7)])
+        )
       ]
 
       assert AlistAnalysis.freezable_names(body) == MapSet.new(["xs"])

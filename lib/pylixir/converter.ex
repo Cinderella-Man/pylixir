@@ -191,6 +191,7 @@ defmodule Pylixir.Converter do
     # rest of the unary ops on the simpler ast-only dispatch.
     operand_type = TypeInfer.infer_expr(operand, context)
     {operand_ast, context} = convert(operand, context)
+
     {typed_truthy_test(operand_ast, operand_type, :negative) ||
        {:!, [], [{:truthy?, [], [operand_ast]}]}, context}
   end
@@ -3139,9 +3140,14 @@ defmodule Pylixir.Converter do
   statements after the indices recorded in `ctx.append_build_freeze_after`.
 
   After emitting the AST for statement `i`, looks up `freeze_after[i]`;
-  for each `xs` in that set, appends a synthetic
-  `xs = py_alist_new(Enum.reverse(xs))` AST and re-binds the type so
-  downstream Subscript/len/iter reads route through alist clauses.
+  for each `{xs, kind}` in that map, appends a synthetic freeze AST.
+  The freeze form depends on the finalizer kind:
+
+    * `:append_tail` → `xs = py_alist_new(Enum.reverse(xs))` (restore
+      insertion order after the prepend-build).
+    * `:sort_tail`   → `xs = py_alist_new(xs)` (the preceding
+      `xs.sort()` already canonicalized order; re-reversing would
+      de-sort).
 
   Falls back to plain `convert_each/2` when the freeze map is empty —
   no behaviour change for scopes without an append-then-readonly hit.
@@ -3163,8 +3169,8 @@ defmodule Pylixir.Converter do
             nil ->
               {[ast | acc], ctx}
 
-            names ->
-              {freeze_asts, ctx} = emit_append_build_freezes(names, ctx)
+            kinds_by_name ->
+              {freeze_asts, ctx} = emit_append_build_freezes(kinds_by_name, ctx)
               # Stack: latest at head, so prepend in order.
               new_acc = Enum.reduce(freeze_asts, [ast | acc], &[&1 | &2])
               {new_acc, ctx}
@@ -3175,24 +3181,25 @@ defmodule Pylixir.Converter do
     end
   end
 
-  # Emit `xs = py_alist_new(Enum.reverse(xs))` for each name in the set,
-  # and rebind the type tracker to `{:py_alist, e}` so coerce_iter and
-  # subscript-read paths see the alist representation.
-  defp emit_append_build_freezes(names, context) do
-    Enum.reduce(names, {[], context}, fn name, {acc, ctx} ->
+  # Emit one freeze statement per `{name, kind}`, and rebind each
+  # name's type to `{:py_alist, :any}` so coerce_iter and subscript
+  # reads route through alist clauses downstream.
+  defp emit_append_build_freezes(kinds_by_name, context) do
+    Enum.reduce(kinds_by_name, {[], context}, fn {name, kind}, {acc, ctx} ->
       atom = name |> Pylixir.Naming.rewrite() |> String.to_atom()
       ref = {atom, [], nil}
 
-      reversed =
-        {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [ref]}
+      inner =
+        case kind do
+          :append_tail ->
+            {{:., [], [{:__aliases__, [], [:Enum]}, :reverse]}, [], [ref]}
 
-      freeze_rhs = {:py_alist_new, [], [reversed]}
-      assign_ast = {:=, [], [ref, freeze_rhs]}
+          :sort_tail ->
+            ref
+        end
 
-      # Type after freeze: alist of whatever element type we had (we
-      # don't track it across the build loop precisely, so :any is the
-      # safe default). The downstream `coerce_iter` and helper clauses
-      # already handle `{:py_alist, :any}` correctly.
+      assign_ast = {:=, [], [ref, {:py_alist_new, [], [inner]}]}
+
       ctx =
         ctx
         |> TypeInfer.bind(name, {:py_alist, :any})

@@ -35,12 +35,15 @@ defmodule Pylixir.Context do
       "append-then-readonly" pattern (see `Pylixir.AppendBuildAnalysis`).
       `Pylixir.Nodes.Mutations` consults it to choose the O(1) `[v | xs]`
       prepend lowering for `.append`.
-    * `:append_build_freeze_after` — `%{stmt_idx => MapSet}` keyed by
-      top-level statement index. After emitting the statement at index
-      `i`, the body emitter injects
-      `xs = py_alist_new(Enum.reverse(xs))` for each name in the set,
-      flipping the type to `{:py_alist, _}` so downstream reads use the
-      alist helper clauses.
+    * `:append_build_freeze_after` — `%{stmt_idx => %{name => kind}}`
+      keyed by top-level statement index. After emitting the statement
+      at index `i`, the body emitter injects one freeze per name. The
+      `kind` (`:append_tail | :sort_tail`, see
+      `Pylixir.AppendBuildAnalysis`) selects the freeze RHS:
+      `Enum.reverse(xs)` for plain append-build, identity for sort-tail
+      (the preceding `xs.sort()` already canonicalized order). The
+      lowered freeze rebinds the type to `{:py_alist, _}` so downstream
+      reads route through the alist helper clauses.
     * `:pvec_names` — `%{name => default_ast}` of Python names matching
       the `xs = [<default>] * <n>` + index-write pattern (see
       `Pylixir.PvecAnalysis`). When the Assign node module sees a
@@ -92,7 +95,10 @@ defmodule Pylixir.Context do
           heap_types: %{optional(String.t()) => term()},
           freezable_names: MapSet.t(String.t()),
           append_build_names: MapSet.t(String.t()),
-          append_build_freeze_after: %{optional(non_neg_integer()) => MapSet.t(String.t())},
+          append_build_freeze_after: %{
+            optional(non_neg_integer()) =>
+              %{optional(String.t()) => :append_tail | :sort_tail}
+          },
           pvec_names: %{optional(String.t()) => map()},
           assume_types: %{optional(:module | String.t()) => %{optional(String.t()) => term()}},
           assume_types_scope: :module | String.t() | nil,

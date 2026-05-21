@@ -659,4 +659,40 @@ defmodule Pylixir.SpecializationTest do
       assert out =~ ~s|"5"|
     end
   end
+
+  describe "AppendBuildAnalysis: .sort() as tail finalizer" do
+    test "xs = []; for: xs.append; xs.sort(); xs[0] avoids py_append fallback" do
+      # Exact shape responsible for the `seed_13048` :elixir_timeout in
+      # the eval corpus: build a list with .append inside a loop, then
+      # .sort() it, then iterate read-only. Without the .sort() being
+      # recognised as a tail finalizer, AppendBuildAnalysis bails and
+      # the converter falls back to `py_append(xs, v) = xs ++ [v]` —
+      # O(n) per call, O(n²) for the build.
+      src = """
+      def f():
+          xs = []
+          for v in range(1000):
+              xs.append(v)
+          xs.sort()
+          return xs[0]
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+
+      # O(1) prepend during build (`[v | xs]`), not O(n) `py_append`.
+      refute out =~ "py_append(xs"
+
+      # The .sort() statement still lowers to `xs = Enum.sort(xs)` —
+      # operating on the reversed prepend-built list, which is fine
+      # because plain .sort() (no key=) is order-independent on input.
+      assert out =~ "Enum.sort(xs)"
+
+      # After the sort, the freeze must NOT inject `Enum.reverse(xs)` —
+      # reversing a sorted list de-sorts it. The lowered freeze is
+      # `xs = py_alist_new(xs)`.
+      assert out =~ "py_alist_new(xs)"
+      refute out =~ "py_alist_new(Enum.reverse(xs))"
+    end
+  end
 end

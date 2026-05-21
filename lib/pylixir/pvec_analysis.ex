@@ -380,8 +380,16 @@ defmodule Pylixir.PvecAnalysis do
   end
 
   defp nested_mentions?(%{"_type" => type} = node, name)
-       when type in ["FunctionDef", "AsyncFunctionDef", "Lambda", "ClassDef",
-                     "ListComp", "SetComp", "DictComp", "GeneratorExp"] do
+       when type in [
+              "FunctionDef",
+              "AsyncFunctionDef",
+              "Lambda",
+              "ClassDef",
+              "ListComp",
+              "SetComp",
+              "DictComp",
+              "GeneratorExp"
+            ] do
     name_anywhere?(node, name)
   end
 

@@ -75,8 +75,12 @@ defmodule Pylixir.TypeInfer.Signatures do
 
       merged_params =
         cond do
-          ex_params == [] -> param_anns
-          length(ex_params) != length(param_anns) -> param_anns
+          ex_params == [] ->
+            param_anns
+
+          length(ex_params) != length(param_anns) ->
+            param_anns
+
           true ->
             Enum.zip(param_anns, ex_params)
             |> Enum.map(fn

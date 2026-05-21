@@ -79,10 +79,17 @@ defmodule Pylixir.ExampleInference.LatticeMap do
 
     new_params =
       cond do
-        is_nil(params) -> existing_params
-        is_nil(existing_params) -> params
-        length(params) != length(existing_params) -> params
-        true -> Enum.zip(params, existing_params) |> Enum.map(fn {a, b} -> TypeInfer.lub(a, b) end)
+        is_nil(params) ->
+          existing_params
+
+        is_nil(existing_params) ->
+          params
+
+        length(params) != length(existing_params) ->
+          params
+
+        true ->
+          Enum.zip(params, existing_params) |> Enum.map(fn {a, b} -> TypeInfer.lub(a, b) end)
       end
 
     new_ret = TypeInfer.lub(existing_ret, ret)
@@ -134,8 +141,12 @@ defmodule Pylixir.ExampleInference.LatticeMap do
           true ->
             new_params =
               cond do
-                is_nil(existing_params) -> params
-                is_nil(params) -> existing_params
+                is_nil(existing_params) ->
+                  params
+
+                is_nil(params) ->
+                  existing_params
+
                 true ->
                   Enum.zip(existing_params, params)
                   |> Enum.map(fn {a, b} -> soften_lub(TypeInfer.lub(a, b)) end)

@@ -63,7 +63,7 @@ defmodule Pylixir.AppendBuildAnalysisTest do
 
       {names, freeze_after} = AppendBuildAnalysis.analyze(body)
       assert names == MapSet.new(["xs"])
-      assert freeze_after == %{1 => MapSet.new(["xs"])}
+      assert freeze_after == %{1 => %{"xs" => :append_tail}}
     end
 
     test "two independent append-build candidates freeze at their own indices" do
@@ -78,7 +78,11 @@ defmodule Pylixir.AppendBuildAnalysisTest do
 
       {names, freeze_after} = AppendBuildAnalysis.analyze(body)
       assert names == MapSet.new(["xs", "ys"])
-      assert freeze_after == %{1 => MapSet.new(["xs"]), 3 => MapSet.new(["ys"])}
+
+      assert freeze_after == %{
+               1 => %{"xs" => :append_tail},
+               3 => %{"ys" => :append_tail}
+             }
     end
 
     test "no reads after build still freezes (last mutation index)" do
@@ -89,7 +93,7 @@ defmodule Pylixir.AppendBuildAnalysisTest do
 
       {names, freeze_after} = AppendBuildAnalysis.analyze(body)
       assert names == MapSet.new(["xs"])
-      assert freeze_after == %{1 => MapSet.new(["xs"])}
+      assert freeze_after == %{1 => %{"xs" => :append_tail}}
     end
 
     test "len(xs) and `for v in xs` and `v in xs` are read-only uses" do
@@ -108,7 +112,107 @@ defmodule Pylixir.AppendBuildAnalysisTest do
 
       {names, freeze_after} = AppendBuildAnalysis.analyze(body)
       assert names == MapSet.new(["xs"])
-      assert freeze_after == %{1 => MapSet.new(["xs"])}
+      assert freeze_after == %{1 => %{"xs" => :append_tail}}
+    end
+  end
+
+  # --- Tail finalizer: `.sort()` ------------------------------------
+  #
+  # Common idiom: build a list with .append in a loop, then sort it
+  # in place, then iterate read-only. Without recognising the sort
+  # as a tail finalizer, the analysis bails and the converter falls
+  # back to `py_append(xs, v) = xs ++ [v]`, which is O(n) per call
+  # and turns the build loop into O(n²) — the source of the
+  # `:elixir_timeout` for `seed_13048` (n≈386504) in the eval corpus.
+
+  describe "tail finalizer: .sort()" do
+    test "xs = []; for: xs.append(v); xs.sort(); xs[0] → frozen after sort" do
+      body = [
+        empty_list_bind("xs"),
+        for_stmt("v", name("src"), [method_call("xs", "append", [name("v")])]),
+        method_call("xs", "sort", []),
+        expr(subscript_read("xs", 0))
+      ]
+
+      {names, freeze_after} = AppendBuildAnalysis.analyze(body)
+      assert names == MapSet.new(["xs"])
+      assert freeze_after == %{2 => %{"xs" => :sort_tail}}
+    end
+
+    test ".sort() with no following reads still freezes at the sort index" do
+      body = [
+        empty_list_bind("xs"),
+        method_call("xs", "append", [const(1)]),
+        method_call("xs", "sort", [])
+      ]
+
+      {names, freeze_after} = AppendBuildAnalysis.analyze(body)
+      assert names == MapSet.new(["xs"])
+      assert freeze_after == %{2 => %{"xs" => :sort_tail}}
+    end
+
+    test "two .sort() finalizers → bail (only one tail finalizer allowed)" do
+      body = [
+        empty_list_bind("xs"),
+        method_call("xs", "append", [const(1)]),
+        method_call("xs", "sort", []),
+        method_call("xs", "sort", [])
+      ]
+
+      assert {MapSet.new(), %{}} == AppendBuildAnalysis.analyze(body)
+    end
+
+    test ".sort() before all appends → bail (finalizer must be the tail)" do
+      body = [
+        empty_list_bind("xs"),
+        method_call("xs", "sort", []),
+        method_call("xs", "append", [const(1)])
+      ]
+
+      assert {MapSet.new(), %{}} == AppendBuildAnalysis.analyze(body)
+    end
+
+    test "read interleaved between append and .sort() → bail" do
+      body = [
+        empty_list_bind("xs"),
+        method_call("xs", "append", [const(1)]),
+        expr(subscript_read("xs", 0)),
+        method_call("xs", "sort", [])
+      ]
+
+      assert {MapSet.new(), %{}} == AppendBuildAnalysis.analyze(body)
+    end
+
+    test ".sort(key=...) → bail (stability would be observable on prepend-built input)" do
+      body = [
+        empty_list_bind("xs"),
+        method_call("xs", "append", [const(1)]),
+        method_call("xs", "sort", [], [
+          %{
+            "_type" => "keyword",
+            "arg" => "key",
+            "value" => name("fn")
+          }
+        ])
+      ]
+
+      assert {MapSet.new(), %{}} == AppendBuildAnalysis.analyze(body)
+    end
+
+    test "freeze_after carries kind so the converter can choose the freeze RHS" do
+      # `:append_tail` → freeze wraps `Enum.reverse(xs)` (restore insertion order).
+      # `:sort_tail`   → freeze wraps `xs` directly (Enum.sort already canonicalized;
+      #                  re-reversing would de-sort).
+      body = [
+        empty_list_bind("xs"),
+        for_stmt("v", name("src"), [method_call("xs", "append", [name("v")])]),
+        method_call("xs", "sort", []),
+        expr(subscript_read("xs", 0))
+      ]
+
+      {names, freeze_after} = AppendBuildAnalysis.analyze(body)
+      assert names == MapSet.new(["xs"])
+      assert freeze_after == %{2 => %{"xs" => :sort_tail}}
     end
   end
 
@@ -253,8 +357,8 @@ defmodule Pylixir.AppendBuildAnalysisTest do
       assert names == MapSet.new(["x_sums", "y_sums"])
       # x_sums frozen after stmt 2 (its for-loop), y_sums after stmt 5.
       assert freeze_after == %{
-               2 => MapSet.new(["x_sums"]),
-               5 => MapSet.new(["y_sums"])
+               2 => %{"x_sums" => :append_tail},
+               5 => %{"y_sums" => :append_tail}
              }
     end
   end

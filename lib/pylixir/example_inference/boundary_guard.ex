@@ -20,8 +20,7 @@ defmodule Pylixir.ExampleInference.BoundaryGuard do
   def wrap(value_ast, name, type) when is_binary(name) do
     case guard_clauses(type, name) do
       {:ok, clauses} ->
-        {:ok,
-         {:case, [], [value_ast, [do: clauses]]}}
+        {:ok, {:case, [], [value_ast, [do: clauses]]}}
 
       :skip ->
         :skip

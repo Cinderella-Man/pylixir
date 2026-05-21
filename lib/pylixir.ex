@@ -90,7 +90,8 @@ defmodule Pylixir do
   Library stays pure — no `Code.eval_string`. The caller owns process
   sandboxing, timeouts, and stdout capture (docs/09 Q9 B).
   """
-  @spec validate_transpile(String.t(), [map()], (String.t(), String.t() -> {:ok, String.t()} | {:error, term()})) ::
+  @spec validate_transpile(String.t(), [map()], (String.t(), String.t() ->
+                                                   {:ok, String.t()} | {:error, term()})) ::
           :ok | {:error, [map()]}
   def validate_transpile(source, examples, runner)
       when is_binary(source) and is_list(examples) and is_function(runner, 2) do

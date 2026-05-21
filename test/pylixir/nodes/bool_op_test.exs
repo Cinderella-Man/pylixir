@@ -166,9 +166,7 @@ defmodule Pylixir.Nodes.BoolOpTest do
     test "[1] and \"hi\" returns \"hi\" (LHS truthy → returns RHS)" do
       {_, value, _, _} =
         TranspileHelpers.transpile_and_run(
-          module_with(
-            bool_op("And", [%{"_type" => "List", "elts" => [const(1)]}, const("hi")])
-          )
+          module_with(bool_op("And", [%{"_type" => "List", "elts" => [const(1)]}, const("hi")]))
         )
 
       assert value == "hi"
