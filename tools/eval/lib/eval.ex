@@ -71,8 +71,8 @@ defmodule Eval do
 
   @default_concurrency_multiplier 2
   @default_samples_per_bucket 10
-  @default_python_timeout_ms 3_000
-  @default_elixir_timeout_ms 5_000
+  @default_python_timeout_ms 10_000
+  @default_elixir_timeout_ms 10_000
 
   @spec run(opts()) :: accumulator()
   def run(opts \\ []) do
