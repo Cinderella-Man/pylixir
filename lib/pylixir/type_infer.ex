@@ -393,6 +393,50 @@ defmodule Pylixir.TypeInfer do
     end
   end
 
+  @doc """
+  After an `xs.append(v)` mutation, refine `xs`'s tracked element
+  type so downstream consumers (loop-target lowering, alist freeze,
+  …) see a precise type instead of the widened `:any` from `[]`.
+
+  Two storage paths:
+
+    * If `xs` is in `ctx.append_build_type_refinable` (see
+      `Pylixir.AppendBuildAnalysis.type_refinable_names/2`): the lub
+      of observed `.append` args goes into
+      `ctx.append_build_element_types`, a scope-stable map that
+      `If`/`For`/`Try` etc. do NOT roll back. `infer_expr/2` on
+      `Name(xs)` then returns `{:list, lubbed_elem}`, so the
+      refinement is visible to all downstream reads regardless of
+      which scope they're emitted from.
+
+    * Otherwise: falls back to `demote/2` (the pre-existing
+      `{:list, :any}` widening — safe but lossy).
+
+  Skipped (like `demote/2`) when `xs` has a trace-stable type from
+  `assume_types`.
+  """
+  @spec refine_after_append(Context.t(), String.t(), t()) :: Context.t()
+  def refine_after_append(%Context{} = ctx, name, arg_t) do
+    case lookup_assume(ctx, name) do
+      {:ok, _} ->
+        ctx
+
+      :none ->
+        if MapSet.member?(ctx.append_build_type_refinable, name) do
+          prev = Map.get(ctx.append_build_element_types, name, :bottom)
+          new_elem = lub(prev, arg_t)
+
+          %{
+            ctx
+            | append_build_element_types:
+                Map.put(ctx.append_build_element_types, name, new_elem)
+          }
+        else
+          demote(ctx, name)
+        end
+    end
+  end
+
   # ---------------------------------------------------------------------
   # infer_expr — read-only type inference for an expression node.
   # ---------------------------------------------------------------------
@@ -404,6 +448,13 @@ defmodule Pylixir.TypeInfer do
 
   def infer_expr(%{"_type" => "Name", "id" => id}, ctx) do
     cond do
+      # `.append`-driven element-type refinement lives in a separate
+      # context map that scope rollbacks (If/For/Try) don't touch —
+      # consult it first so reads emitted from any scope see the
+      # refined `{:list, elem_t}` even after intermediate boundaries.
+      elem = Map.get(ctx.append_build_element_types, id) ->
+        {:list, elem}
+
       Map.has_key?(ctx.types, id) ->
         Map.fetch!(ctx.types, id)
 

@@ -412,9 +412,13 @@ defmodule Pylixir.Nodes.Loop do
     iter_type = TypeInfer.infer_expr(iter, context)
     {iter_ast, context} = Converter.convert(iter, context)
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
-    {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
 
-    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
+    elem_t = TypeInfer.elem_of(iter_type)
+
+    {target_ast, target_names, context} =
+      Converter.convert_loop_target(target, context, elem_t)
+
+    context = TypeInfer.bind_pattern(target, elem_t, context)
 
     analysis = LoopAnalysis.analyze(body)
 
@@ -549,12 +553,16 @@ defmodule Pylixir.Nodes.Loop do
     # either. Body-assigned threaded vars get re-bound below.
     saved_scopes = context.scopes
     saved_types = context.types
-    {target_ast, target_names, context} = Converter.convert_loop_target(target, context)
+
+    elem_t = TypeInfer.elem_of(iter_type)
+
+    {target_ast, target_names, context} =
+      Converter.convert_loop_target(target, context, elem_t)
 
     # PR 10 — bind the for-target's type via `elem_of(iter_type)` so the
     # body's converter sees `x: elem_t`. `Pattern` binding handles
     # destructure (`for i, x in enumerate(xs)`).
-    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
+    context = TypeInfer.bind_pattern(target, elem_t, context)
 
     analysis = LoopAnalysis.analyze(body)
 

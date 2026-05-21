@@ -141,6 +141,129 @@ defmodule Pylixir.AppendBuildAnalysis do
     end
   end
 
+  @doc """
+  Looser sibling of `analyze/1` returning just the set of names whose
+  element type can be safely derived from observed `.append` arguments
+  alone — used by `Pylixir.TypeInfer.refine_after_append/3` to enable
+  the `:any`-as-`:bottom` lub trick for the empty-list-literal bind.
+
+  Superset of `analyze/1`'s admitted names. Compared to the freeze
+  analysis it additionally admits:
+
+    * Nested subscript-assigns `xs[i][...] = v` (`:elem_mutates`) —
+      modify inside an existing element, type-preserving for `xs`.
+    * Reads interleaved with mutations — ordering doesn't affect the
+      lub-of-all-args derivation.
+    * Tail-finalizer methods (`.sort()`, `.reverse()` no kwargs)
+      anywhere, not just as the final mutation.
+
+  Disqualifiers stay the same as `analyze/1`'s leak rules: direct
+  subscript-assign `xs[i] = v` (replaces element, could change type),
+  `xs += other` / `.extend(iter)` / `.insert(i, v)` (multi-element
+  add — not currently lubbed), alias / return as raw, reassignment,
+  method calls outside the safe allowlist.
+
+  Skipped (returns empty set) when `PYLIXIR_DISABLE_ALIST=1`.
+  """
+  @spec type_refinable_names([map()], String.t()) :: MapSet.t(String.t())
+  def type_refinable_names(body, scope_name \\ "(module)") when is_list(body) do
+    if disabled?() do
+      MapSet.new()
+    else
+      indexed = Enum.with_index(body)
+      binds = collect_empty_list_binds(indexed)
+
+      Enum.reduce(binds, MapSet.new(), fn {name, bind_idx}, acc ->
+        if type_refinable?(name, bind_idx, indexed) do
+          log_decision(scope_name, name, :type_refinable, nil)
+          MapSet.put(acc, name)
+        else
+          acc
+        end
+      end)
+    end
+  end
+
+  defp type_refinable?(name, bind_idx, indexed) do
+    not reassigned?(indexed, name, bind_idx) and
+      Enum.all?(indexed, fn
+        {_stmt, ^bind_idx} -> true
+        {stmt, _idx} -> not type_unsafe?(stmt, name)
+      end)
+  end
+
+  # The pessimistic `collect_uses` `:leaks` rule (bare `Name(name)`
+  # anywhere outside a known-safe slot) is too strict for type
+  # tracking — it bails on `if not xs:`, `f(xs)`, alias `y = xs`,
+  # etc., none of which change `xs`'s element type. Flip the
+  # detection: a statement is type-unsafe only if it contains one of
+  # the specific patterns that could change `xs`'s element type.
+  defp type_unsafe?(stmt, name), do: walk_type_unsafe?(stmt, name)
+
+  # Direct subscript-assign `xs[i] = v` — replaces an element, new
+  # element type could differ from prior appends.
+  defp walk_type_unsafe?(%{"_type" => "Assign", "targets" => targets, "value" => value}, name) do
+    Enum.any?(targets, fn t ->
+      direct_subscript_assign_root?(t, name) or walk_type_unsafe?(t, name)
+    end) or walk_type_unsafe?(value, name)
+  end
+
+  # `xs += other` / `xs[i] += other` — multi-element add, lub of
+  # iter elements isn't tracked here. Bail.
+  defp walk_type_unsafe?(%{"_type" => "AugAssign", "target" => t, "value" => v}, name) do
+    target_root_is_name?(t, name) or walk_type_unsafe?(t, name) or walk_type_unsafe?(v, name)
+  end
+
+  # `del xs[i]` / `del xs` — destructive, conservative bail.
+  defp walk_type_unsafe?(%{"_type" => "Delete", "targets" => targets}, name) do
+    Enum.any?(targets, fn t ->
+      target_root_is_name?(t, name) or walk_type_unsafe?(t, name)
+    end)
+  end
+
+  # `xs.<unsafe_method>(args)` — `extend`, `insert`, etc. add elements
+  # we don't lub. `.append`, `.sort`, `.reverse`, `.pop`, `.copy` etc.
+  # are type-preserving / type-contributing-in-the-tracked-way.
+  defp walk_type_unsafe?(
+         %{
+           "_type" => "Call",
+           "func" => %{
+             "_type" => "Attribute",
+             "value" => %{"_type" => "Name", "id" => recv},
+             "attr" => attr
+           },
+           "args" => args
+         } = call,
+         name
+       )
+       when recv == name do
+    kws = Map.get(call, "keywords", [])
+
+    cond do
+      attr in ["extend", "insert"] -> true
+      Enum.any?(args, &walk_type_unsafe?(&1, name)) -> true
+      Enum.any?(kws, &walk_type_unsafe?(&1, name)) -> true
+      true -> false
+    end
+  end
+
+  defp walk_type_unsafe?(%{"_type" => _} = node, name) do
+    node
+    |> Map.delete("_type")
+    |> Enum.any?(fn {_k, v} -> walk_type_unsafe?(v, name) end)
+  end
+
+  defp walk_type_unsafe?(list, name) when is_list(list),
+    do: Enum.any?(list, &walk_type_unsafe?(&1, name))
+
+  defp walk_type_unsafe?(_, _), do: false
+
+  defp target_root_is_name?(%{"_type" => "Name", "id" => id}, name), do: id == name
+  defp target_root_is_name?(%{"_type" => "Subscript", "value" => v}, name),
+    do: target_root_is_name?(v, name)
+
+  defp target_root_is_name?(_, _), do: false
+
   # --- candidate discovery -------------------------------------------
 
   defp collect_empty_list_binds(indexed) do
@@ -275,12 +398,25 @@ defmodule Pylixir.AppendBuildAnalysis do
   # only read-only uses. `:finalizer` means a single tail-finalizer
   # method call (currently just bare `xs.sort()`). `:mixed` is two of
   # the above in the same statement. `:leak` is any disqualifying use.
+  #
+  # `:elem_mutates` (nested subscript-assign `xs[i][...] = v`) is
+  # bucketed as `:leak` from the perspective of the alist-freeze
+  # analysis below — the lowered `py_setitem(xs, …)` cannot operate
+  # on a `{:py_alist, _}`. The looser `type_refinable_names/2`
+  # analysis treats it as harmless.
   defp classify_stmt(stmt, name) do
     counts =
-      collect_uses(stmt, name, %{appends: 0, reads: 0, leaks: 0, finalizers: 0})
+      collect_uses(stmt, name, %{
+        appends: 0,
+        reads: 0,
+        leaks: 0,
+        finalizers: 0,
+        elem_mutates: 0
+      })
 
     cond do
       counts.leaks > 0 -> :leak
+      counts.elem_mutates > 0 -> :leak
       mixed?(counts) -> :mixed
       counts.appends > 0 -> :mutates
       counts.finalizers > 0 -> :finalizer
@@ -481,7 +617,8 @@ defmodule Pylixir.AppendBuildAnalysis do
     Enum.reduce(kws, acc, fn k, a -> collect_uses(k, name, a) end)
   end
 
-  # `xs[i] = v` subscript-assign — disqualifying mutation.
+  # `xs[i] = v` direct subscript-assign — disqualifying mutation.
+  # Replaces an element entirely, so the element type could change.
   defp collect_uses(
          %{
            "_type" => "Assign",
@@ -493,13 +630,23 @@ defmodule Pylixir.AppendBuildAnalysis do
        ) do
     acc =
       Enum.reduce(targets, acc, fn t, a ->
-        case t do
-          %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => ^name}, "slice" => s} ->
+        cond do
+          direct_subscript_assign_root?(t, name) ->
             a = bump(a, :leaks)
-            collect_uses(s, name, a)
+            collect_uses(slice_of(t), name, a)
 
-          other ->
-            collect_uses(other, name, a)
+          nested_subscript_assign_root?(t, name) ->
+            # `xs[i][...] = v` — chain rooted at Name(`name`), depth >= 2.
+            # Modifies INSIDE an existing element, doesn't change xs's
+            # element TYPE. Bumps a separate bucket: disqualifying for
+            # the alist-freeze (we'd lower to `py_setitem(xs, …)` which
+            # has no clause for `{:py_alist, _}`) but admitted by the
+            # looser `type_refinable_names/2` analysis below.
+            a = bump(a, :elem_mutates)
+            walk_subscript_chain_slices(t, name, a)
+
+          true ->
+            collect_uses(t, name, a)
         end
       end)
 
@@ -561,6 +708,41 @@ defmodule Pylixir.AppendBuildAnalysis do
 
   defp collect_uses(_, _, acc), do: acc
 
+  defp direct_subscript_assign_root?(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => id}},
+         name
+       ),
+       do: id == name
+
+  defp direct_subscript_assign_root?(_, _), do: false
+
+  defp nested_subscript_assign_root?(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Subscript"} = inner},
+         name
+       ),
+       do: subscript_chain_root?(inner, name)
+
+  defp nested_subscript_assign_root?(_, _), do: false
+
+  defp subscript_chain_root?(%{"_type" => "Subscript", "value" => v}, name),
+    do: subscript_chain_root?(v, name)
+
+  defp subscript_chain_root?(%{"_type" => "Name", "id" => id}, name), do: id == name
+  defp subscript_chain_root?(_, _), do: false
+
+  defp slice_of(%{"_type" => "Subscript", "slice" => s}), do: s
+
+  defp walk_subscript_chain_slices(
+         %{"_type" => "Subscript", "value" => v, "slice" => s},
+         name,
+         acc
+       ) do
+    acc = collect_uses(s, name, acc)
+    walk_subscript_chain_slices(v, name, acc)
+  end
+
+  defp walk_subscript_chain_slices(_, _, acc), do: acc
+
   defp bump(acc, key), do: Map.update!(acc, key, &(&1 + 1))
 
   # --- generic walk ---------------------------------------------------
@@ -605,6 +787,14 @@ defmodule Pylixir.AppendBuildAnalysis do
   defp log_decision(scope, name, :bailed, reason) do
     if diag_enabled?() do
       IO.puts(:stderr, "[alist-append] f=#{scope} x=#{name} decision=bailed reason=#{reason}")
+    end
+
+    :ok
+  end
+
+  defp log_decision(scope, name, :type_refinable, _reason) do
+    if diag_enabled?() do
+      IO.puts(:stderr, "[alist-append] f=#{scope} x=#{name} decision=type_refinable")
     end
 
     :ok

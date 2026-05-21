@@ -151,6 +151,12 @@ defmodule Pylixir.Nodes.Mutations do
   @spec emit(String.t(), String.t(), [map()], [map()], map(), Pylixir.Context.t()) ::
           {Macro.t(), Pylixir.Context.t()}
   def emit(target_name, method, args, kwargs_raw, source, context) do
+    # Snapshot the type context BEFORE arg conversion so element-type
+    # refinement (below) sees the same context the caller did. Arg
+    # conversion can introduce side-effect bindings (e.g. walrus) but
+    # those don't affect the appended-value's static type.
+    pre_args_context = context
+
     {arg_asts, context} = Converter.convert_each(args, context)
     {kwargs, context} = Converter.convert_keywords(kwargs_raw, context)
 
@@ -170,9 +176,33 @@ defmodule Pylixir.Nodes.Mutations do
         mutation_rhs(method, target_ast, arg_asts, kwargs, source)
       end
 
-    context = TypeInfer.demote(context, target_name)
+    context = refine_or_demote(method, args, target_name, pre_args_context, context)
     context = Converter.bind_name(context, target_name)
     {{:=, [], [target_ast, new_value]}, context}
+  end
+
+  # `.append(v)` refines the tracked element type to
+  # `lub(prev_elem, v_type)` so downstream consumers (loop-target
+  # lowering, etc.) keep precise info.
+  defp refine_or_demote("append", [arg], target_name, pre_args_context, context) do
+    arg_t = TypeInfer.infer_expr(arg, pre_args_context)
+    TypeInfer.refine_after_append(context, target_name, arg_t)
+  end
+
+  # In-place reorder methods don't add or remove elements, so the
+  # tracked element type is unchanged and demotion would be purely
+  # lossy. Important for the AppendBuildAnalysis `.sort()` tail
+  # finalizer path — without skipping demote here, the refined
+  # element type would get widened back to `:any` and the post-sort
+  # alist freeze would lose precision (breaking the type-directed
+  # loop-target lowering downstream).
+  defp refine_or_demote(method, _args, _target_name, _pre_args_context, context)
+       when method in ["sort", "reverse"] do
+    context
+  end
+
+  defp refine_or_demote(_method, _args, target_name, _pre_args_context, context) do
+    TypeInfer.demote(context, target_name)
   end
 
   # `coll[i].method(args)` — rebind `coll` to a copy where the i-th

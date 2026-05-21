@@ -101,17 +101,24 @@ defmodule Pylixir.Converter do
     # `Pylixir.Nodes.Assign` when P5 lands.
     saved_freezable_names = context.freezable_names
     saved_append_build_names = context.append_build_names
+    saved_append_build_type_refinable = context.append_build_type_refinable
+    saved_append_build_element_types = context.append_build_element_types
     saved_append_build_freeze_after = context.append_build_freeze_after
     saved_pvec_names = context.pvec_names
 
     {append_names, append_freeze_after} =
       Pylixir.AppendBuildAnalysis.analyze(analysis.runtime_statements)
 
+    append_type_refinable =
+      Pylixir.AppendBuildAnalysis.type_refinable_names(analysis.runtime_statements)
+
     context = %{
       context
       | def_position: :nested_fn,
         freezable_names: Pylixir.AlistAnalysis.freezable_names(analysis.runtime_statements),
         append_build_names: append_names,
+        append_build_type_refinable: append_type_refinable,
+        append_build_element_types: %{},
         append_build_freeze_after: append_freeze_after,
         pvec_names: Pylixir.PvecAnalysis.analyze(analysis.runtime_statements)
     }
@@ -123,6 +130,8 @@ defmodule Pylixir.Converter do
       | def_position: :module_top,
         freezable_names: saved_freezable_names,
         append_build_names: saved_append_build_names,
+        append_build_type_refinable: saved_append_build_type_refinable,
+        append_build_element_types: saved_append_build_element_types,
         append_build_freeze_after: saved_append_build_freeze_after,
         pvec_names: saved_pvec_names
     }
@@ -2501,7 +2510,20 @@ defmodule Pylixir.Converter do
   # See `LoopAnalysis.discard_name?/1` for the matching exclusion and
   # rationale (Elixir's `_` is pattern-only; `__` collides with the
   # compiler-variable prefix).
-  def convert_loop_target(%{"_type" => "Name", "id" => id}, context)
+  def convert_loop_target(target, context), do: convert_loop_target(target, context, :any)
+
+  @doc """
+  Same as `convert_loop_target/2` but takes the iterable's element
+  type (`elem_t`, produced by `TypeInfer.elem_of/1`). When a tuple
+  loop-target iterates a list-of-lists (`elem_t == {:list, _}`), the
+  destructure emits an Elixir list pattern (`[a, b]`) instead of a
+  tuple pattern (`{a, b}`) — Python's sequence-unpacking handles both
+  shapes, but Elixir's pattern matching is strict. Falls back to the
+  tuple pattern for `:any` / `{:tuple, _}` / unions / etc.
+  """
+  @spec convert_loop_target(map(), Context.t(), TypeInfer.t()) ::
+          {Macro.t(), [String.t()], Context.t()}
+  def convert_loop_target(%{"_type" => "Name", "id" => id}, context, _elem_t)
       when is_binary(id) and id != "" do
     context = bind_name(context, id)
     atom = id |> Naming.rewrite() |> String.to_atom()
@@ -2514,7 +2536,7 @@ defmodule Pylixir.Converter do
     {{atom, [], nil}, names, context}
   end
 
-  def convert_loop_target(%{"_type" => "Tuple", "elts" => elts}, context) do
+  def convert_loop_target(%{"_type" => "Tuple", "elts" => elts}, context, elem_t) do
     reject_starred!(elts, "Tuple")
 
     {refs, names, context} =
@@ -2523,14 +2545,29 @@ defmodule Pylixir.Converter do
         {[ref | refs], Enum.reverse(new_names) ++ names, ctx}
       end)
 
-    {tuple_pattern(Enum.reverse(refs)), Enum.reverse(names), context}
+    refs = Enum.reverse(refs)
+    pattern = loop_target_destructure(refs, elem_t)
+    {pattern, Enum.reverse(names), context}
   end
 
-  def convert_loop_target(target, _context) do
+  def convert_loop_target(target, _context, _elem_t) do
     raise UnsupportedNodeError,
       node_type: "For",
       hint:
         "for-loop target shape `#{Map.get(target, "_type")}` is not supported (use a Name or Tuple of Names)"
+  end
+
+  # Choose the Elixir destructure shape for a tuple-form loop target
+  # given the iterable's element type. Python's `for a, b in xs:` is
+  # sequence-agnostic — it unpacks lists and tuples alike. Elixir
+  # patterns aren't, so we pick the shape that matches what's actually
+  # in the iterable when we can prove it.
+  defp loop_target_destructure(refs, elem_t) do
+    if TypeInfer.is_list?(elem_t) do
+      refs
+    else
+      tuple_pattern(refs)
+    end
   end
 
   defp all_underscores?(id),
@@ -3182,8 +3219,12 @@ defmodule Pylixir.Converter do
   end
 
   # Emit one freeze statement per `{name, kind}`, and rebind each
-  # name's type to `{:py_alist, :any}` so coerce_iter and subscript
-  # reads route through alist clauses downstream.
+  # name's type to `{:py_alist, elem_t}` so coerce_iter and subscript
+  # reads route through alist clauses downstream. The element type
+  # is carried over from the pre-freeze `{:list, elem_t}` binding
+  # (refined by `TypeInfer.refine_after_append/3` over the build
+  # region) so e.g. the type-directed loop-target lowering can keep
+  # picking precise destructure patterns post-freeze.
   defp emit_append_build_freezes(kinds_by_name, context) do
     Enum.reduce(kinds_by_name, {[], context}, fn {name, kind}, {acc, ctx} ->
       atom = name |> Pylixir.Naming.rewrite() |> String.to_atom()
@@ -3200,10 +3241,30 @@ defmodule Pylixir.Converter do
 
       assign_ast = {:=, [], [ref, {:py_alist_new, [], [inner]}]}
 
+      # Prefer the `.append`-driven element-type refinement (see
+      # `TypeInfer.refine_after_append/3`) when available; fall back
+      # to the static `:types` binding.
+      elem_t =
+        case Map.fetch(ctx.append_build_element_types, name) do
+          {:ok, e} ->
+            e
+
+          :error ->
+            case Map.get(ctx.types, name) do
+              {:list, e} -> e
+              _ -> :any
+            end
+        end
+
       ctx =
         ctx
-        |> TypeInfer.bind(name, {:py_alist, :any})
+        |> TypeInfer.bind(name, {:py_alist, elem_t})
         |> bind_name(name)
+        # Post-freeze, the runtime value is `{:py_alist, _}` — drop the
+        # `{:list, _}` shadow in `append_build_element_types` so
+        # `infer_expr(Name)` sees the freshly-bound alist type from
+        # `:types`, not the stale list-flavored refinement.
+        |> Map.update!(:append_build_element_types, &Map.delete(&1, name))
 
       {[assign_ast | acc], ctx}
     end)

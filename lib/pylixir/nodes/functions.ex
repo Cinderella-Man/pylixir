@@ -184,6 +184,8 @@ defmodule Pylixir.Nodes.Functions do
     saved_types = context.types
     saved_freezable_names = context.freezable_names
     saved_append_build_names = context.append_build_names
+    saved_append_build_type_refinable = context.append_build_type_refinable
+    saved_append_build_element_types = context.append_build_element_types
     saved_append_build_freeze_after = context.append_build_freeze_after
     saved_pvec_names = context.pvec_names
 
@@ -206,6 +208,9 @@ defmodule Pylixir.Nodes.Functions do
     {append_names, append_freeze_after} =
       Pylixir.AppendBuildAnalysis.analyze(body, py_name)
 
+    append_type_refinable =
+      Pylixir.AppendBuildAnalysis.type_refinable_names(body, py_name)
+
     context = %{
       context
       | scopes: [new_scope | context.scopes],
@@ -214,6 +219,8 @@ defmodule Pylixir.Nodes.Functions do
         types: primed_types,
         freezable_names: Pylixir.AlistAnalysis.freezable_names(body, py_name),
         append_build_names: append_names,
+        append_build_type_refinable: append_type_refinable,
+        append_build_element_types: %{},
         append_build_freeze_after: append_freeze_after,
         pvec_names: Pylixir.PvecAnalysis.analyze(body, py_name)
     }
@@ -239,6 +246,8 @@ defmodule Pylixir.Nodes.Functions do
           saved_types,
           saved_freezable_names,
           saved_append_build_names,
+          saved_append_build_type_refinable,
+          saved_append_build_element_types,
           saved_append_build_freeze_after,
           saved_pvec_names
         )
@@ -254,6 +263,7 @@ defmodule Pylixir.Nodes.Functions do
             types: saved_types,
             freezable_names: saved_freezable_names,
             append_build_names: saved_append_build_names,
+            append_build_type_refinable: saved_append_build_type_refinable,
             append_build_freeze_after: saved_append_build_freeze_after,
             pvec_names: saved_pvec_names
         }
@@ -345,6 +355,8 @@ defmodule Pylixir.Nodes.Functions do
          saved_types,
          saved_freezable_names,
          saved_append_build_names,
+         saved_append_build_type_refinable,
+         saved_append_build_element_types,
          saved_append_build_freeze_after,
          saved_pvec_names
        ) do
@@ -368,6 +380,8 @@ defmodule Pylixir.Nodes.Functions do
           types: saved_types,
           freezable_names: saved_freezable_names,
           append_build_names: saved_append_build_names,
+          append_build_type_refinable: saved_append_build_type_refinable,
+          append_build_element_types: saved_append_build_element_types,
           append_build_freeze_after: saved_append_build_freeze_after,
           pvec_names: saved_pvec_names
       }
@@ -399,6 +413,8 @@ defmodule Pylixir.Nodes.Functions do
           types: saved_types,
           freezable_names: saved_freezable_names,
           append_build_names: saved_append_build_names,
+          append_build_type_refinable: saved_append_build_type_refinable,
+          append_build_element_types: saved_append_build_element_types,
           append_build_freeze_after: saved_append_build_freeze_after,
           pvec_names: saved_pvec_names
       }

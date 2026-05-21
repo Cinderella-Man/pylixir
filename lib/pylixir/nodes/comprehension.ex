@@ -42,8 +42,9 @@ defmodule Pylixir.Nodes.Comprehension do
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
     saved_scopes = context.scopes
     saved_types = context.types
-    {target_ast, _, context} = Converter.convert_loop_target(target, context)
-    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
+    elem_t = TypeInfer.elem_of(iter_type)
+    {target_ast, _, context} = Converter.convert_loop_target(target, context, elem_t)
+    context = TypeInfer.bind_pattern(target, elem_t, context)
 
     {pipeline, context} =
       case ifs do
@@ -84,8 +85,9 @@ defmodule Pylixir.Nodes.Comprehension do
     iter_ast = TypeInfer.coerce_iter(iter_ast, iter_type)
     saved_scopes = context.scopes
     saved_types = context.types
-    {target_ast, _, context} = Converter.convert_loop_target(target, context)
-    context = TypeInfer.bind_pattern(target, TypeInfer.elem_of(iter_type), context)
+    elem_t = TypeInfer.elem_of(iter_type)
+    {target_ast, _, context} = Converter.convert_loop_target(target, context, elem_t)
+    context = TypeInfer.bind_pattern(target, elem_t, context)
     {filtered_iter, context} = apply_filter(iter_ast, target_ast, ifs, context)
     {inner, context} = build_comp(rest, elt_node, kind, context)
 

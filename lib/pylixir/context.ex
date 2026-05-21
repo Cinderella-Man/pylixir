@@ -35,6 +35,22 @@ defmodule Pylixir.Context do
       "append-then-readonly" pattern (see `Pylixir.AppendBuildAnalysis`).
       `Pylixir.Nodes.Mutations` consults it to choose the O(1) `[v | xs]`
       prepend lowering for `.append`.
+    * `:append_build_type_refinable` — `MapSet` of names admitted by the
+      looser `Pylixir.AppendBuildAnalysis.type_refinable_names/2`
+      analysis. Superset of `:append_build_names` — additionally admits
+      nested subscript-assigns and reads interleaved with mutations,
+      since those don't affect the element-type lub. Consulted by
+      `Pylixir.TypeInfer.refine_after_append/3` to enable the
+      `:any`-as-`:bottom` trick for `xs = []` element-type tracking.
+    * `:append_build_element_types` — `%{name => elem_t}` accumulating
+      the lub of all observed `.append` arg types for names in
+      `:append_build_type_refinable`. Lives in a separate map so the
+      refinement isn't lost when `If`/`For`/etc. restore `:types` at
+      scope boundaries (a list mutation persists across scopes; only
+      rebindings should be branch-isolated). `Pylixir.TypeInfer.infer_expr/2`
+      for a `Name` consults this map first, so downstream consumers
+      (loop element-type inference, alist freeze, …) see the refined
+      element type regardless of which scope they're in.
     * `:append_build_freeze_after` — `%{stmt_idx => %{name => kind}}`
       keyed by top-level statement index. After emitting the statement
       at index `i`, the body emitter injects one freeze per name. The
@@ -95,6 +111,8 @@ defmodule Pylixir.Context do
           heap_types: %{optional(String.t()) => term()},
           freezable_names: MapSet.t(String.t()),
           append_build_names: MapSet.t(String.t()),
+          append_build_type_refinable: MapSet.t(String.t()),
+          append_build_element_types: %{optional(String.t()) => term()},
           append_build_freeze_after: %{
             optional(non_neg_integer()) =>
               %{optional(String.t()) => :append_tail | :sort_tail}
@@ -132,6 +150,8 @@ defmodule Pylixir.Context do
             heap_types: %{},
             freezable_names: MapSet.new(),
             append_build_names: MapSet.new(),
+            append_build_type_refinable: MapSet.new(),
+            append_build_element_types: %{},
             append_build_freeze_after: %{},
             pvec_names: %{},
             assume_types: %{},
