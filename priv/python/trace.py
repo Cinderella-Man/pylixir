@@ -215,9 +215,23 @@ def write_envelope(out_path: str, envelope: dict[str, Any]) -> None:
 def main(argv: list[str]) -> int:
     source_path, stdin_path, out_path = argv[1], argv[2], argv[3]
 
-    with open(source_path, "r", encoding="utf-8") as fh:
-        source = fh.read()
-    code = compile(source, source_path, "exec")
+    try:
+        with open(source_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except FileNotFoundError:
+        # Source file vanished — typically the parent timed out and cleaned
+        # up before this child was reaped. Exit quietly to avoid leaking a
+        # traceback to the parent's stderr.
+        return 1
+
+    try:
+        code = compile(source, source_path, "exec")
+    except SyntaxError as exc:
+        # Surface a one-line diagnostic on stdout (which the Elixir caller
+        # captures as `output` in `{:tracer_exit, code, output}`) without
+        # printing the full traceback to stderr.
+        print(f"SyntaxError: {exc.msg} (line {exc.lineno})")
+        return 1
 
     state = TraceState(source_path)
     tracer = make_tracer(state)
