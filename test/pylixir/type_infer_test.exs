@@ -506,4 +506,77 @@ defmodule Pylixir.TypeInferTest do
       assert TypeInfer.type_of_term(%{"a" => 1}) == {:dict, {:str}, {:int_lit_nonneg}}
     end
   end
+
+  describe "BuiltinSignatures — flow-sensitive method dispatch" do
+    defp call_attr(recv, method, args) do
+      %{
+        "_type" => "Call",
+        "func" => %{"_type" => "Attribute", "value" => recv, "attr" => method},
+        "args" => args
+      }
+    end
+
+    test "dict.get(k) on {:dict, _, v} returns lub(v, :none)" do
+      c = TypeInfer.bind(ctx(), "d", {:dict, {:str}, {:int}})
+      node = call_attr(name("d"), "get", [const("k")])
+      assert TypeInfer.infer_expr(node, c) == {:union, MapSet.new([{:int}, {:none}])}
+    end
+
+    test "dict.get(k, default) lubs value type with default's type" do
+      c = TypeInfer.bind(ctx(), "d", {:dict, {:str}, {:int}})
+      node = call_attr(name("d"), "get", [const("k"), const(0)])
+      # int_lit_nonneg lub int → int
+      assert TypeInfer.infer_expr(node, c) == {:int}
+    end
+
+    test "dict.setdefault(k, default) lubs value type with default's type" do
+      c = TypeInfer.bind(ctx(), "d", {:dict, {:str}, {:str}})
+      node = call_attr(name("d"), "setdefault", [const("k"), const("z")])
+      assert TypeInfer.infer_expr(node, c) == {:str}
+    end
+
+    test "list.pop() returns element type of the list" do
+      c = TypeInfer.bind(ctx(), "xs", {:list, {:str}})
+      node = call_attr(name("xs"), "pop", [])
+      assert TypeInfer.infer_expr(node, c) == {:str}
+    end
+
+    test "dict.pop(k, default) lubs value type with default's type" do
+      c = TypeInfer.bind(ctx(), "d", {:dict, {:str}, {:int}})
+      node = call_attr(name("d"), "pop", [const("k"), const(-1)])
+      assert TypeInfer.infer_expr(node, c) == {:int}
+    end
+
+    test "method on unknown receiver type falls through to :any" do
+      node = call_attr(name("unknown"), "pop", [])
+      assert TypeInfer.infer_expr(node, ctx()) == :any
+    end
+  end
+
+  describe "BuiltinSignatures — static method returns" do
+    test "partition / rpartition → 3-tuple of strs" do
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("partition") ==
+               {:tuple, [{:str}, {:str}, {:str}]}
+
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("rpartition") ==
+               {:tuple, [{:str}, {:str}, {:str}]}
+    end
+
+    test "format_map / translate / expandtabs / decode → :str" do
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("format_map") == {:str}
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("translate") == {:str}
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("expandtabs") == {:str}
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("decode") == {:str}
+    end
+
+    test "fromkeys → {:dict, :any, :any}" do
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("fromkeys") ==
+               {:dict, :any, :any}
+    end
+
+    test "popitem → {:tuple, :any_arity}" do
+      assert Pylixir.TypeInfer.BuiltinSignatures.method_return_type("popitem") ==
+               {:tuple, :any_arity}
+    end
+  end
 end

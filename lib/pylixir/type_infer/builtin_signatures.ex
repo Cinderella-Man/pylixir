@@ -309,6 +309,104 @@ defmodule Pylixir.TypeInfer.BuiltinSignatures do
       m when m in ["items"] ->
         {:list, {:tuple, :any_arity}}
 
+      # Single-receiver string returners not covered above. Unambiguous
+      # — no other Python type defines these method names.
+      m when m in ["format_map", "translate", "expandtabs", "decode"] ->
+        {:str}
+
+      # str.partition/rpartition always return a 3-tuple of strings.
+      m when m in ["partition", "rpartition"] ->
+        {:tuple, [{:str}, {:str}, {:str}]}
+
+      # dict.fromkeys (classmethod) and dict.popitem are dict-only.
+      "fromkeys" ->
+        {:dict, :any, :any}
+
+      "popitem" ->
+        {:tuple, :any_arity}
+
+      _ ->
+        :any
+    end
+  end
+
+  @doc """
+  Flow-sensitive method return-type lookup. Same as `method_return_type/1`
+  but with access to the full `Call` node and `Context` — lets us
+  refine cases that depend on the receiver's lattice type and the
+  default-argument's type:
+
+    * `d.get(k)` on `{:dict, _, v}` → `lub(v, {:none})`
+    * `d.get(k, default)` → `lub(v, type_of(default))`
+    * `d.setdefault(k, default)` → `lub(v, type_of(default))`
+    * `d.pop(k, default)` → `lub(v, type_of(default))`
+    * `xs.pop()` on `{:list, t}` → `t`
+    * `xs.pop(i)` on `{:list, t}` → `t`
+
+  Falls through to `method_return_type/1` for static (receiver-
+  independent) cases.
+  """
+  @spec method_return_type(String.t(), map(), Context.t()) :: t()
+  def method_return_type(method, %{"_type" => "Call", "func" => func} = node, %Context{} = ctx) do
+    receiver = Map.get(func, "value")
+    args = Map.get(node, "args", [])
+
+    case {method, receiver} do
+      {"get", %{} = recv} ->
+        dict_lookup_with_default(recv, args, {:none}, ctx)
+
+      {"setdefault", %{} = recv} ->
+        dict_lookup_with_default(recv, args, :any, ctx)
+
+      {"pop", %{} = recv} ->
+        pop_return_type(recv, args, ctx)
+
+      _ ->
+        method_return_type(method)
+    end
+  end
+
+  def method_return_type(method, _node, _ctx), do: method_return_type(method)
+
+  # dict.get / dict.setdefault: when receiver is a dict, lub the value
+  # type with the default's type (or with `:none` if no default given).
+  defp dict_lookup_with_default(receiver, args, no_default_fallback, ctx) do
+    case TypeInfer.infer_expr(receiver, ctx) do
+      {:dict, _, v} ->
+        default_t =
+          case args do
+            [_key] -> no_default_fallback
+            [_key, default_node | _] -> TypeInfer.infer_expr(default_node, ctx)
+            _ -> :any
+          end
+
+        TypeInfer.lub(v, default_t)
+
+      _ ->
+        :any
+    end
+  end
+
+  # list.pop returns the element type; dict.pop with a default lub's
+  # the value type with the default's type.
+  defp pop_return_type(receiver, args, ctx) do
+    case TypeInfer.infer_expr(receiver, ctx) do
+      {:list, t} ->
+        t
+
+      {:py_alist, t} ->
+        t
+
+      {:py_pvec, t} ->
+        t
+
+      {:dict, _, v} ->
+        case args do
+          [_key] -> v
+          [_key, default_node | _] -> TypeInfer.lub(v, TypeInfer.infer_expr(default_node, ctx))
+          _ -> :any
+        end
+
       _ ->
         :any
     end

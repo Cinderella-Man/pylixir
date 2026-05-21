@@ -511,7 +511,7 @@ defmodule Pylixir.TypeInfer do
         end
 
       %{"_type" => "Attribute", "attr" => method} ->
-        Pylixir.TypeInfer.BuiltinSignatures.method_return_type(method)
+        Pylixir.TypeInfer.BuiltinSignatures.method_return_type(method, node, ctx)
 
       # Phase 7 Q1+Q2 — callee is an expression (curried Call, Lambda
       # literal, parenthesized Name resolving to fn-type, etc.). If
