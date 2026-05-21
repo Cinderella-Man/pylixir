@@ -24,6 +24,7 @@ defmodule Pylixir.Nodes.Assign do
 
   alias Pylixir.{Converter, MutableModuleDict, Naming, TypeInfer, UnsupportedNodeError}
   alias Pylixir.AST.Trivial
+  alias Pylixir.ExampleInference.BoundaryGuard
 
   @spec assign(map(), Pylixir.Context.t()) :: {Macro.t(), Pylixir.Context.t()}
   def assign(%{"_type" => "Assign", "targets" => targets, "value" => value} = node, context) do
@@ -426,7 +427,7 @@ defmodule Pylixir.Nodes.Assign do
     end
   end
 
-  defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, _node, context) do
+  defp single_target_assign(%{"_type" => "Name", "id" => id} = target, value, node, context) do
     # Module-level mutable dict — the initial `memo = {…}` lives in
     # runtime statements (py_main); we store the value in the process
     # dict so subsequent `memo[k] = v` writes inside top-level defs
@@ -500,7 +501,9 @@ defmodule Pylixir.Nodes.Assign do
               context = TypeInfer.bind(context, id, bound_type)
               context = Converter.bind_name(context, id)
               {target_ast, context} = Converter.convert(target, context)
-              {{:=, [], [target_ast, emitted_value_ast]}, context}
+
+              guarded_value_ast = maybe_wrap_boundary(emitted_value_ast, id, node, context)
+              {{:=, [], [target_ast, guarded_value_ast]}, context}
           end
       end
     end
@@ -1059,5 +1062,20 @@ defmodule Pylixir.Nodes.Assign do
     bind_split2 = {:=, [], [{{star_atom, [], nil}, after_pat}, split2]}
 
     {{:__block__, [], [bind_temp, bind_split1, bind_split2]}, context}
+  end
+
+  defp maybe_wrap_boundary(value_ast, name, node, context) do
+    lineno = Map.get(node, "lineno")
+
+    case Map.get(context.boundary_sites, lineno) do
+      {^name, type} ->
+        case BoundaryGuard.wrap(value_ast, name, type) do
+          {:ok, wrapped} -> wrapped
+          :skip -> value_ast
+        end
+
+      _ ->
+        value_ast
+    end
   end
 end

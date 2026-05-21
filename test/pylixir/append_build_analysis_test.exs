@@ -15,7 +15,7 @@ defmodule Pylixir.AppendBuildAnalysisTest do
       "value" => %{"_type" => "List", "elts" => []}
     }
 
-  defp call(func, args, keywords \\ []),
+  defp call(func, args, keywords),
     do: %{"_type" => "Call", "func" => func, "args" => args, "keywords" => keywords}
 
   defp method_call(recv_id, method, args, keywords \\ []),

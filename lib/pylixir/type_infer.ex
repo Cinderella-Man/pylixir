@@ -188,9 +188,77 @@ defmodule Pylixir.TypeInfer do
   # ---------------------------------------------------------------------
 
   @spec bind(Context.t(), String.t(), t()) :: Context.t()
-  def bind(%Context{types: types} = ctx, name, type) do
-    %{ctx | types: Map.put(types, name, type)}
+  def bind(%Context{} = ctx, name, type) do
+    case lookup_assume(ctx, name) do
+      :none ->
+        %{ctx | types: Map.put(ctx.types, name, type)}
+
+      {:ok, trace_type} ->
+        cond do
+          weak_syntactic?(type) ->
+            %{ctx | types: Map.put(ctx.types, name, trace_type)}
+
+          type == trace_type ->
+            %{ctx | types: Map.put(ctx.types, name, trace_type)}
+
+          true ->
+            # Softened A′: concrete-vs-concrete conflict → drop name from
+            # assume_types, fall back to existing inference for this and
+            # all later binds in this scope.
+            ctx = drop_assume(ctx, name)
+            %{ctx | types: Map.put(ctx.types, name, type)}
+        end
+    end
   end
+
+  defp lookup_assume(%Context{assume_types: at, assume_types_scope: scope}, name) do
+    case scope do
+      nil ->
+        :none
+
+      key ->
+        case at do
+          %{^key => names} ->
+            case Map.fetch(names, name) do
+              {:ok, t} -> {:ok, t}
+              :error -> :none
+            end
+
+          _ ->
+            :none
+        end
+    end
+  end
+
+  defp drop_assume(%Context{assume_types: at, assume_types_scope: scope} = ctx, name) do
+    case scope do
+      nil ->
+        ctx
+
+      key ->
+        case at do
+          %{^key => names} ->
+            updated_names = Map.delete(names, name)
+
+            updated_at =
+              if map_size(updated_names) == 0,
+                do: Map.delete(at, key),
+                else: Map.put(at, key, updated_names)
+
+            %{ctx | assume_types: updated_at}
+
+          _ ->
+            ctx
+        end
+    end
+  end
+
+  defp weak_syntactic?(:any), do: true
+  defp weak_syntactic?(:bottom), do: true
+  defp weak_syntactic?({:list, :any}), do: true
+  defp weak_syntactic?({:dict, :any, :any}), do: true
+  defp weak_syntactic?({:tuple, :any_arity}), do: true
+  defp weak_syntactic?(_), do: false
 
   # ---------------------------------------------------------------------
   # bind_pattern — structural destructure binding (decision Q6-A).
@@ -303,10 +371,18 @@ defmodule Pylixir.TypeInfer do
   # ---------------------------------------------------------------------
 
   @spec demote(Context.t(), String.t()) :: Context.t()
-  def demote(%Context{types: types, heap_types: heap_types} = ctx, name) do
-    types = demote_in(types, name)
-    heap_types = demote_in(heap_types, name)
-    %{ctx | types: types, heap_types: heap_types}
+  def demote(%Context{} = ctx, name) do
+    case lookup_assume(ctx, name) do
+      {:ok, _} ->
+        # Trace-stable name (Q1): skip demotion. The trace observed the
+        # final container element type after all mutations.
+        ctx
+
+      :none ->
+        types = demote_in(ctx.types, name)
+        heap_types = demote_in(ctx.heap_types, name)
+        %{ctx | types: types, heap_types: heap_types}
+    end
   end
 
   defp demote_in(map, name) do

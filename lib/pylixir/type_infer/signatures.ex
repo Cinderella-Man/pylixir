@@ -31,7 +31,7 @@ defmodule Pylixir.TypeInfer.Signatures do
   def infer(function_defs, runtime_statements, %Context{} = ctx) do
     typeable_defs = Enum.filter(function_defs, &typeable_def?/1)
     external_sources = build_external_sources(typeable_defs, runtime_statements)
-    annotated_sigs = collect_annotated_sigs(typeable_defs)
+    annotated_sigs = collect_annotated_sigs(typeable_defs, ctx.assume_fn_signatures)
     initial_sigs = seed_fn_signatures(ctx.fn_signatures, annotated_sigs)
 
     final_sigs =
@@ -50,17 +50,44 @@ defmodule Pylixir.TypeInfer.Signatures do
     %{ctx | fn_signatures: final_sigs}
   end
 
-  # Collect annotation-derived param / return types per FunctionDef.
-  # Result shape: `%{name => {param_types, return_type}}` where each
-  # type is `:any` if the corresponding annotation is absent or maps
-  # to `:any` via `Annotation.annotation_to_type/1`.
-  defp collect_annotated_sigs(defs) do
+  @doc """
+  Collect annotation-derived param / return types per FunctionDef.
+
+  Result shape: `%{name => {param_types, return_type}}` where each type
+  is `:any` if the corresponding annotation is absent or maps to `:any`
+  via `Annotation.annotation_to_type/1`.
+
+  Example-derived signatures (`ctx.assume_fn_signatures`, populated by
+  `Pylixir.ExampleInference`) fill in any slot the syntactic annotation
+  left as `:any`. Syntactic annotations always win when present (Q2 +
+  docs/09).
+  """
+  @spec collect_annotated_sigs([map()], %{optional(String.t()) => {[term()], term()}}) ::
+          %{optional(String.t()) => {[term()], term()}}
+  def collect_annotated_sigs(defs, example_sigs \\ %{}) do
     Map.new(defs, fn def_node ->
       name = def_node["name"]
       args = Map.get(def_node["args"], "args", [])
       param_anns = Enum.map(args, fn arg -> Annotation.annotation_to_type(arg["annotation"]) end)
       return_ann = Annotation.annotation_to_type(def_node["returns"])
-      {name, {param_anns, return_ann}}
+
+      {ex_params, ex_ret} = Map.get(example_sigs, name, {[], :any})
+
+      merged_params =
+        cond do
+          ex_params == [] -> param_anns
+          length(ex_params) != length(param_anns) -> param_anns
+          true ->
+            Enum.zip(param_anns, ex_params)
+            |> Enum.map(fn
+              {:any, ex} -> ex
+              {ann, _ex} -> ann
+            end)
+        end
+
+      merged_return = if return_ann == :any, do: ex_ret, else: return_ann
+
+      {name, {merged_params, merged_return}}
     end)
   end
 

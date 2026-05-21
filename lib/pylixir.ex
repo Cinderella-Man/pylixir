@@ -28,7 +28,20 @@ defmodule Pylixir do
   pylixir does not translate (RFC §4.4).
   """
   @spec to_source(map()) :: String.t()
-  def to_source(python_ast) when is_map(python_ast) do
+  def to_source(python_ast) when is_map(python_ast), do: to_source(python_ast, [])
+
+  @doc """
+  Variant of `to_source/1` accepting options. Supported:
+
+    * `:examples` — list of `%{stdin: String.t(), stdout: String.t()}` maps
+      used to seed example-driven type inference (docs/09). When empty
+      (default), behavior is identical to `to_source/1`.
+  """
+  @spec to_source(map(), keyword()) :: String.t()
+  def to_source(python_ast, opts) when is_map(python_ast) and is_list(opts) do
+    examples = Keyword.get(opts, :examples, [])
+    source = Keyword.get(opts, :source)
+
     body = Pylixir.LiteralPropagation.rewrite(python_ast["body"] || [])
     python_ast = Map.put(python_ast, "body", body)
     analysis = ModuleAnalysis.analyze(body)
@@ -39,6 +52,8 @@ defmodule Pylixir do
         demoted_functions: analysis.demoted_function_names,
         mutable_module_dicts: analysis.mutable_module_dicts
     }
+
+    context = Pylixir.ExampleInference.seed(body, examples, context, source: source)
 
     {elixir_ast, _context} = Converter.convert(python_ast, context, analysis)
     Formatter.format(elixir_ast)
@@ -57,9 +72,19 @@ defmodule Pylixir do
   """
   @spec transpile(String.t()) :: String.t()
   def transpile(python_source) when is_binary(python_source) do
+    transpile(python_source, [])
+  end
+
+  @doc """
+  Variant of `transpile/1` accepting options. See `to_source/2`.
+  """
+  @spec transpile(String.t(), keyword()) :: String.t()
+  def transpile(python_source, opts) when is_binary(python_source) and is_list(opts) do
+    opts = Keyword.put_new(opts, :source, python_source)
+
     python_source
     |> python_ast()
-    |> to_source()
+    |> to_source(opts)
   end
 
   @doc false

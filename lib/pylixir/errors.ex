@@ -72,3 +72,62 @@ defmodule Pylixir.UnsupportedNodeError do
     "#{node_type} at #{location}: #{hint || "not supported"}"
   end
 end
+
+defmodule Pylixir.ExampleConflictError do
+  @moduledoc """
+  Raised by `Pylixir.ExampleInference` when supplied examples produce
+  irreconcilable type observations for the same name across examples
+  (Q7 A, docs/09). Indicates user-authored bad input — the examples
+  exercise the same name with concretely-different types.
+
+  Fields:
+
+    * `:name` — the Python identifier with the disagreement.
+    * `:scope` — `:module` or a top-level def name.
+    * `:observed` — list of observed `TypeInfer.t()` values.
+    * `:message` — human-readable summary.
+  """
+
+  defexception [:name, :scope, :observed, :message]
+
+  @impl true
+  def exception(opts) when is_list(opts) do
+    name = Keyword.fetch!(opts, :name)
+    scope = Keyword.fetch!(opts, :scope)
+    observed = Keyword.fetch!(opts, :observed)
+
+    %__MODULE__{
+      name: name,
+      scope: scope,
+      observed: observed,
+      message:
+        "example_conflict: name `#{name}` in scope #{inspect(scope)} observed as " <>
+          Enum.map_join(observed, " / ", &inspect/1) <> " across examples"
+    }
+  end
+end
+
+defmodule Pylixir.BoundaryViolationError do
+  @moduledoc """
+  Raised at runtime by code emitted from `Pylixir.ExampleInference`'s
+  boundary guards when an input value disagrees with the type observed
+  during example-driven inference (docs/09).
+  """
+
+  defexception [:name, :expected, :observed, :message]
+
+  @impl true
+  def exception(opts) when is_list(opts) do
+    name = Keyword.fetch!(opts, :name)
+    expected = Keyword.fetch!(opts, :expected)
+    observed = Keyword.fetch!(opts, :observed)
+
+    %__MODULE__{
+      name: name,
+      expected: expected,
+      observed: observed,
+      message:
+        "boundary_violation: `#{name}` expected #{inspect(expected)}, got #{inspect(observed)}"
+    }
+  end
+end

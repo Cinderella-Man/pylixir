@@ -49,6 +49,16 @@ defmodule Pylixir.Context do
       `{:py_pvec, _}`, so subsequent `xs[i] = v` and `xs[i]`
       operations route through the O(log n) `:array`-backed helper
       clauses.
+    * `:assume_types` — `%{scope_key => %{name => type}}` populated by
+      `Pylixir.ExampleInference` (docs/09). Scope key is `:module` or
+      a top-level function name. `TypeInfer.bind/3` consults this map
+      to override syntactic types with trace-derived ones; on
+      concrete-vs-concrete conflict it drops the name. Empty when no
+      `examples:` option is supplied to `Pylixir.transpile/2`.
+    * `:boundary_sites` — `%{lineno => {name, observed_type}}` of
+      input-boundary assignments detected by `BoundaryAnalysis` (Q4 C).
+      Converter consults this at Assign lowering to wrap the RHS in a
+      runtime guard. Empty when no examples are supplied.
   """
 
   @type def_position :: :module_top | :nested_fn | :other
@@ -83,7 +93,11 @@ defmodule Pylixir.Context do
           freezable_names: MapSet.t(String.t()),
           append_build_names: MapSet.t(String.t()),
           append_build_freeze_after: %{optional(non_neg_integer()) => MapSet.t(String.t())},
-          pvec_names: %{optional(String.t()) => map()}
+          pvec_names: %{optional(String.t()) => map()},
+          assume_types: %{optional(:module | String.t()) => %{optional(String.t()) => term()}},
+          assume_types_scope: :module | String.t() | nil,
+          assume_fn_signatures: %{optional(String.t()) => {[term()], term()}},
+          boundary_sites: %{optional(non_neg_integer()) => {String.t(), term()}}
         }
 
   @enforce_keys [:scopes]
@@ -112,7 +126,11 @@ defmodule Pylixir.Context do
             freezable_names: MapSet.new(),
             append_build_names: MapSet.new(),
             append_build_freeze_after: %{},
-            pvec_names: %{}
+            pvec_names: %{},
+            assume_types: %{},
+            assume_types_scope: :module,
+            assume_fn_signatures: %{},
+            boundary_sites: %{}
 
   @doc """
   Build a fresh context with a single empty scope and the given set of
