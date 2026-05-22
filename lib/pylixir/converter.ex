@@ -2861,6 +2861,28 @@ defmodule Pylixir.Converter do
 
   # --- Literal-container rejections --------------------------------------
 
+  # `del coll[start:stop:step]` — slice deletion. Reconstruct the list
+  # without the selected indices (mirrors Python's `coll[a:b] = []`).
+  defp convert_del_target(
+         %{
+           "_type" => "Subscript",
+           "value" => %{"_type" => "Name", "id" => coll_id} = collection,
+           "slice" => %{"_type" => "Slice"} = slice_node
+         },
+         _node,
+         context
+       ) do
+    {start_ast, context} = convert_optional(Map.get(slice_node, "lower"), context)
+    {stop_ast, context} = convert_optional(Map.get(slice_node, "upper"), context)
+    {step_ast, context} = convert_optional(Map.get(slice_node, "step"), context)
+    {coll_ast, context} = convert(collection, context)
+    context = TypeInfer.demote(context, coll_id)
+    context = bind_name(context, coll_id)
+
+    rhs = {:py_slice_delete, [], [coll_ast, start_ast, stop_ast, step_ast]}
+    {{:=, [], [coll_ast, rhs]}, context}
+  end
+
   defp convert_del_target(
          %{
            "_type" => "Subscript",

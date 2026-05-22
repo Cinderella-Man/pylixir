@@ -393,7 +393,7 @@ defmodule Pylixir.Nodes.Mutations do
     do: {:++, [], [target, other]}
 
   defp mutation_rhs("remove", target, [x], _kw, _node),
-    do: {{:., [], [{:__aliases__, [], [:List]}, :delete]}, [], [target, x]}
+    do: {:py_remove, [], [target, x]}
 
   defp mutation_rhs("clear", target, [], _kw, _node) do
     # Heuristic at codegen time — emit a runtime branch.

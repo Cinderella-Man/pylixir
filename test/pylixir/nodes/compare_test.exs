@@ -77,11 +77,14 @@ defmodule Pylixir.Nodes.CompareTest do
         )
 
       # Should be a flat &&-chain with x referenced twice, no temp binding.
+      # `x` is untyped (`:any`), so each `<` becomes the nil-coercing
+      # `py_lt` helper (a Counter/defaultdict miss must compare as 0, not
+      # sort above numbers — see Pylixir.Nodes.Compare.order_cmp/6).
       assert ast ==
                {:&&, [],
                 [
-                  {:<, [], [1, {:x, [], nil}]},
-                  {:<, [], [{:x, [], nil}, 10]}
+                  {:py_lt, [], [1, {:x, [], nil}]},
+                  {:py_lt, [], [{:x, [], nil}, 10]}
                 ]}
     end
 

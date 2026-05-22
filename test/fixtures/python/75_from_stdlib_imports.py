@@ -21,8 +21,7 @@ xs = [1, 3, 5, 7, 9]
 print(bisect_left(xs, 4))                 # 2
 print(bisect_right(xs, 5))                # 3
 
-# itertools.combinations — returns list-like; iterate and index so the
-# golden assertion doesn't depend on tuple-vs-list print format
-# (Pylixir's combinations helper returns lists, like py_permutations).
+# itertools.combinations — yields tuples like CPython; iterate and index
+# (both work on tuples).
 for combo in combinations([1, 2, 3, 4], 2):
     print(combo[0], combo[1])

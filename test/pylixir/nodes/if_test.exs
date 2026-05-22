@@ -33,8 +33,9 @@ defmodule Pylixir.Nodes.IfTest do
           Context.new()
         )
 
-      # Compare test → no truthy? wrap; body single stmt → no __block__
-      assert ast == {:if, [], [{:>, [], [{:x, [], nil}, 0]}, [do: 1]]}
+      # Compare test → no truthy? wrap; body single stmt → no __block__.
+      # `x` is untyped (:any), so `>` lowers to the nil-coercing `py_gt`.
+      assert ast == {:if, [], [{:py_gt, [], [{:x, [], nil}, 0]}, [do: 1]]}
     end
 
     test "orelse is a non-If statement → `if cond, do: body, else: orelse`" do
@@ -47,7 +48,7 @@ defmodule Pylixir.Nodes.IfTest do
       assert ast ==
                {:if, [],
                 [
-                  {:>, [], [{:x, [], nil}, 0]},
+                  {:py_gt, [], [{:x, [], nil}, 0]},
                   [do: 1, else: 2]
                 ]}
     end
@@ -134,7 +135,7 @@ defmodule Pylixir.Nodes.IfTest do
       assert ast ==
                {:if, [],
                 [
-                  {:>, [], [{:x, [], nil}, 0]},
+                  {:py_gt, [], [{:x, [], nil}, 0]},
                   [do: 1, else: -1]
                 ]}
     end

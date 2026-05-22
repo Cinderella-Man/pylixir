@@ -52,6 +52,25 @@ defmodule Pylixir.TypeInferTest do
     end
   end
 
+  describe "infer_expr/2 — Subscript index vs slice" do
+    test "index into a list returns the element type" do
+      c = TypeInfer.bind(ctx(), "xs", {:list, {:int}})
+      sub = %{"_type" => "Subscript", "value" => name("xs"), "slice" => const(0)}
+      assert TypeInfer.infer_expr(sub, c) == {:int}
+    end
+
+    # `xs[:i]` is a list, not the element type. Mis-inferring it as the
+    # element type made `xs[:i] + xs[i:]` lower to native `+` (numeric)
+    # instead of `py_add` (list concat), crashing on `:erlang.+([], [])`
+    # under example-driven inference (eval-corpus seed_29772).
+    test "slice of a list stays a list" do
+      c = TypeInfer.bind(ctx(), "xs", {:list, {:int}})
+      slice = %{"_type" => "Slice", "lower" => nil, "upper" => name("i"), "step" => nil}
+      sub = %{"_type" => "Subscript", "value" => name("xs"), "slice" => slice}
+      assert TypeInfer.infer_expr(sub, c) == {:list, {:int}}
+    end
+  end
+
   describe "infer_expr/2 — container literals" do
     test "List of ints" do
       list = %{"_type" => "List", "elts" => [const(1), const(2), const(3)]}

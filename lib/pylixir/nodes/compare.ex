@@ -87,10 +87,10 @@ defmodule Pylixir.Nodes.Compare do
       {:!=, [], [l, r]}
     end
   end
-  def pair_ast(%{"_type" => "Lt"}, l, r, _lt, _rt), do: {:<, [], [l, r]}
-  def pair_ast(%{"_type" => "LtE"}, l, r, _lt, _rt), do: {:<=, [], [l, r]}
-  def pair_ast(%{"_type" => "Gt"}, l, r, _lt, _rt), do: {:>, [], [l, r]}
-  def pair_ast(%{"_type" => "GtE"}, l, r, _lt, _rt), do: {:>=, [], [l, r]}
+  def pair_ast(%{"_type" => "Lt"}, l, r, lt, rt), do: order_cmp(:<, :py_lt, l, r, lt, rt)
+  def pair_ast(%{"_type" => "LtE"}, l, r, lt, rt), do: order_cmp(:<=, :py_le, l, r, lt, rt)
+  def pair_ast(%{"_type" => "Gt"}, l, r, lt, rt), do: order_cmp(:>, :py_gt, l, r, lt, rt)
+  def pair_ast(%{"_type" => "GtE"}, l, r, lt, rt), do: order_cmp(:>=, :py_ge, l, r, lt, rt)
   def pair_ast(%{"_type" => "Is"}, l, r, _lt, _rt), do: {:==, [], [l, r]}
   def pair_ast(%{"_type" => "IsNot"}, l, r, _lt, _rt), do: {:!=, [], [l, r]}
 
@@ -103,6 +103,21 @@ defmodule Pylixir.Nodes.Compare do
   defp alist_or_pvec?({:py_alist, _}), do: true
   defp alist_or_pvec?({:py_pvec, _}), do: true
   defp alist_or_pvec?(_), do: false
+
+  # Ordering comparison: native `<`/`<=`/`>`/`>=` when both operand types
+  # are statically known (cannot be nil), else a nil-coercing helper so a
+  # `defaultdict`/`Counter` miss (`nil`) compares as 0 rather than sorting
+  # above every number (eval-corpus seed_5737, `Counter(s)[c] < n`).
+  defp order_cmp(native_op, helper, l, r, lt, rt) do
+    if maybe_nil?(lt) or maybe_nil?(rt) do
+      {helper, [], [l, r]}
+    else
+      {native_op, [], [l, r]}
+    end
+  end
+
+  defp maybe_nil?(:any), do: true
+  defp maybe_nil?(_), do: false
 
   defp in_emit(l, r, lt, rt) do
     cond do

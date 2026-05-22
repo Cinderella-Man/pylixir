@@ -54,7 +54,22 @@ defmodule Pylixir.RuntimeHelpers do
   def py_add(a, b) when is_boolean(a), do: py_add(py_bool_to_int(a), b)
   def py_add(a, b) when is_boolean(b), do: py_add(a, py_bool_to_int(b))
   def py_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
-  def py_add(a, b) when is_number(a) and is_number(b), do: a + b
+  def py_add(a, b) when is_integer(a) and is_integer(b), do: a + b
+
+  # At least one float: the sum is an IEEE double and can overflow.
+  # `float('inf')` lowers to the finite sentinel `±1.0e308` (see
+  # `Pylixir.Builtins`), so the common `dist[u] + dist[v]` pattern over
+  # unreachable BFS/DP nodes sums two sentinels and would raise
+  # ArithmeticError. Saturate the overflow back to the sentinel so
+  # `inf + finite == inf` and `inf + inf == inf`, matching Python and
+  # `py_str_float/1`'s `1.0e308 -> "inf"` round-trip. Same-sign operands
+  # are the only ones that can overflow, so `a`'s sign picks the limit.
+  def py_add(a, b) when is_number(a) and is_number(b) do
+    a + b
+  rescue
+    ArithmeticError -> if a < 0, do: -1.0e308, else: 1.0e308
+  end
+
   def py_add(a, b) when is_list(a) and is_list(b), do: a ++ b
 
   # Python's `(1, 2) + (3, 4) == (1, 2, 3, 4)` — tuple concat. Round-
@@ -64,6 +79,12 @@ defmodule Pylixir.RuntimeHelpers do
     do: (Tuple.to_list(a) ++ Tuple.to_list(b)) |> List.to_tuple()
 
   def py_add(a, b), do: a + b
+
+  # `nil`-tolerant clauses mirror `py_add`/`py_mult`: a missing
+  # `defaultdict(int)` key reads as `nil`, so `d[a] - d[missing]` must
+  # treat `nil` as the integer 0 rather than crash on `:erlang.-(_, nil)`.
+  def py_sub(nil, b), do: py_sub(0, b)
+  def py_sub(a, nil), do: py_sub(a, 0)
 
   # RFC §6.11 — booleans coerce to ints in arithmetic.
   def py_sub(a, b) when is_boolean(a), do: py_sub(py_bool_to_int(a), b)
@@ -88,6 +109,28 @@ defmodule Pylixir.RuntimeHelpers do
   def py_div(a, b) when is_boolean(a), do: py_div(py_bool_to_int(a), b)
   def py_div(a, b) when is_boolean(b), do: py_div(a, py_bool_to_int(b))
   def py_div(a, b), do: a / b
+
+  # Ordering comparisons that may see a `nil` from a `defaultdict`/`Counter`
+  # miss (`Counter(s)[absent] < n`). Elixir ranks `nil` (an atom) ABOVE
+  # numbers, so a native `nil < n` is silently `false`; Python treats the
+  # missing count as 0. Coerce `nil` → 0 (consistent with py_add/sub/mult),
+  # leaving every other term to compare natively. Emitted only when an
+  # operand's static type is unknown (`:any`) — see `Pylixir.Nodes.Compare`.
+  def py_lt(a, b), do: py_cmp_coerce(a) < py_cmp_coerce(b)
+  def py_le(a, b), do: py_cmp_coerce(a) <= py_cmp_coerce(b)
+  def py_gt(a, b), do: py_cmp_coerce(a) > py_cmp_coerce(b)
+  def py_ge(a, b), do: py_cmp_coerce(a) >= py_cmp_coerce(b)
+
+  def py_cmp_coerce(nil), do: 0
+  def py_cmp_coerce(x), do: x
+
+  # `nil`-tolerant clauses mirror `py_add`: a missing `defaultdict(int)`
+  # key reads as `nil` (see `py_getitem`), so `count * d[missing]` must
+  # treat `nil` as the integer 0 rather than crash on `:erlang.*(_, nil)`.
+  # Delegating to `0` (not returning 0) preserves Python's polymorphic
+  # `0 * x` — `0 * "ab" == ""`, `0 * [1] == []`.
+  def py_mult(nil, b), do: py_mult(0, b)
+  def py_mult(a, nil), do: py_mult(a, 0)
 
   def py_mult(a, b) when is_boolean(a), do: py_mult(py_bool_to_int(a), b)
   def py_mult(a, b) when is_boolean(b), do: py_mult(a, py_bool_to_int(b))
@@ -626,6 +669,15 @@ defmodule Pylixir.RuntimeHelpers do
   # set instead of crashing in `MapSet.put(nil, v)`.
   def py_set_add(nil, v), do: MapSet.new([v])
   def py_set_add(%MapSet{} = s, v), do: MapSet.put(s, v)
+
+  # `coll.remove(x)` — receiver-polymorphic like `.add`/`.clear`. Python
+  # `set.remove` and `list.remove` share a method name but need different
+  # ops; a `defaultdict(set)` value reaches here as a MapSet, so a
+  # hardcoded `List.delete` raised FunctionClauseError (eval-corpus
+  # seed_25097). `list.remove` drops the first occurrence; `set.remove`
+  # deletes the member.
+  def py_remove(%MapSet{} = s, x), do: MapSet.delete(s, x)
+  def py_remove(list, x) when is_list(list), do: List.delete(list, x)
 
   # `x.is_integer()` — Python `float`/`int` method: True when the value
   # has no fractional part. Ints are always integral; floats compare
@@ -1414,13 +1466,14 @@ defmodule Pylixir.RuntimeHelpers do
   # === itertools.combinations ===
 
   # Mirrors Python's `itertools.combinations(iter, r)` — every r-length
-  # subset of `iter` in lexicographic order. Returns lists rather than
-  # tuples (Python returns tuples, but every common downstream use —
-  # `set(combo)`, `for x in combo`, `combo[i]` — works equivalently
-  # on lists in Pylixir's lowering).
+  # subset of `iter` in lexicographic order. Yields *tuples*, like
+  # CPython: example-driven inference observes the tuple element type and
+  # lowers `for i, j in combinations(...)` to a tuple pattern `{i, j}`, so
+  # list elements would raise FunctionClauseError. The inner recursion
+  # builds lists (cheap prepend); the boundary converts to tuples.
   def py_combinations(enum, r) when is_integer(r) and r >= 0 do
     list = if is_list(enum), do: enum, else: Enum.to_list(enum)
-    py_combinations_inner(list, r)
+    py_combinations_inner(list, r) |> Enum.map(&List.to_tuple/1)
   end
 
   # Recursive inner — public `def` (not `defp`) to keep the
@@ -1539,7 +1592,7 @@ defmodule Pylixir.RuntimeHelpers do
   # `h` AGAIN, so recurse over the SAME list (`[h | t]`), not its
   # tail.
   def py_combinations_with_replacement(enum, r) when is_integer(r) and r >= 0 do
-    py_cwr_inner(py_iter_to_list(enum), r)
+    py_cwr_inner(py_iter_to_list(enum), r) |> Enum.map(&List.to_tuple/1)
   end
 
   def py_cwr_inner(_, 0), do: [[]]
@@ -1553,8 +1606,12 @@ defmodule Pylixir.RuntimeHelpers do
 
   # Python's `itertools.permutations(iter)` — all orderings of the input.
   # `itertools.permutations(iter, r)` — r-length permutations.
-  # Returns lists (same convention as py_combinations). Output order
-  # matches CPython: lexicographic over the input's positional indices.
+  # Yields *tuples*, like CPython (and like `py_product`): example-driven
+  # inference observes the tuple element type and lowers `a, b, c = perm`
+  # to a tuple pattern, so a list element would raise MatchError. Output
+  # order matches CPython: lexicographic over the input's positional
+  # indices. The inner recursion builds lists (cheap prepend); the
+  # boundary converts each completed permutation to a tuple.
   def py_permutations(enum) do
     list = if is_list(enum), do: enum, else: Enum.to_list(enum)
     py_permutations(list, length(list))
@@ -1562,7 +1619,7 @@ defmodule Pylixir.RuntimeHelpers do
 
   def py_permutations(enum, r) when is_integer(r) and r >= 0 do
     list = if is_list(enum), do: enum, else: Enum.to_list(enum)
-    py_permutations_inner(list, r)
+    py_permutations_inner(list, r) |> Enum.map(&List.to_tuple/1)
   end
 
   def py_permutations_inner(_, 0), do: [[]]
@@ -1648,6 +1705,26 @@ defmodule Pylixir.RuntimeHelpers do
   def py_slice_assign_stepped(list, indices, new_seq) do
     pairs = Enum.zip(indices, new_seq) |> Map.new()
     Enum.with_index(list, fn x, i -> Map.get(pairs, i, x) end)
+  end
+
+  # `del coll[start:stop:step]` — remove the slice's elements. For the
+  # contiguous (step 1) case this is the prefix ++ suffix around the
+  # bounds; for a stepped slice we drop exactly the selected indices.
+  def py_slice_delete(list, start, stop, step) when is_list(list) do
+    step_v = step || 1
+    len = length(list)
+    {s, e} = py_slice_bounds(start, stop, step_v, len)
+
+    if step_v == 1 do
+      Enum.take(list, s) ++ Enum.drop(list, e)
+    else
+      drop = MapSet.new(py_slice_indices(s, e, step_v))
+
+      list
+      |> Enum.with_index()
+      |> Enum.reject(fn {_x, i} -> MapSet.member?(drop, i) end)
+      |> Enum.map(&elem(&1, 0))
+    end
   end
 
   # === Bisect (sorted-list insertion-point search) ===
@@ -1952,6 +2029,17 @@ defmodule Pylixir.RuntimeHelpers do
     end
   end
 
+  # `next(it)` where `it` is a materialized iterable rather than an
+  # `iter()`-made handle — e.g. a generator expression / comprehension,
+  # which Pylixir lowers to a list. Take the head (no stateful advance;
+  # the common `next(genexpr, default)` idiom reads the first match).
+  def py_iter_next(other) do
+    case py_iter_to_list(other) do
+      [] -> raise RuntimeError, "StopIteration"
+      [h | _] -> h
+    end
+  end
+
   def py_iter_next(ref, default) when is_integer(ref) do
     case Process.get({:pylixir_iter, ref}) do
       nil ->
@@ -1963,6 +2051,13 @@ defmodule Pylixir.RuntimeHelpers do
       [h | t] ->
         Process.put({:pylixir_iter, ref}, t)
         h
+    end
+  end
+
+  def py_iter_next(other, default) do
+    case py_iter_to_list(other) do
+      [] -> default
+      [h | _] -> h
     end
   end
 

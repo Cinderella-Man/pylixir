@@ -242,14 +242,23 @@ defmodule Pylixir.LoopAnalysis do
     |> MapSet.new()
   end
 
-  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` (and bare-Name
-  # forms after `from heapq import …`) rebind `heap` via the Converter's
-  # Expr-clause rewrite. For-loop bodies must thread `heap` through the
-  # accumulator. Recognizer lives on `Pylixir.Stdlib.Heapq`.
+  # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` and
+  # `bisect.insort(xs, v)` (plus bare-Name forms after `from heapq/bisect
+  # import …`) rebind their list argument via the Converter's Expr-clause
+  # rewrite. For-loop bodies must thread that name through the
+  # accumulator — without this, the rebind is discarded each iteration
+  # and the list stays at its pre-loop value (eval-corpus seed_3783).
+  # Mirrors `ModuleAnalysis.mutates_name?`, which checks both stdlibs.
   defp names_assigned_in(%{"_type" => "Expr", "value" => value}) do
     case Pylixir.Stdlib.Heapq.statement_mutation_call(value, nil) do
-      {:ok, name, _, _} -> MapSet.new([name])
-      :none -> MapSet.new()
+      {:ok, name, _, _} ->
+        MapSet.new([name])
+
+      _ ->
+        case Pylixir.Stdlib.Bisect.statement_mutation_call(value, nil) do
+          {:ok, name, _, _} -> MapSet.new([name])
+          _ -> MapSet.new()
+        end
     end
   end
 

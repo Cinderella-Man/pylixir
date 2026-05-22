@@ -70,6 +70,17 @@ defmodule Pylixir.RuntimeHelpersTest do
       assert H.py_add(true, 1) == 2
       assert H.py_add(false, 5) == 5
     end
+
+    # `float('inf')` lowers to the finite sentinel `1.0e308` (builtins.ex).
+    # Erlang has no IEEE infinity, so summing two sentinels overflows and
+    # raises ArithmeticError. Python's `inf + inf == inf`, so the sentinel
+    # sum must saturate back to `1.0e308` rather than crash (the BFS/DP
+    # `dist[u] + dist[v]` pattern over unreachable nodes hits this).
+    test "float('inf') sentinel sums saturate instead of overflowing" do
+      assert H.py_add(1.0e308, 1.0e308) == 1.0e308
+      assert H.py_add(-1.0e308, -1.0e308) == -1.0e308
+      assert H.py_add(1.0e308, 1.0) == 1.0e308
+    end
   end
 
   describe "py_str/1 — Python str() representation (RFC §6.7)" do
@@ -209,6 +220,15 @@ defmodule Pylixir.RuntimeHelpersTest do
     test "empty minus empty → empty" do
       assert H.py_sub(%{}, %{}) == %{}
     end
+
+    # Same `defaultdict(int)` idiom as py_add/py_mult: a missing key reads
+    # as nil, so `d[a] - d[missing]` must treat nil as 0 instead of
+    # crashing on `:erlang.-(5, nil)`.
+    test "nil operand acts as the integer 0 (defaultdict idiom)" do
+      assert H.py_sub(5, nil) == 5
+      assert H.py_sub(nil, 2) == -2
+      assert H.py_sub(nil, nil) == 0
+    end
   end
 
   describe "py_floor_div/2 — Python `//` (RFC §6.1)" do
@@ -249,6 +269,128 @@ defmodule Pylixir.RuntimeHelpersTest do
       assert H.py_mult(true, 5) == 5
       assert H.py_abs(true) == 1
       assert H.py_abs(false) == 0
+    end
+  end
+
+  describe "py_mult/2 — nil tolerance for the defaultdict(int) idiom" do
+    # A missing `defaultdict(int)` key reads as `nil` (py_getitem returns
+    # nil, builtins.ex emits `%{}` for defaultdict). `py_add` already
+    # treats nil as 0; `py_mult` must too, so `count * d[missing]`
+    # evaluates to 0 instead of raising `:erlang.*(0, nil)`.
+    test "nil multiplicand acts as the integer 0" do
+      assert H.py_mult(0, nil) == 0
+      assert H.py_mult(nil, 5) == 0
+      assert H.py_mult(7, nil) == 0
+    end
+
+    # `0 * x` is type-polymorphic in Python: 0 * "ab" == "", 0 * [1] == [].
+    # A nil (== 0) multiplicand must follow the same semantics.
+    test "nil follows Python's 0-as-repeat-count semantics for seqs" do
+      assert H.py_mult(nil, "ab") == ""
+      assert H.py_mult([1, 2], nil) == []
+    end
+  end
+
+  describe "py_lt/py_le/py_gt/py_ge — nil-coercing ordering comparisons" do
+    # A `Counter`/`defaultdict` miss reads as nil; Elixir ranks nil above
+    # numbers so `nil < n` is wrongly false. These helpers coerce nil → 0
+    # to match Python's `Counter()[absent] == 0` (eval-corpus seed_5737).
+    test "nil compares as the integer 0" do
+      assert H.py_lt(nil, 1) == true
+      assert H.py_lt(nil, 0) == false
+      assert H.py_gt(5, nil) == true
+      assert H.py_ge(nil, 0) == true
+      assert H.py_le(nil, -1) == false
+    end
+
+    test "non-nil operands compare natively" do
+      assert H.py_lt(2, 5) == true
+      assert H.py_gt("b", "a") == true
+      assert H.py_le(3, 3) == true
+    end
+  end
+
+  describe "py_permutations/1,2 — yields tuples like CPython" do
+    # `itertools.permutations` yields *tuples* in CPython. Pylixir used
+    # to yield lists, which broke example-driven inference: when the
+    # tracer observes tuple-typed permutation elements, `a, b, c = perm`
+    # lowers to a tuple pattern `{a, b, c} = perm`, and matching that
+    # against a list raised MatchError (eval-corpus seed_30319).
+    test "elements are tuples, not lists" do
+      perms = H.py_permutations([1, 2, 3])
+      assert {1, 2, 3} in perms
+      assert Enum.all?(perms, &is_tuple/1)
+      assert length(perms) == 6
+    end
+
+    test "r-length form also yields tuples" do
+      perms = H.py_permutations([1, 2, 3], 2)
+      assert Enum.all?(perms, &is_tuple/1)
+      assert {1, 2} in perms
+      assert length(perms) == 6
+    end
+  end
+
+  describe "py_combinations/2 — yields tuples like CPython" do
+    # Same tuple-vs-list issue as py_permutations: `for i, j in
+    # combinations(xs, 2)` lowers to a tuple pattern `{i, j}` under
+    # example-driven inference, so list elements raise FunctionClauseError
+    # in the reduce callback (eval-corpus seed_29881).
+    test "combinations elements are tuples" do
+      combos = H.py_combinations([1, 2, 3], 2)
+      assert Enum.all?(combos, &is_tuple/1)
+      assert combos == [{1, 2}, {1, 3}, {2, 3}]
+    end
+
+    test "combinations_with_replacement elements are tuples" do
+      combos = H.py_combinations_with_replacement([1, 2], 2)
+      assert Enum.all?(combos, &is_tuple/1)
+      assert combos == [{1, 1}, {1, 2}, {2, 2}]
+    end
+  end
+
+  describe "py_slice_delete/4 — del coll[a:b:c]" do
+    # `del queue[:m]` (slice deletion) was unsupported (raised on the
+    # bare Slice node) — eval-corpus seed_27619.
+    test "contiguous slice deletion" do
+      assert H.py_slice_delete([1, 2, 3, 4, 5], nil, 2, nil) == [3, 4, 5]
+      assert H.py_slice_delete([1, 2, 3, 4, 5], 2, nil, nil) == [1, 2]
+      assert H.py_slice_delete([1, 2, 3, 4, 5], 1, 3, nil) == [1, 4, 5]
+    end
+
+    test "stepped slice deletion drops the selected indices" do
+      assert H.py_slice_delete([0, 1, 2, 3, 4, 5], nil, nil, 2) == [1, 3, 5]
+    end
+  end
+
+  describe "py_remove/2 — receiver-polymorphic .remove()" do
+    # `defaultdict(set)` values reach `.remove` as a MapSet; a hardcoded
+    # List.delete raised FunctionClauseError (eval-corpus seed_25097).
+    test "set.remove deletes the member" do
+      assert H.py_remove(MapSet.new([1, 2, 3]), 2) == MapSet.new([1, 3])
+    end
+
+    test "list.remove drops the first occurrence (unchanged behaviour)" do
+      assert H.py_remove([1, 2, 3, 2], 2) == [1, 3, 2]
+    end
+  end
+
+  describe "py_iter_next/1,2 — next() over a materialized iterable" do
+    # A generator expression / comprehension lowers to a *list*, so
+    # `next((p for p in xs if cond), default)` calls py_iter_next on a
+    # list, not an `iter()`-made integer handle. Without a list clause
+    # this raised FunctionClauseError (eval-corpus seed_25097).
+    test "returns the first element of a list" do
+      assert H.py_iter_next([10, 20, 30]) == 10
+    end
+
+    test "2-arg form returns default on empty, head otherwise" do
+      assert H.py_iter_next([], :sentinel) == :sentinel
+      assert H.py_iter_next([7, 8], :sentinel) == 7
+    end
+
+    test "1-arg form raises StopIteration on empty" do
+      assert_raise RuntimeError, ~r/StopIteration/, fn -> H.py_iter_next([]) end
     end
   end
 

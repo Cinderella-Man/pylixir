@@ -521,7 +521,10 @@ defmodule Pylixir.TypeInfer do
   def infer_expr(%{"_type" => "Subscript", "value" => val, "slice" => slice}, ctx) do
     case infer_expr(val, ctx) do
       {:list, e} ->
-        e
+        # A `Slice` subscript (`xs[:i]`, `xs[a:b]`) yields a *list*, not
+        # the element type — otherwise `xs[:i] + xs[i:]` mis-lowers to
+        # native numeric `+` instead of `py_add` list concat.
+        if match?(%{"_type" => "Slice"}, slice), do: {:list, e}, else: e
 
       # decision Q1-B: dict subscript reads return :any to preserve the
       # py_add(nil, n) = n defaultdict idiom.
