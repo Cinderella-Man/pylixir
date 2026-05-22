@@ -1,0 +1,16 @@
+# Build artifacts
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/config/*.secret.exs
+.elixir_ls/
+
+# Curator working dirs (regenerable / large)
+/cache/
+/tmp/
+/out/
