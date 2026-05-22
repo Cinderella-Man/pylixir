@@ -37,6 +37,7 @@ defmodule Dataset.Corpus do
 
   alias Dataset.Dataset
   require Explorer.DataFrame, as: DF
+  require Logger
 
   @cache_filename "corpus_v1.term.gz"
   @cache_version 1
@@ -90,11 +91,11 @@ defmodule Dataset.Corpus do
     {solutions_by_qid, testcases_by_qid} =
       case load_cache(k, cache_path) do
         {:hit, payload} ->
-          IO.puts("[corpus] warm cache hit (#{cache_path})")
+          Logger.info("[corpus] warm cache hit (#{cache_path})")
           {payload.solutions_by_qid, payload.testcases_by_qid}
 
         :miss ->
-          IO.puts("[corpus] cold build (testcase_shards=#{k})")
+          Logger.info("[corpus] cold build (testcase_shards=#{k})")
           rebuild_and_cache(k, dataset, cache_path)
       end
 
@@ -119,7 +120,7 @@ defmodule Dataset.Corpus do
 
     solutions_by_qid =
       Enum.reduce(0..(sft_total - 1), %{}, fn idx, acc ->
-        IO.puts("[corpus] seed_sft shard #{idx + 1}/#{sft_total}")
+        Logger.info("[corpus] seed_sft shard #{idx + 1}/#{sft_total}")
         df = dataset.read_sft_shard(idx, ["question_id", "code", "is_passed"])
         accumulate_solutions(df, acc)
       end)
@@ -129,7 +130,7 @@ defmodule Dataset.Corpus do
 
     testcases_by_qid =
       Enum.reduce(0..(k - 1), %{}, fn idx, acc ->
-        IO.puts("[corpus] seed_testcase shard #{idx + 1}/#{k}")
+        Logger.info("[corpus] seed_testcase shard #{idx + 1}/#{k}")
 
         df =
           dataset.read_testcase_shard(idx, qid_filter, [
@@ -291,7 +292,7 @@ defmodule Dataset.Corpus do
     File.write!(partial, binary)
     File.rename!(partial, path)
 
-    IO.puts("[corpus] wrote #{path} (#{format_bytes(byte_size(binary))})")
+    Logger.info("[corpus] wrote #{path} (#{format_bytes(byte_size(binary))})")
   end
 
   defp collect_parquet_mtimes(k, dataset) do

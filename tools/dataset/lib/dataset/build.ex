@@ -14,6 +14,7 @@ defmodule Dataset.Build do
   """
 
   alias Dataset.{Candidates, Corpus, Emit, MergeGroups, PythonCache, Sandbox, Select}
+  require Logger
 
   @doc """
   Run the build. Returns `{:ok, out_dir, summary}`.
@@ -38,7 +39,7 @@ defmodule Dataset.Build do
     {:ok, _} = PythonCache.ensure_started(path: cache_path(opts))
     unless Keyword.get(opts, :no_sandbox, false), do: Sandbox.self_test!()
 
-    IO.puts("[build] loading corpus (testcase_shards=#{k})")
+    Logger.info("[build] loading corpus (testcase_shards=#{k})")
 
     corpus_opts =
       [dataset_module: dataset, testcase_shards: k]
@@ -46,7 +47,7 @@ defmodule Dataset.Build do
 
     {solutions_by_qid, testcases_by_qid, stats} = Corpus.grouped(corpus_opts)
 
-    IO.puts("[build] #{stats.total_qids_with_solutions} qids with solutions; grouping near-dups")
+    Logger.info("[build] #{stats.total_qids_with_solutions} qids with solutions; grouping near-dups")
     qid_to_group =
       MergeGroups.build(Map.keys(solutions_by_qid),
         dataset_module: dataset,
@@ -66,7 +67,7 @@ defmodule Dataset.Build do
       |> apply_skip_limit(Keyword.get(opts, :skip), Keyword.get(opts, :limit))
 
     total = length(selected)
-    IO.puts("[build] selecting over #{total} merge-groups")
+    Logger.info("[build] selecting over #{total} merge-groups")
 
     select_opts = [
       run_count: Keyword.get(opts, :run_count, 5),
@@ -98,7 +99,7 @@ defmodule Dataset.Build do
       )
 
     summary = %{groups: total, kept: length(results), dropped: total - length(results)}
-    IO.puts("[build] done: #{summary.kept} kept / #{summary.dropped} dropped → #{out_dir}")
+    Logger.info("[build] done: #{summary.kept} kept / #{summary.dropped} dropped → #{out_dir}")
     {:ok, out_dir, summary}
   end
 
@@ -108,7 +109,7 @@ defmodule Dataset.Build do
     result = Select.select(group, opts)
     :counters.add(counter, 1, 1)
     n = :counters.get(counter, 1)
-    if rem(n, 25) == 0 or n == total, do: IO.puts("[build] #{n}/#{total} groups")
+    if rem(n, 25) == 0 or n == total, do: Logger.info("[build] #{n}/#{total} groups")
     result
   end
 

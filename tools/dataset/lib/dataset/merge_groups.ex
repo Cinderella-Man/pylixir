@@ -26,6 +26,7 @@ defmodule Dataset.MergeGroups do
   """
 
   alias Dataset.Dataset
+  require Logger
 
   @min_shared 3
   # Skip an stdin shared by more qids than this when enumerating pairs:
@@ -56,7 +57,7 @@ defmodule Dataset.MergeGroups do
 
     fps =
       Enum.reduce(0..(shards - 1), %{}, fn idx, acc ->
-        IO.puts("[merge] seed_testcase shard #{idx + 1}/#{shards}")
+        Logger.info("[merge] seed_testcase shard #{idx + 1}/#{shards}")
         df = dataset.read_testcase_shard(idx, qids, ["question_id", "inputs", "outputs"])
         accumulate_fingerprints(df, acc)
       end)

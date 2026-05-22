@@ -182,6 +182,9 @@ emit parquet row    id | source | solution_sha256 | testcases(JSON) | num_testca
 - **Tests run real `python3.14`.** They set `PYLIXIR_DATASET_SANDBOX=""` (no untrusted code, no netns
   needed) — except the sandbox test and the e2e test, which exercise the real sandbox. The build
   pipeline is testable end-to-end via the `:dataset_module` fake.
+- **Progress output goes through `Logger`** (`[corpus]`/`[merge]`/`[build]` lines). `test_helper.exs`
+  uses `ExUnit.start(capture_log: true)` so a passing run is silent and logs only surface on a failing
+  test; `config/config.exs` strips Logger decoration so real runs print plain lines.
 - **`defmodule` inside a test body** had compile-timing surprises — define fakes at test-module scope.
 
 ---

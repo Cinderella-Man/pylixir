@@ -14,6 +14,7 @@ defmodule Dataset.Dataset do
   """
 
   require Explorer.DataFrame, as: DF
+  require Logger
 
   @dataset_repo "microsoft/rStar-Coder"
   @base_url "https://huggingface.co/datasets/#{@dataset_repo}/resolve/main"
@@ -169,7 +170,7 @@ defmodule Dataset.Dataset do
         )
 
       if resp.status == 200 do
-        IO.puts("[dataset] #{label}: done")
+        Logger.info("[dataset] #{label}: done")
         :ok
       else
         {:error, {:bad_status, resp.status}}
@@ -245,7 +246,7 @@ defmodule Dataset.Dataset do
           else: "?%"
 
       mb = :erlang.float_to_binary(bytes / 1_048_576, decimals: 1)
-      IO.puts("[dataset] #{state.label}: #{pct_str} (#{mb} MB)")
+      Logger.info("[dataset] #{state.label}: #{pct_str} (#{mb} MB)")
 
       %{state | last_ms: now, next_pct: state.next_pct + 5}
     else
