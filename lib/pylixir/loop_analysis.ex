@@ -122,6 +122,23 @@ defmodule Pylixir.LoopAnalysis do
     end)
   end
 
+  @doc """
+  Whether `body` wholesale-rebinds `name` under *type-aware* rules — i.e.
+  a disconnecting rebind that would make a tuple-element reconstruction put
+  the wrong value in `name`'s slot. Unlike `wholesale_rebinds?/2`, a
+  bare-Name `+=` counts as wholesale here *unless* `name_type` proves it is
+  an in-place mutable-container op. Used by T2 tuple-target gating to reject
+  any component that isn't either propagating or read-only.
+  """
+  @spec target_wholesale_rebound?(String.t(), [map()], term()) :: boolean()
+  def target_wholesale_rebound?(name, body, name_type) when is_binary(name) and is_list(body) do
+    Enum.any?(body, fn node ->
+      Walk.walk_scope(node, false, fn n, acc ->
+        acc or wholesale_node?(n, name, {:typed, name_type})
+      end)
+    end)
+  end
+
   defp in_place_mutated?(name, body, mode) do
     {prop, whole} =
       Enum.reduce(body, {false, false}, fn node, acc ->

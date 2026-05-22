@@ -192,8 +192,31 @@ NOT `@var_grid`; fallback emits `Enum.each`.
   a proven concrete container tag is reliable; uncertainty widens to `:any` ⇒ safe fallback. If `elem_t`
   were wrong, existing codegen would already misbehave independent of this change.
 
+## Corpus eval (500-sample slice, baseline vs current)
+Baseline = HEAD without the T1–T5 emit/predicate working changes; current = full change.
+- ok 343→342, elixir_timeout 77→78 — a single sample flipped ok↔timeout (the load-dependent
+  bucket; runs were back-to-back under load).
+- **output_mismatch 12→12 (identical buckets) and errors/unsupported 5→5 (identical)** ⇒ NO
+  correctness or capability regression.
+- This slice contains few for-loop-element-mutation cases, so the fix's benefit isn't visible here
+  (output_mismatch unchanged); verified instead by 16 targeted execution tests + the trap-guards.
+  A larger corpus batch would surface the OK-rate gain. T5's polyfill-reduction shows up structurally
+  (e.g. `py_getitem` is dead-code-eliminated in list-only programs).
+
+## Implementation status (all tiers landed; T4 gated off)
+All 8 tasks complete. `mix test` = 1571 tests, 0 failures. T1/T2/T3/T5 live; T4 built + verified but
+gated off (`enable_t4_break_continue`, default false). Files: loop_analysis.ex (predicate),
+module_analysis.ex + literal_propagation.ex (de-promotion, committed in 86ac5f4), nodes/loop.ex
+(classify + 4 emit variants), converter.ex + nodes/assign.ex (T5), test/pylixir/loop_analysis_test.exs
++ test/pylixir/loop_element_mutation_test.exs.
+
 ## Resolved (was: unresolved questions)
 1. **T4 sequencing** → build it, gate to fallback first, flip after dedicated review + corpus pass.
+   IMPLEMENTED: gated on app-env `config :pylixir, enable_t4_break_continue: true` (default false; a
+   runtime lookup, not a compile-time constant, so the path stays live for Dialyzer and toggleable by
+   tests). Verified correct with the flag on (break tail-preservation, break-before-mutation,
+   continue partial-carry, full rebuild, threaded+break); off by default ⇒ break/continue loops fall
+   back to `Enum.each`/reduce. To enable: flip the default in `t4_break_continue_enabled?/0`.
 2. **T4 helper** → fully-inlined AST (no `py_*` helper).
 3. **De-promotion cross-function safety** → route through Process-dict machinery (not style-only).
 4. **Bare-Name `+=`** → type-gated propagating, full op set (list `+=`/`*=`, set `|=`/`&=`/`-=`/`^=`,

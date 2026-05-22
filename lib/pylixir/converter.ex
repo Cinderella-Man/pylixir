@@ -671,9 +671,20 @@ defmodule Pylixir.Converter do
         {{:py_slice, [], [value_ast, start_ast, stop_ast, step_ast]}, context}
 
       _ ->
+        # T5 op-narrowing: a proven `{:list, _}` value reads natively via
+        # `Enum.at/2` — exactly what `py_getitem`'s list clause dispatches
+        # to (same negative-index / out-of-range behaviour). pvec/alist
+        # reps are NOT `is_list?` so they keep `py_getitem` (and their
+        # specializations). Infer before convert (which may refine types).
+        value_type = TypeInfer.infer_expr(value, context)
         {value_ast, context} = convert(value, context)
         {slice_ast, context} = convert(slice, context)
-        {{:py_getitem, [], [value_ast, slice_ast]}, context}
+
+        if TypeInfer.is_list?(value_type) do
+          {{{:., [], [{:__aliases__, [], [:Enum]}, :at]}, [], [value_ast, slice_ast]}, context}
+        else
+          {{:py_getitem, [], [value_ast, slice_ast]}, context}
+        end
     end
   end
 
@@ -1743,13 +1754,20 @@ defmodule Pylixir.Converter do
           "right" => value
         }
 
+        # T5 op-narrowing: pass the operand types so `bin_op_ast` can pick
+        # the native op — `list += list` → `++`, `int += int` → `+`,
+        # `str += str` → `<>` — instead of the polymorphic `py_add` the
+        # typeless 4-arg form emits. Semantics-preserving (same surface
+        # `bin_op_ast` already uses for typed `BinOp`).
+        lt = TypeInfer.infer_expr(%{"_type" => "Name", "id" => id}, context)
+        rt = TypeInfer.infer_expr(value, context)
         result_type = TypeInfer.infer_expr(synthetic_binop, context)
         {value_ast, context} = convert(value, context)
         context = TypeInfer.bind(context, id, result_type)
         context = bind_name(context, id)
         target_atom = id |> Naming.rewrite() |> String.to_atom()
         target_ref = {target_atom, [], nil}
-        rhs = bin_op_ast(op, target_ref, value_ast, node)
+        rhs = bin_op_ast(op, target_ref, value_ast, node, lt, rt)
         {{:=, [], [target_ref, rhs]}, context}
     end
   end

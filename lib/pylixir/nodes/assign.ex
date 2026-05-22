@@ -395,10 +395,22 @@ defmodule Pylixir.Nodes.Assign do
             {{:=, [], [coll_ast, rhs]}, context}
 
           _ ->
+            # T5 op-narrowing: a proven `{:list, _}` collection stores
+            # natively via `List.replace_at/3` — exactly what `py_setitem`'s
+            # list clause dispatches to. Infer before convert/demote.
+            coll_type = TypeInfer.infer_expr(collection, context)
             {value_ast, context} = Converter.convert(value, context)
             {slice_ast, context} = Converter.convert(slice, context)
             {coll_ast, context} = Converter.convert(collection, context)
-            setitem = {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
+
+            setitem =
+              if TypeInfer.is_list?(coll_type) do
+                {{:., [], [{:__aliases__, [], [:List]}, :replace_at]}, [],
+                 [coll_ast, slice_ast, value_ast]}
+              else
+                {:py_setitem, [], [coll_ast, slice_ast, value_ast]}
+              end
+
             context = TypeInfer.demote(context, coll_id)
             context = Converter.bind_name(context, coll_id)
             {{:=, [], [coll_ast, setitem]}, context}

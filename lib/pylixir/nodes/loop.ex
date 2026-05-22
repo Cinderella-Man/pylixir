@@ -577,22 +577,55 @@ defmodule Pylixir.Nodes.Loop do
     flow = loop_flow(body)
 
     {payload_ast, acc_refs} = build_acc_refs(threaded)
-    saved = context.loop_break_payload
-    context = %{context | loop_break_payload: payload_ast}
-    {body_asts, context} = Converter.convert_each(body, context)
-    context = %{context | loop_break_payload: saved}
-    context = %{context | types: saved_types}
 
     # In-place element-mutation rebuild (T1+): when the loop mutates its
     # target in place, the source must be rebuilt + rebound rather than
     # iterated with `Enum.each` (which discards the mutation). `:none`
-    # ⇒ today's exact codegen (no regression).
+    # ⇒ today's exact codegen (no regression). Classified BEFORE the body
+    # is converted because the T4 (break/continue) variant needs the
+    # break/continue payload to carry the (partially-mutated) element.
     rebuild = classify_rebuild(iter, target, body, analysis, threaded, flow, elem_t)
+
+    break_payload =
+      case rebuild do
+        {:reduce_while, _} -> t4_break_payload(target_ast, threaded, payload_ast)
+        _ -> payload_ast
+      end
+
+    saved = context.loop_break_payload
+    context = %{context | loop_break_payload: break_payload}
+    {body_asts, context} = Converter.convert_each(body, context)
+    context = %{context | loop_break_payload: saved}
+    context = %{context | types: saved_types}
 
     {result_ast, context} =
       case rebuild do
         {:map, iter_name} ->
           emit_for_map(iter_ast, target_ast, body_asts, iter_name, context)
+
+        {:map_reduce, iter_name} ->
+          emit_for_map_reduce(
+            iter_ast,
+            target_ast,
+            body_asts,
+            iter_name,
+            threaded,
+            payload_ast,
+            pre_loop_context,
+            context
+          )
+
+        {:reduce_while, iter_name} ->
+          emit_for_reduce_while(
+            iter_ast,
+            target_ast,
+            body_asts,
+            iter_name,
+            threaded,
+            payload_ast,
+            pre_loop_context,
+            context
+          )
 
         :none ->
           case {threaded, flow} do
@@ -631,6 +664,8 @@ defmodule Pylixir.Nodes.Loop do
     rebind_names =
       case rebuild do
         {:map, iter_name} -> [iter_name | threaded]
+        {:map_reduce, iter_name} -> [iter_name | threaded]
+        {:reduce_while, iter_name} -> [iter_name | threaded]
         :none -> threaded
       end
 
@@ -650,20 +685,89 @@ defmodule Pylixir.Nodes.Loop do
   # (blocks mutate-while-iterating / threading-vs-rebind collisions);
   # `orelse` is excluded structurally (emit_for only runs when orelse==[]).
   #
-  # T1 gate: single bare-Name target, no break/continue, no threaded vars,
-  # and the (type-aware) predicate is TRUE for the target.
+  # T4 (break/continue rebuild) is BUILT but gated OFF by default — it is
+  # the only correctness-delicate tier (tail preservation, partial-mutation
+  # carry). Gated on an app-env flag (not a compile-time constant) so the
+  # code path stays live for Dialyzer and is toggleable by tests; flip the
+  # default (or set `config :pylixir, enable_t4_break_continue: true`) only
+  # after its dedicated review + full corpus pass. While off, break/continue
+  # loops fall back to today's codegen.
+  defp t4_break_continue_enabled?,
+    do: Application.get_env(:pylixir, :enable_t4_break_continue, false)
+
+  # Shared gates (iter shape), target eligibility (T1 single-Name / T2 flat-
+  # tuple), then variant by flow + threaded:
+  #   no flow, no threaded  ⇒ :map         (T1/T2)
+  #   no flow, threaded     ⇒ :map_reduce  (T3)
+  #   break/continue        ⇒ :reduce_while (T4, gated)
   defp classify_rebuild(iter, target, body, analysis, threaded, flow, elem_t) do
     with %{"_type" => "Name", "id" => iter_name} <- iter,
          false <- MapSet.member?(analysis.assigned_vars, iter_name),
-         %{"_type" => "Name", "id" => tname} <- target,
-         {false, false} <- flow,
-         [] <- threaded,
-         true <- LoopAnalysis.target_in_place_mutated?(tname, body, elem_t) do
-      {:map, iter_name}
+         true <- target_eligible?(target, body, elem_t) do
+      case flow do
+        {false, false} when threaded == [] -> {:map, iter_name}
+        {false, false} -> {:map_reduce, iter_name}
+        _ -> if t4_break_continue_enabled?(), do: {:reduce_while, iter_name}, else: :none
+      end
     else
       _ -> :none
     end
   end
+
+  # T1: single bare-Name target — the (type-aware) predicate decides.
+  defp target_eligible?(%{"_type" => "Name", "id" => tname}, body, elem_t),
+    do: LoopAnalysis.target_in_place_mutated?(tname, body, elem_t)
+
+  # T2: flat tuple of bare Names over a proven list/tuple element. Reuse the
+  # destructure pattern as the yield constructor (handled by the emitters).
+  # Eligible iff ≥1 unpacked name is mutated in place AND none is wholesale-
+  # rebound (a wholesale rebind of any component would corrupt that slot in
+  # the reconstruction). Per-component types come from `elem_t`.
+  defp target_eligible?(%{"_type" => "Tuple", "elts" => elts}, body, elem_t) do
+    with true <- proven_seq_shape?(elem_t),
+         {:ok, names} <- flat_names(elts),
+         comp_types = tuple_component_types(elem_t, length(names)),
+         pairs = Enum.zip(names, comp_types),
+         false <-
+           Enum.any?(pairs, fn {n, t} -> LoopAnalysis.target_wholesale_rebound?(n, body, t) end),
+         true <-
+           Enum.any?(pairs, fn {n, t} -> LoopAnalysis.target_in_place_mutated?(n, body, t) end) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp target_eligible?(_, _, _), do: false
+
+  # Element shape must be proven so `convert_loop_target`'s pattern (list vs
+  # tuple, chosen off `elem_t`) matches the runtime element AND the same node
+  # reused as a constructor rebuilds the right shape.
+  defp proven_seq_shape?({:list, _}), do: true
+  defp proven_seq_shape?({:py_alist, _}), do: true
+  defp proven_seq_shape?({:py_pvec, _}), do: true
+  defp proven_seq_shape?({:tuple, _}), do: true
+  defp proven_seq_shape?(_), do: false
+
+  # All elts must be bare Names (no nested tuples / starred) for the
+  # pattern-as-constructor reuse to be valid.
+  defp flat_names(elts) do
+    if Enum.all?(elts, &match?(%{"_type" => "Name"}, &1)) do
+      {:ok, Enum.map(elts, &Map.fetch!(&1, "id"))}
+    else
+      :error
+    end
+  end
+
+  # Per-component static types from the element type. Lists are homogeneous
+  # (every component shares the element type); fixed-arity tuples give one
+  # type per position; anything else is `:any` per component.
+  defp tuple_component_types({:list, e}, n), do: List.duplicate(e, n)
+  defp tuple_component_types({:py_alist, e}, n), do: List.duplicate(e, n)
+  defp tuple_component_types({:py_pvec, e}, n), do: List.duplicate(e, n)
+
+  defp tuple_component_types({:tuple, ts}, n) when is_list(ts) and length(ts) == n, do: ts
+  defp tuple_component_types(_, n), do: List.duplicate(:any, n)
 
   # T1 emit: `iter_name = Enum.map(iter, fn target -> body; target end)`.
   # The body's last value is the (mutated) target; collecting it rebuilds
@@ -674,6 +778,136 @@ defmodule Pylixir.Nodes.Loop do
     map_call = {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [iter_ast, fn_ast]}
     iter_ref = {iter_name |> Naming.rewrite() |> String.to_atom(), [], nil}
     {{:=, [], [iter_ref, map_call]}, context}
+  end
+
+  # T3 emit: rebuild AND thread the body-assigned accumulator vars in one
+  # pass via `Enum.map_reduce/3`:
+  #   {iter_name, <acc>} =
+  #     Enum.map_reduce(iter, <acc0>, fn target, <acc> -> body; {target, <acc>} end)
+  # `payload_ast` is the bare ref (single threaded var) or a tuple pattern
+  # (multiple) — `<acc>` in both fn param and yield; `<acc0>` mirrors it.
+  defp emit_for_map_reduce(
+         iter_ast,
+         target_ast,
+         body_asts,
+         iter_name,
+         threaded,
+         payload_ast,
+         pre_ctx,
+         context
+       ) do
+    initial =
+      case threaded do
+        [single] -> initial_ref(single, pre_ctx)
+        vars -> Converter.tuple_pattern(Enum.map(vars, &initial_ref(&1, pre_ctx)))
+      end
+
+    inner_body = Converter.body_to_block(body_asts ++ [{target_ast, payload_ast}])
+    fn_ast = {:fn, [], [{:->, [], [[target_ast, payload_ast], inner_body]}]}
+
+    mr_call =
+      {{:., [], [{:__aliases__, [], [:Enum]}, :map_reduce]}, [], [iter_ast, initial, fn_ast]}
+
+    iter_ref = {iter_name |> Naming.rewrite() |> String.to_atom(), [], nil}
+    context = Enum.reduce(threaded, context, &Converter.bind_name(&2, &1))
+    {{:=, [], [{iter_ref, payload_ast}, mr_call]}, context}
+  end
+
+  # The break/continue payload for T4: carries the (partially-mutated)
+  # element so a `break`/`continue` can splice it into the rebuilt prefix.
+  # No threaded vars ⇒ just the element; otherwise `{element, acc}`.
+  defp t4_break_payload(target_ast, [], _payload_ast), do: target_ast
+  defp t4_break_payload(target_ast, _threaded, payload_ast), do: {target_ast, payload_ast}
+
+  # T4 emit (gated): rebuild a source whose loop has break/continue, while
+  # preserving Python's semantics — elements visited keep their mutations
+  # (up to a `continue`/`break`), and elements AFTER a `break` are left
+  # untouched. Iterate `Enum.with_index` under `Enum.reduce_while`,
+  # accumulating a reversed prefix (+ threaded acc), then splice the
+  # untouched original tail on break. Fully-inlined AST (no runtime helper).
+  defp emit_for_reduce_while(
+         iter_ast,
+         target_ast,
+         body_asts,
+         iter_name,
+         threaded,
+         payload_ast,
+         pre_ctx,
+         context
+       ) do
+    acc_list = {:pylixir_for_acc, [], nil}
+    idx_var = {:pylixir_for_idx, [], nil}
+    broke = {:pylixir_for_broke, [], nil}
+    prefix = {:pylixir_for_prefix, [], nil}
+    iter_ref = {iter_name |> Naming.rewrite() |> String.to_atom(), [], nil}
+    threaded? = threaded != []
+
+    enum = fn f, args -> {{:., [], [{:__aliases__, [], [:Enum]}, f]}, [], args} end
+    cons = [{:|, [], [target_ast, acc_list]}]
+
+    # Accumulator tuple `{reversed_prefix, <acc?>, broke_idx_or_nil}`.
+    acc_tuple = fn third ->
+      if threaded?, do: {:{}, [], [cons, payload_ast, third]}, else: {cons, third}
+    end
+
+    initial =
+      if threaded? do
+        acc0 =
+          case threaded do
+            [single] -> initial_ref(single, pre_ctx)
+            vars -> Converter.tuple_pattern(Enum.map(vars, &initial_ref(&1, pre_ctx)))
+          end
+
+        {:{}, [], [[], acc0, nil]}
+      else
+        {[], nil}
+      end
+
+    # Normal fall-through and `continue` produce the same shape (element +
+    # acc carried into the next iteration); `break` halts and records idx.
+    cont_tuple = {:cont, acc_tuple.(nil)}
+    halt_tuple = {:halt, acc_tuple.(idx_var)}
+    payload_pattern = t4_break_payload(target_ast, threaded, payload_ast)
+
+    do_block = Converter.body_to_block(body_asts ++ [cont_tuple])
+
+    catch_clauses = [
+      ControlFlow.catch_continue(payload_pattern, cont_tuple),
+      ControlFlow.catch_break(payload_pattern, halt_tuple)
+    ]
+
+    try_block = {:try, [], [[do: do_block, catch: catch_clauses]]}
+
+    acc_param =
+      if threaded?,
+        do: {:{}, [], [acc_list, payload_ast, {:_, [], nil}]},
+        else: {acc_list, {:_, [], nil}}
+
+    fn_ast =
+      {:fn, [], [{:->, [], [[{target_ast, idx_var}, acc_param], try_block]}]}
+
+    reduce = enum.(:reduce_while, [enum.(:with_index, [iter_ast]), initial, fn_ast])
+
+    result_pattern =
+      if threaded?, do: {:{}, [], [prefix, payload_ast, broke]}, else: {prefix, broke}
+
+    # `broke` is nil (no break) or the break index. Note 0 is truthy in
+    # Elixir, so `if broke` correctly fires for a break at index 0.
+    tail =
+      {:if, [], [broke, [do: enum.(:drop, [iter_ref, {:+, [], [broke, 1]}]), else: []]]}
+
+    grid_final = {:++, [], [enum.(:reverse, [prefix]), tail]}
+
+    context = Enum.reduce(threaded, context, &Converter.bind_name(&2, &1))
+
+    block =
+      {:__block__, [],
+       [
+         {:=, [], [result_pattern, reduce]},
+         {:=, [], [iter_ref, grid_final]}
+       ]}
+
+    {block, context}
   end
 
   # --- Shared loop machinery ---------------------------------------------
