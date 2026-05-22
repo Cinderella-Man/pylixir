@@ -74,6 +74,188 @@ defmodule Pylixir.LoopAnalysis do
     %__MODULE__{assigned_vars: assigned, referenced_vars: referenced}
   end
 
+  # --- In-place mutation predicate (for-loop element rebuild) -------------
+
+  @doc """
+  Whether the loop target `name` is mutated *in place* in `body` such that
+  the mutation must propagate back to the source collection — i.e. `body`
+  contains a propagating mutation of `name` AND no wholesale rebind of it.
+
+  Propagating ops are exactly those that lower to `name = <op>(name, …)`
+  (rebind the root to the mutated value): `name[i]=v`, `name[i]+=v`,
+  `name[i][j]=v`, `name[a:b]=…`, `name.<@mutation_methods>(…)` (depth 0/1),
+  `del name[i]`. Wholesale rebinds disconnect the final value from the
+  source: `name = …`, `for name in …`, `with … as name`, tuple-unpack of
+  `name`. Co-occurrence ⇒ FALSE (conservative: rebuild-of-final-value would
+  be wrong; fall back to today's codegen).
+
+  `/2` is the structural (typeless) variant — bare-Name augmented assignment
+  (`name += …`) is treated as *conservatively propagating* ("might rebuild the
+  source", since `list += …` is in-place). Used by `ModuleAnalysis` /
+  `LiteralPropagation`, which run before type inference: this guarantees the
+  `/2` TRUE-set ⊇ the `/3` TRUE-set, so anything `/3` actually rebuilds is
+  already seen as mutated (never promoted/folded). Over-reporting an `int +=`
+  no-op is harmless (de-promote / refuse-fold only).
+
+  `/3` additionally takes `name`'s static type (normally the loop's `elem_t`):
+  a bare-Name augmented assignment becomes a *propagating* in-place mutation
+  (not wholesale) when the type proves a mutable container and `op` is in-place
+  for it — list `+=`/`*=`, set `|=`/`&=`/`-=`/`^=`, dict `|=`. Used by codegen.
+  """
+  @spec target_in_place_mutated?(String.t(), [map()]) :: boolean()
+  def target_in_place_mutated?(name, body) when is_binary(name) and is_list(body),
+    do: in_place_mutated?(name, body, :structural)
+
+  @spec target_in_place_mutated?(String.t(), [map()], term()) :: boolean()
+  def target_in_place_mutated?(name, body, name_type) when is_binary(name) and is_list(body),
+    do: in_place_mutated?(name, body, {:typed, name_type})
+
+  @doc """
+  Whether `body` wholesale-rebinds the bare Name `name` (`name = …`,
+  `name += …`, `for name in …`, `with … as name`, or a tuple-unpack target
+  binding `name`). Structural rules — `+=` always counts as a rebind.
+  """
+  @spec wholesale_rebinds?(String.t(), [map()]) :: boolean()
+  def wholesale_rebinds?(name, body) when is_binary(name) and is_list(body) do
+    Enum.any?(body, fn node ->
+      Walk.walk_scope(node, false, fn n, acc -> acc or wholesale_node?(n, name, :structural) end)
+    end)
+  end
+
+  defp in_place_mutated?(name, body, mode) do
+    {prop, whole} =
+      Enum.reduce(body, {false, false}, fn node, acc ->
+        Walk.walk_scope(node, acc, fn n, {p, w} ->
+          {p or propagating_mutation?(n, name, mode), w or wholesale_node?(n, name, mode)}
+        end)
+      end)
+
+    prop and not whole
+  end
+
+  # Propagating (rebind-the-root) mutations of `name`. All lower to
+  # `name = <op>(name, …)`, so the body's final `name` carries the change.
+  defp propagating_mutation?(%{"_type" => "Assign", "targets" => targets}, name, _mode) do
+    Enum.any?(targets, &subscript_root_is?(&1, name))
+  end
+
+  defp propagating_mutation?(
+         %{"_type" => "AugAssign", "target" => %{"_type" => "Subscript"} = tgt},
+         name,
+         _mode
+       ),
+       do: subscript_root_is?(tgt, name)
+
+  # Bare-Name augmented assign that is in-place for the proven type
+  # (`row += xs` on a list, etc.) — propagating only under `/3`.
+  defp propagating_mutation?(
+         %{"_type" => "AugAssign", "target" => %{"_type" => "Name", "id" => id}, "op" => op},
+         name,
+         mode
+       ),
+       do: id == name and inplace_augassign?(op, mode)
+
+  # Statement-context mutation method, receiver rooted at `name` at depth
+  # 0 (`name.append(x)`) or depth 1 (`name[i].sort()`).
+  defp propagating_mutation?(
+         %{
+           "_type" => "Expr",
+           "value" => %{
+             "_type" => "Call",
+             "func" => %{"_type" => "Attribute", "value" => recv, "attr" => method}
+           }
+         },
+         name,
+         _mode
+       )
+       when method in @mutation_methods,
+       do: mutation_receiver_root(recv) == name
+
+  defp propagating_mutation?(%{"_type" => "Delete", "targets" => targets}, name, _mode) do
+    Enum.any?(targets, &subscript_root_is?(&1, name))
+  end
+
+  defp propagating_mutation?(_, _, _), do: false
+
+  # Wholesale rebinds — the final `name` is disconnected from the source.
+  defp wholesale_node?(%{"_type" => "Assign", "targets" => targets}, name, _mode) do
+    Enum.any?(targets, &wholesale_binds?(&1, name))
+  end
+
+  defp wholesale_node?(
+         %{"_type" => "AugAssign", "target" => %{"_type" => "Name", "id" => id}, "op" => op},
+         name,
+         mode
+       ),
+       do: id == name and not inplace_augassign?(op, mode)
+
+  defp wholesale_node?(%{"_type" => type, "target" => tgt}, name, _mode)
+       when type in ["For", "AsyncFor"],
+       do: wholesale_binds?(tgt, name)
+
+  defp wholesale_node?(%{"_type" => type, "items" => items}, name, _mode)
+       when type in ["With", "AsyncWith"] do
+    Enum.any?(items, fn item ->
+      case Map.get(item, "optional_vars") do
+        nil -> false
+        vars -> wholesale_binds?(vars, name)
+      end
+    end)
+  end
+
+  defp wholesale_node?(_, _, _), do: false
+
+  # `name[i] = …` / `name[i][j] = …` / `name[a:b] = …` / `del name[i]` —
+  # a Subscript target whose base Name is `name`.
+  defp subscript_root_is?(%{"_type" => "Subscript", "value" => value}, name),
+    do: root_name(value) == name
+
+  defp subscript_root_is?(_, _), do: false
+
+  # Bare-Name binding, including tuple/list unpack targets (`a, b = …`).
+  defp wholesale_binds?(%{"_type" => "Name", "id" => id}, name), do: id == name
+
+  defp wholesale_binds?(%{"_type" => type, "elts" => elts}, name)
+       when type in ["Tuple", "List"],
+       do: Enum.any?(elts, &wholesale_binds?(&1, name))
+
+  defp wholesale_binds?(%{"_type" => "Starred", "value" => v}, name),
+    do: wholesale_binds?(v, name)
+
+  defp wholesale_binds?(_, _), do: false
+
+  defp mutation_receiver_root(%{"_type" => "Name", "id" => id}), do: id
+
+  defp mutation_receiver_root(%{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => id}}),
+    do: id
+
+  defp mutation_receiver_root(_), do: nil
+
+  # Whether a bare-Name augmented assignment counts as a propagating
+  # in-place mutation (vs a disconnecting wholesale rebind).
+  #   * `:structural` (typeless) ⇒ TRUE — conservative: `list += …` is
+  #     in-place, and without types we must assume it might rebuild the
+  #     source (keeps the `/2` ⊇ `/3` superset invariant).
+  #   * `{:typed, type}` ⇒ TRUE only when `type` proves a mutable container
+  #     and `op` is in-place for it; otherwise FALSE (`int += 1` no-op etc.).
+  defp inplace_augassign?(_op, :structural), do: true
+
+  defp inplace_augassign?(%{"_type" => op}, {:typed, type}) do
+    case container_kind(type) do
+      :list -> op in ["Add", "Mult"]
+      :set -> op in ["BitOr", "BitAnd", "Sub", "BitXor"]
+      :dict -> op in ["BitOr"]
+      :none -> false
+    end
+  end
+
+  defp container_kind({:list, _}), do: :list
+  defp container_kind({:py_alist, _}), do: :list
+  defp container_kind({:py_pvec, _}), do: :list
+  defp container_kind({:set}), do: :set
+  defp container_kind({:dict, _, _}), do: :dict
+  defp container_kind(_), do: :none
+
   defp names_referenced_in(%{"_type" => "Name", "id" => id}), do: MapSet.new([id])
 
   # Comprehensions are scope boundaries for `walk_scope` — it visits

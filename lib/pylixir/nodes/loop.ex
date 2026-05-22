@@ -583,42 +583,97 @@ defmodule Pylixir.Nodes.Loop do
     context = %{context | loop_break_payload: saved}
     context = %{context | types: saved_types}
 
+    # In-place element-mutation rebuild (T1+): when the loop mutates its
+    # target in place, the source must be rebuilt + rebound rather than
+    # iterated with `Enum.each` (which discards the mutation). `:none`
+    # ⇒ today's exact codegen (no regression).
+    rebuild = classify_rebuild(iter, target, body, analysis, threaded, flow, elem_t)
+
     {result_ast, context} =
-      case {threaded, flow} do
-        {[], _} ->
-          emit_for_each(iter_ast, target_ast, body_asts, flow, context)
+      case rebuild do
+        {:map, iter_name} ->
+          emit_for_map(iter_ast, target_ast, body_asts, iter_name, context)
 
-        {[single], _} ->
-          emit_for_reduce_single(
-            iter_ast,
-            target_ast,
-            single,
-            body_asts,
-            pre_loop_context,
-            flow,
-            context
-          )
+        :none ->
+          case {threaded, flow} do
+            {[], _} ->
+              emit_for_each(iter_ast, target_ast, body_asts, flow, context)
 
-        {_multi, _} ->
-          emit_for_reduce_tuple(
-            iter_ast,
-            target_ast,
-            threaded,
-            acc_refs,
-            body_asts,
-            pre_loop_context,
-            flow,
-            context
-          )
+            {[single], _} ->
+              emit_for_reduce_single(
+                iter_ast,
+                target_ast,
+                single,
+                body_asts,
+                pre_loop_context,
+                flow,
+                context
+              )
+
+            {_multi, _} ->
+              emit_for_reduce_tuple(
+                iter_ast,
+                target_ast,
+                threaded,
+                acc_refs,
+                body_asts,
+                pre_loop_context,
+                flow,
+                context
+              )
+          end
       end
 
     # Restore scopes — drops target binding AND any body-locals — then
-    # re-bind only the threaded vars (those that the emitter explicitly
-    # threads through the accumulator and are visible post-loop).
+    # re-bind the threaded vars (threaded through the accumulator) plus,
+    # for a rebuild variant, the rebound iterable name (already in scope
+    # from before the loop; bind_name is idempotent).
+    rebind_names =
+      case rebuild do
+        {:map, iter_name} -> [iter_name | threaded]
+        :none -> threaded
+      end
+
     context = %{context | scopes: saved_scopes}
-    context = Enum.reduce(threaded, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
+    context = Enum.reduce(rebind_names, context, fn v, ctx -> Converter.bind_name(ctx, v) end)
 
     {result_ast, context}
+  end
+
+  # --- In-place element-mutation rebuild (T1+) ---------------------------
+
+  # Decide whether (and how) to rebuild+rebind the iterable so an in-place
+  # mutation of the loop target propagates back to the source. Returns the
+  # rebuild variant tag or `:none` (⇒ unchanged existing codegen).
+  #
+  # Shared gates: iter is a bare Name NOT itself assigned in the body
+  # (blocks mutate-while-iterating / threading-vs-rebind collisions);
+  # `orelse` is excluded structurally (emit_for only runs when orelse==[]).
+  #
+  # T1 gate: single bare-Name target, no break/continue, no threaded vars,
+  # and the (type-aware) predicate is TRUE for the target.
+  defp classify_rebuild(iter, target, body, analysis, threaded, flow, elem_t) do
+    with %{"_type" => "Name", "id" => iter_name} <- iter,
+         false <- MapSet.member?(analysis.assigned_vars, iter_name),
+         %{"_type" => "Name", "id" => tname} <- target,
+         {false, false} <- flow,
+         [] <- threaded,
+         true <- LoopAnalysis.target_in_place_mutated?(tname, body, elem_t) do
+      {:map, iter_name}
+    else
+      _ -> :none
+    end
+  end
+
+  # T1 emit: `iter_name = Enum.map(iter, fn target -> body; target end)`.
+  # The body's last value is the (mutated) target; collecting it rebuilds
+  # the source, and the rebind makes the mutation visible after the loop.
+  defp emit_for_map(iter_ast, target_ast, body_asts, iter_name, context) do
+    inner_body = Converter.body_to_block(body_asts ++ [target_ast])
+    fn_ast = {:fn, [], [{:->, [], [[target_ast], inner_body]}]}
+    map_call = {{:., [], [{:__aliases__, [], [:Enum]}, :map]}, [], [iter_ast, fn_ast]}
+    iter_ref = {iter_name |> Naming.rewrite() |> String.to_atom(), [], nil}
+    {{:=, [], [iter_ref, map_call]}, context}
   end
 
   # --- Shared loop machinery ---------------------------------------------

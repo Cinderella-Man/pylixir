@@ -187,6 +187,29 @@ defmodule Pylixir.LiteralPropagation do
     do_collect_mutations_children(node, acc)
   end
 
+  # `for row in grid: row[i]=v` mutates `grid` in place (the for-loop
+  # rebuild codegen reassigns it). LiteralPropagation must see `grid` as
+  # mutated so it won't fold a later `print(grid)` to the stale literal.
+  # Same blind spot as `ModuleAnalysis.mutates_name?`; delegate to the
+  # same structural predicate. Children are still recursed (nested
+  # mutations of other names).
+  defp do_collect_mutations(
+         %{
+           "_type" => "For",
+           "iter" => %{"_type" => "Name", "id" => iter_name},
+           "target" => tgt,
+           "body" => body
+         } = node,
+         acc
+       ) do
+    acc =
+      if Enum.any?(for_target_names(tgt), &Pylixir.LoopAnalysis.target_in_place_mutated?(&1, body)),
+        do: MapSet.put(acc, iter_name),
+        else: acc
+
+    do_collect_mutations_children(node, acc)
+  end
+
   defp do_collect_mutations(node, acc) when is_map(node) do
     do_collect_mutations_children(node, acc)
   end
@@ -196,6 +219,14 @@ defmodule Pylixir.LiteralPropagation do
   end
 
   defp do_collect_mutations(_leaf, acc), do: acc
+
+  defp for_target_names(%{"_type" => "Name", "id" => id}), do: [id]
+
+  defp for_target_names(%{"_type" => type, "elts" => elts})
+       when type in ["Tuple", "List"],
+       do: Enum.flat_map(elts, &for_target_names/1)
+
+  defp for_target_names(_), do: []
 
   defp do_collect_mutations_children(node, acc) when is_map(node) do
     node

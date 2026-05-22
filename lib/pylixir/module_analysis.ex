@@ -1321,6 +1321,24 @@ defmodule Pylixir.ModuleAnalysis do
       when method in @mutation_methods,
       do: target_name == name
 
+  # `for row in name: row[i]=v` — iterating `name` and mutating the loop
+  # element in place propagates back to `name` (the for-loop rebuild
+  # codegen reassigns it). So `name` is mutated and must NOT be promoted
+  # to an immutable `@var_name`. Delegate to the STRUCTURAL predicate
+  # (no type info available here); conservative — `+=` counts as a rebind,
+  # so this de-promote set ⊇ loop.ex's actual rebuild set. Must precede
+  # the bare For clause below (which only inspects the target name).
+  def mutates_name?(
+        %{
+          "_type" => "For",
+          "iter" => %{"_type" => "Name", "id" => name},
+          "target" => tgt,
+          "body" => body
+        },
+        name
+      ),
+      do: Enum.any?(target_names(tgt), &Pylixir.LoopAnalysis.target_in_place_mutated?(&1, body))
+
   def mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
     do: target == name
 
