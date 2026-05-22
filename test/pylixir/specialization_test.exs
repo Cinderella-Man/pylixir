@@ -790,6 +790,57 @@ defmodule Pylixir.SpecializationTest do
     end
   end
 
+  describe "PvecAnalysis: `[d]*n` binds nested in loops/branches" do
+    # `collect_pre_alloc_binds` originally scanned only top-level
+    # statements, so an `arr = [0] * n` inside a `for`/`if` (the
+    # eval-corpus seed_17116 shape — `original = [0]*n` rebuilt per
+    # candidate, with `original[j] = …` writes) fell back to a plain
+    # list with O(n) `List.replace_at` per write → O(n²)/O(n³).
+    test "[0]*n bound inside a for-loop is pvec-detected" do
+      src = """
+      def f(n):
+          result = 0
+          for i in range(3):
+              arr = [0] * n
+              for j in range(n):
+                  arr[j] = j
+              result = result + arr[n - 1]
+          return result
+      print(f(5))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "py_pvec_new(n, 0)"
+      refute out =~ "py_mult([0]"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # arr = [0,1,2,3,4]; arr[4]=4; ×3 iterations → 12.
+      assert stdout == "12\n"
+    end
+
+    test "[0]*n bound inside an if-branch is pvec-detected" do
+      src = """
+      def f(n, flag):
+          if flag:
+              arr = [0] * n
+              for j in range(n):
+                  arr[j] = j * 2
+              return arr[n - 1]
+          return -1
+
+      print(f(4, 1))
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "py_pvec_new(n, 0)"
+      refute out =~ "py_mult([0]"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # arr=[0,2,4,6]; arr[3]=6.
+      assert stdout == "6\n"
+    end
+  end
+
   describe "PvecAnalysis: `return xs` doesn't disqualify pvec freeze" do
     # Eval-corpus `seed_14984` shape: a helper function builds a
     # `[0] * n` pvec, fills it via index-writes in a loop, then
@@ -1196,6 +1247,91 @@ defmodule Pylixir.SpecializationTest do
       {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
       # L = [0, 1, 2, -1]; L[3] = -1.
       assert stdout == "-1\n"
+    end
+  end
+
+  describe "next(iter(x)) coerces through py_iter_to_list" do
+    # `next(iter(x))` is specialized to `Enum.fetch!(x, 0)`. For a
+    # list/string the first element is correct, but for a dict
+    # Python's `iter(dict)` yields KEYS — `Enum.fetch!(map, 0)`
+    # returns a `{k, v}` entry instead. Coerce through
+    # `py_iter_to_list` (which maps to `Map.keys/1` for maps) so the
+    # dict case yields the first key. Surfaces in the
+    # `Counter - Counter` → `next(iter(diff))` eval-corpus shape
+    # (seed_1726 / seed_17225).
+    test "next(iter(dict)) yields the first key, not a {k,v} entry" do
+      src = """
+      def f():
+          d = {7: 100}
+          return next(iter(d))
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+      assert out =~ "py_iter_to_list"
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      assert stdout == "7\n"
+    end
+
+    test "next(iter(list)) still yields the first element" do
+      src = """
+      def f():
+          return next(iter([42, 43, 44]))
+      print(f())
+      """
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(Pylixir.transpile(src))
+      assert stdout == "42\n"
+    end
+  end
+
+  describe "AlistAnalysis: `==`/`!=` comparison doesn't disqualify alist freeze" do
+    # eval-corpus seed_19498: `a = list(...); sorted_a = sorted(a);
+    # if a == sorted_a: ...` then `a[i]` reads in a loop. Treating
+    # `==` as a leak left `a` a plain list → O(n) `Enum.at` per
+    # index → O(n²) loop. `==`/`!=` are value comparisons; `py_eq`
+    # normalizes the alist representation, so it's safe to keep `a`
+    # frozen and route the comparison through `py_eq`.
+    test "list compared with == still freezes to alist; comparison uses py_eq" do
+      src = """
+      def f():
+          a = list(map(int, "3 1 2".split()))
+          s = sorted(a)
+          if a == s:
+              return -1
+          return a[0] + a[1] + a[2]
+      print(f())
+      """
+
+      out = Pylixir.transpile(src)
+      # `a` freezes to alist.
+      assert out =~ "py_alist_new"
+      # The comparison routes through py_eq (alist-aware), not raw ==.
+      assert out =~ "py_eq("
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # a=[3,1,2], s=[1,2,3]; a != s → 3+1+2 = 6.
+      assert stdout == "6\n"
+    end
+
+    test "equal case returns true through py_eq" do
+      src = """
+      def f():
+          a = list(map(int, "1 2 3".split()))
+          s = sorted(a)
+          return 1 if a == s else 0
+      print(f())
+      """
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(Pylixir.transpile(src))
+      assert stdout == "1\n"
+    end
+
+    test "alist == non-iterable scalar is False, not a crash" do
+      # py_eq must not call py_iter_to_list on the scalar side.
+      assert Pylixir.RuntimeHelpers.py_eq(Pylixir.RuntimeHelpers.py_alist_new([1, 2]), 5) == false
+      assert Pylixir.RuntimeHelpers.py_eq(5, Pylixir.RuntimeHelpers.py_alist_new([1, 2])) == false
     end
   end
 end

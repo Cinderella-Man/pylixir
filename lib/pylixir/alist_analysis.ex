@@ -311,6 +311,31 @@ defmodule Pylixir.AlistAnalysis do
     leak_in_value_slot?(value, name) or leak_in?(slice, name)
   end
 
+  # Single `==` / `!=`: a bare `Name(xs)` on EITHER side is a
+  # read-only value comparison — the `Compare` lowering routes
+  # alist/pvec operands through `py_eq`, which normalizes the
+  # representation. Keeps `a` frozen for the common
+  # `if a == sorted_a:` idiom (eval-corpus seed_19498). Non-Name
+  # operands are still walked for transitive leaks.
+  defp leak_in_dispatch(
+         %{
+           "_type" => "Compare",
+           "left" => left,
+           "ops" => [%{"_type" => eq}],
+           "comparators" => [comp]
+         },
+         name
+       )
+       when eq in ["Eq", "NotEq"] do
+    left_leak =
+      if match?(%{"_type" => "Name", "id" => ^name}, left), do: false, else: leak_in?(left, name)
+
+    comp_leak =
+      if match?(%{"_type" => "Name", "id" => ^name}, comp), do: false, else: leak_in?(comp, name)
+
+    left_leak or comp_leak
+  end
+
   # Compare: only `_ in xs` / `_ not in xs` shapes give the right
   # operand a safe slot. Other operators (`==`, `<`, etc.) checking
   # `xs` mean the value escapes — bail.

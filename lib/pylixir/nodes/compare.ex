@@ -67,8 +67,26 @@ defmodule Pylixir.Nodes.Compare do
   def pair_ast(op, l, r), do: pair_ast(op, l, r, :any, :any)
 
   @spec pair_ast(map(), Macro.t(), Macro.t(), TypeInfer.t(), TypeInfer.t()) :: Macro.t()
-  def pair_ast(%{"_type" => "Eq"}, l, r, _lt, _rt), do: {:==, [], [l, r]}
-  def pair_ast(%{"_type" => "NotEq"}, l, r, _lt, _rt), do: {:!=, [], [l, r]}
+  def pair_ast(%{"_type" => "Eq"}, l, r, lt, rt) do
+    if alist_or_pvec?(lt) or alist_or_pvec?(rt) do
+      # An alist/pvec is a tagged tuple at runtime; raw `==` against a
+      # plain list would always be false. `py_eq` normalizes the
+      # tagged side(s) first. (Lets AlistAnalysis keep a list frozen
+      # even when it's compared with `==` — eval-corpus seed_19498
+      # `if a == sorted_a:`.)
+      {:py_eq, [], [l, r]}
+    else
+      {:==, [], [l, r]}
+    end
+  end
+
+  def pair_ast(%{"_type" => "NotEq"}, l, r, lt, rt) do
+    if alist_or_pvec?(lt) or alist_or_pvec?(rt) do
+      {:!, [], [{:py_eq, [], [l, r]}]}
+    else
+      {:!=, [], [l, r]}
+    end
+  end
   def pair_ast(%{"_type" => "Lt"}, l, r, _lt, _rt), do: {:<, [], [l, r]}
   def pair_ast(%{"_type" => "LtE"}, l, r, _lt, _rt), do: {:<=, [], [l, r]}
   def pair_ast(%{"_type" => "Gt"}, l, r, _lt, _rt), do: {:>, [], [l, r]}
@@ -81,6 +99,10 @@ defmodule Pylixir.Nodes.Compare do
   def pair_ast(%{"_type" => "NotIn"}, l, r, lt, rt) do
     {:!, [], [in_emit(l, r, lt, rt)]}
   end
+
+  defp alist_or_pvec?({:py_alist, _}), do: true
+  defp alist_or_pvec?({:py_pvec, _}), do: true
+  defp alist_or_pvec?(_), do: false
 
   defp in_emit(l, r, lt, rt) do
     cond do

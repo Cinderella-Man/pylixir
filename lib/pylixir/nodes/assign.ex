@@ -320,22 +320,24 @@ defmodule Pylixir.Nodes.Assign do
             {value_ast, context} = Converter.convert(value, context)
             context = bind_destructure_target(elts, context)
 
-            if flat_name_target?(elts) and not TypeInfer.is_tuple_tag?(value_type) do
-              # Python's `n, m, k = X` works for ANY iterable on the
-              # RHS: list, tuple, generator, string, ... Emitting an
-              # Elixir tuple pattern `{n, m, k} = X` would MatchError
-              # at runtime whenever the RHS is a list (every `map()`,
-              # `split()`, comprehension, etc.). When the RHS isn't
-              # statically a tuple, coerce it to a list and use a
-              # list pattern instead — `py_iter_to_list/1` no-ops on
+            if not TypeInfer.is_tuple_tag?(value_type) do
+              # Python's `n, m, k = X` (and nested forms like
+              # `(a, b), (c, d) = X`) work for ANY iterable on the RHS:
+              # list, tuple, generator, string, ... Emitting an Elixir
+              # tuple pattern `{n, m, k} = X` MatchErrors whenever the
+              # RHS is a list (every `map()`, `split()`, comprehension,
+              # or a `.append`-built list-of-tuples). When the RHS
+              # isn't statically a tuple, coerce the OUTER level to a
+              # list and use a list pattern; inner Tuple/List targets
+              # keep their own pattern shape (a list-of-tuples yields
+              # `[{a, b}, {c, d}] = …`). `py_iter_to_list/1` no-ops on
               # actual lists and normalises tuples/strings/etc.
               pattern = list_destructure_pattern(elts)
               rhs = TypeInfer.coerce_iter(value_ast, value_type)
               {{:=, [], [pattern, rhs]}, context}
             else
-              # Static tuple RHS or nested Tuple/List target — the
-              # existing tuple-pattern path is the right Elixir shape
-              # (and avoids a needless `py_iter_to_list` call).
+              # Static tuple RHS — the tuple-pattern path is the right
+              # Elixir shape (and avoids a needless `py_iter_to_list`).
               pattern = destructure_pattern(elts)
               {{:=, [], [pattern, value_ast]}, context}
             end
@@ -719,22 +721,40 @@ defmodule Pylixir.Nodes.Assign do
   # captured at decision time); we re-extract the multiplier from the
   # current RHS so we can convert it in this context.
   defp maybe_pvec_emission(id, value, context) do
-    case Map.fetch(context.pvec_names, id) do
-      :error ->
-        :no
+    # Derive BOTH the multiplier and the default from THIS bind's RHS
+    # (not the analyzer's single captured default) so a name bound in
+    # multiple branches with different defaults — `[0]*n` here,
+    # `[1]*n` there — emits the correct per-bind default.
+    if Map.has_key?(context.pvec_names, id) do
+      case {multiplier_from_rhs(value), default_from_rhs(value)} do
+        {{:ok, mult_ast}, {:ok, default_ast}} ->
+          {mult_elixir, ctx2} = Converter.convert(mult_ast, context)
+          {default_elixir, ctx2} = Converter.convert(default_ast, ctx2)
+          {:ok, {:py_pvec_new, [], [mult_elixir, default_elixir]}, ctx2}
 
-      {:ok, default_python_ast} ->
-        case multiplier_from_rhs(value) do
-          {:ok, mult_ast} ->
-            {mult_elixir, ctx2} = Converter.convert(mult_ast, context)
-            {default_elixir, ctx2} = Converter.convert(default_python_ast, ctx2)
-            {:ok, {:py_pvec_new, [], [mult_elixir, default_elixir]}, ctx2}
-
-          :no ->
-            :no
-        end
+        _ ->
+          :no
+      end
+    else
+      :no
     end
   end
+
+  defp default_from_rhs(%{
+         "_type" => "BinOp",
+         "op" => %{"_type" => "Mult"},
+         "left" => %{"_type" => "List", "elts" => [d]}
+       }),
+       do: {:ok, d}
+
+  defp default_from_rhs(%{
+         "_type" => "BinOp",
+         "op" => %{"_type" => "Mult"},
+         "right" => %{"_type" => "List", "elts" => [d]}
+       }),
+       do: {:ok, d}
+
+  defp default_from_rhs(_), do: :no
 
   # Given a `BinOp(Mult, left, right)` where one side is a
   # single-element list literal, return the *other* side's AST (the
@@ -1039,17 +1059,12 @@ defmodule Pylixir.Nodes.Assign do
     Converter.tuple_pattern(refs)
   end
 
-  # Flat tuple-of-Names with no nested Tuple/List targets — the shape
-  # for which `[a, b, c] = py_iter_to_list(rhs)` is sufficient. Nested
-  # patterns like `count, (a, b) = ...` keep the tuple-pattern path.
-  defp flat_name_target?(elts) when is_list(elts) do
-    Enum.all?(elts, &match?(%{"_type" => "Name"}, &1))
-  end
-
+  # Outer list pattern. Each element keeps its own destructure shape
+  # via `destructure_elt/1` — a flat Name becomes a var ref, a nested
+  # Tuple/List target becomes the corresponding (tuple) pattern. So
+  # `(a, b), (c, d) = list_of_tuples` → `[{a, b}, {c, d}] = …`.
   defp list_destructure_pattern(elts) when is_list(elts) do
-    Enum.map(elts, fn %{"_type" => "Name", "id" => id} ->
-      {id |> Naming.rewrite() |> String.to_atom(), [], nil}
-    end)
+    Enum.map(elts, &destructure_elt/1)
   end
 
   defp destructure_elt(%{"_type" => "Name", "id" => id}),

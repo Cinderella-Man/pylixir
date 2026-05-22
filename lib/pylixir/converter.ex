@@ -1923,6 +1923,60 @@ defmodule Pylixir.Converter do
     {{:=, [], [obj_ref, map_put]}, context}
   end
 
+  # Nested-subscript AugAssign: `m[a][b]... += v` where the chain
+  # bottoms out at a bare Name. The general clause below only rebinds
+  # when `collection` is a Name; a nested chain would otherwise emit a
+  # `py_setitem` whose result is discarded (the outer name never sees
+  # the update). Rebind the root through nested py_setitem, reading the
+  # current value via the matching py_getitem chain. Slices are
+  # temp-bound so they evaluate once (RFC single-eval). Mirrors the
+  # plain-Assign nested rebind in `Pylixir.Nodes.Assign`.
+  defp aug_assign(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Subscript"}} = target,
+         op,
+         value,
+         node,
+         context
+       ) do
+    case aug_nested_subscript_chain(target, []) do
+      {:ok, coll_id, slices} ->
+        {value_ast, context} = convert(value, context)
+        {coll_ast, context} = convert(%{"_type" => "Name", "id" => coll_id}, context)
+
+        {slice_refs, bindings, context} =
+          Enum.reduce(slices, {[], [], context}, fn slice_node, {refs, binds, ctx} ->
+            {ref, binding, ctx} = maybe_temp_bind(slice_node, ctx)
+            binds = if binding, do: [binding | binds], else: binds
+            {[ref | refs], binds, ctx}
+          end)
+
+        slice_refs = Enum.reverse(slice_refs)
+        bindings = Enum.reverse(bindings)
+
+        read = Enum.reduce(slice_refs, coll_ast, fn s, acc -> {:py_getitem, [], [acc, s]} end)
+        combined = bin_op_ast(op, read, value_ast, node)
+        new_value = build_nested_setitem(coll_ast, slice_refs, combined)
+        context = bind_name(context, coll_id)
+        assign = {:=, [], [coll_ast, new_value]}
+
+        result =
+          case bindings do
+            [] -> assign
+            _ -> {:__block__, [], bindings ++ [assign]}
+          end
+
+        {result, context}
+
+      :error ->
+        raise UnsupportedNodeError,
+          node_type: "AugAssign",
+          hint:
+            "Nested-subscript AugAssign `<#{Map.get(target, "_type")}>[…][…] <op>= v` is only supported for chains rooted at a bare Name",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
   defp aug_assign(
          %{"_type" => "Subscript", "value" => collection, "slice" => slice},
          op,
@@ -1971,6 +2025,28 @@ defmodule Pylixir.Converter do
   defp bind_name_returning_assign(context, coll_id, coll_ref, setitem) do
     context = bind_name(context, coll_id)
     {{:=, [], [coll_ref, setitem]}, context}
+  end
+
+  # Walk a (possibly nested) Subscript chain, collecting slices
+  # outermost-first. Succeeds only when the chain bottoms out at a bare
+  # Name (its rebind target).
+  defp aug_nested_subscript_chain(%{"_type" => "Subscript", "value" => v, "slice" => s}, acc) do
+    case v do
+      %{"_type" => "Name", "id" => id} -> {:ok, id, [s | acc]}
+      %{"_type" => "Subscript"} = inner -> aug_nested_subscript_chain(inner, [s | acc])
+      _ -> :error
+    end
+  end
+
+  # `m[a][b] = v` ↦ `py_setitem(m, a, py_setitem(py_getitem(m, a), b, v))`.
+  defp build_nested_setitem(coll_ast, [last_slice], value_ast) do
+    {:py_setitem, [], [coll_ast, last_slice, value_ast]}
+  end
+
+  defp build_nested_setitem(coll_ast, [s | rest], value_ast) do
+    inner_get = {:py_getitem, [], [coll_ast, s]}
+    inner_set = build_nested_setitem(inner_get, rest, value_ast)
+    {:py_setitem, [], [coll_ast, s, inner_set]}
   end
 
   @doc false
@@ -2273,16 +2349,21 @@ defmodule Pylixir.Converter do
 
   defp detect_next_iter(_), do: :no
 
+  # `x_ast` is wrapped in `py_iter_to_list` so the Python iteration
+  # protocol holds: `iter(dict)` yields KEYS (not `{k, v}` entries),
+  # `iter(str)` yields chars, etc. For a list it's an identity wrap.
   defp emit_next_iter(x_node, :no_default, context) do
     {x_ast, context} = convert(x_node, context)
-    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :fetch!]}, [], [x_ast, 0]}
+    coerced = {:py_iter_to_list, [], [x_ast]}
+    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :fetch!]}, [], [coerced, 0]}
     {ast, context}
   end
 
   defp emit_next_iter(x_node, default_node, context) do
     {x_ast, context} = convert(x_node, context)
     {d_ast, context} = convert(default_node, context)
-    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :at]}, [], [x_ast, 0, d_ast]}
+    coerced = {:py_iter_to_list, [], [x_ast]}
+    ast = {{:., [], [{:__aliases__, [], [:Enum]}, :at]}, [], [coerced, 0, d_ast]}
     {ast, context}
   end
 
@@ -2327,7 +2408,31 @@ defmodule Pylixir.Converter do
     {{:py_print_iter, [], [arg_ast, sep_ast, end_ast]}, context}
   end
 
-  defp emit_starred_call(id, star_node, node, context) do
+  # `product(*iters[, repeat=N])` — like `zip`, the unpacked argument
+  # IS the list-of-iterables `py_product` expects. The general
+  # `apply(fn, list)` path would spread the list as separate positional
+  # args and crash the 1-arg `product` binding (BadArityError); pass the
+  # list straight through instead. Only fires when `product` resolves to
+  # the itertools alias, so a user-defined `product` keeps normal splat.
+  defp emit_starred_call("product", star_node, node, context) do
+    case Map.get(context.stdlib_aliases, "product") do
+      {"itertools", "product"} ->
+        arg_type = TypeInfer.infer_expr(star_node, context)
+        {arg_ast, context} = convert(star_node, context)
+        arg_list = TypeInfer.coerce_iter(arg_ast, arg_type)
+        {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
+        repeat = Map.get(kwargs, "repeat", 1)
+        {{:py_product, [], [arg_list, repeat]}, context}
+
+      _ ->
+        emit_starred_call_default("product", star_node, node, context)
+    end
+  end
+
+  defp emit_starred_call(id, star_node, node, context),
+    do: emit_starred_call_default(id, star_node, node, context)
+
+  defp emit_starred_call_default(id, star_node, node, context) do
     arg_type = TypeInfer.infer_expr(star_node, context)
     {arg_ast, context} = convert(star_node, context)
     arg_list = TypeInfer.coerce_iter(arg_ast, arg_type)

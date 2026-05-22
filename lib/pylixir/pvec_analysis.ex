@@ -78,19 +78,26 @@ defmodule Pylixir.PvecAnalysis do
       body
       |> collect_pre_alloc_binds()
       |> Enum.group_by(fn {n, _, _} -> n end)
-      |> Enum.flat_map(fn
-        # Multiple matching binds for the same name is a reassignment.
-        {name, [_, _ | _]} ->
-          log_decision(scope_name, name, :bailed, "multiple_binds")
-          []
+      |> Enum.flat_map(fn {name, binds} ->
+        # All entries here are `[d] * n` shaped (that's all
+        # `collect_pre_alloc_binds` collects). Multiple binds for the
+        # same name — typically in mutually-exclusive branches
+        # (`if …: arr = [0]*n  else: arr = [0]*n`) — are fine: every
+        # bind re-inits to a pvec, so the name is always a pvec. We
+        # skip ALL of them in the reassignment check; a non-pvec
+        # reassignment elsewhere still bails. The emission re-derives
+        # each bind's own default from its RHS, so differing defaults
+        # are handled correctly.
+        binding_nodes = Enum.map(binds, fn {_, _, node} -> node end)
+        {_, default_ast, _} = hd(binds)
 
-        {name, [{_, default_ast, binding_node}]} ->
-          if decide(name, body, binding_node) do
-            log_decision(scope_name, name, :froze, nil)
-            [{name, default_ast}]
-          else
-            []
-          end
+        if decide(name, body, binding_nodes) do
+          log_decision(scope_name, name, :froze, nil)
+          [{name, default_ast}]
+        else
+          log_decision(scope_name, name, :bailed, "reassigned_or_leaked")
+          []
+        end
       end)
       |> Map.new()
     end
@@ -103,27 +110,50 @@ defmodule Pylixir.PvecAnalysis do
   # `<n>` is computed at runtime to size the array. Both `[d] * n` and
   # `n * [d]` shapes are accepted (Python's `*` is commutative for
   # list × int).
+  # Descend into same-scope control flow (`For`/`While`/`If`/`Try`)
+  # so a `[d] * n` bind nested in a loop or branch is still found
+  # (eval-corpus seed_17116: `original = [0]*n` rebuilt per
+  # candidate inside a `for`). Does NOT cross into nested
+  # `FunctionDef`/`Lambda`/`ClassDef` bodies — those are separate
+  # scopes analysed on their own.
   defp collect_pre_alloc_binds(body) do
-    Enum.flat_map(body, fn
-      %{
-        "_type" => "Assign",
-        "targets" => [%{"_type" => "Name", "id" => name}],
-        "value" => %{
-          "_type" => "BinOp",
-          "op" => %{"_type" => "Mult"},
-          "left" => left,
-          "right" => right
-        }
-      } = node ->
-        case pre_alloc_default(left, right) do
-          {:ok, default_ast} -> [{name, default_ast, node}]
-          :no -> []
-        end
-
-      _ ->
-        []
-    end)
+    Enum.flat_map(body, &collect_binds_node/1)
   end
+
+  defp collect_binds_node(
+         %{
+           "_type" => "Assign",
+           "targets" => [%{"_type" => "Name", "id" => name}],
+           "value" => %{
+             "_type" => "BinOp",
+             "op" => %{"_type" => "Mult"},
+             "left" => left,
+             "right" => right
+           }
+         } = node
+       ) do
+    case pre_alloc_default(left, right) do
+      {:ok, default_ast} -> [{name, default_ast, node}]
+      :no -> []
+    end
+  end
+
+  defp collect_binds_node(%{"_type" => type} = node)
+       when type in ["For", "AsyncFor", "While", "If", "Try", "With", "AsyncWith"] do
+    nested =
+      [Map.get(node, "body"), Map.get(node, "orelse"), Map.get(node, "finalbody")]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.flat_map(&collect_pre_alloc_binds/1)
+
+    handler_binds =
+      node
+      |> Map.get("handlers", [])
+      |> Enum.flat_map(fn h -> collect_pre_alloc_binds(Map.get(h, "body", [])) end)
+
+    nested ++ handler_binds
+  end
+
+  defp collect_binds_node(_), do: []
 
   # Either side may be the single-element list literal. Returns the
   # default-value AST when exactly one side matches.
@@ -133,30 +163,37 @@ defmodule Pylixir.PvecAnalysis do
 
   # --- per-candidate decision ----------------------------------------
 
-  defp decide(name, body, binding_node) do
-    not reassigned?(body, name, binding_node) and
+  defp decide(name, body, binding_nodes) do
+    not reassigned?(body, name, binding_nodes) and
       not leaked?(body, name) and
       not mentioned_in_nested_scope?(body, name)
   end
 
   # Reassignment = any Assign/AugAssign/For-target that mentions `name`,
-  # *other than* the pre-alloc binding itself. Subscript-assigns on
-  # `xs[i]` are not reassignments — those are the writes we want.
-  defp reassigned?(body, name, binding_node) do
-    Enum.any?(body, &reassigns_deep?(&1, name, binding_node))
+  # *other than* one of the pre-alloc bindings themselves.
+  # Subscript-assigns on `xs[i]` are not reassignments — those are the
+  # writes we want.
+  defp reassigned?(body, name, binding_nodes) do
+    Enum.any?(body, &reassigns_deep?(&1, name, binding_nodes))
   end
 
-  defp reassigns_deep?(node, _name, binding_node) when node == binding_node, do: false
+  defp reassigns_deep?(%{"_type" => _} = node, name, binding_nodes) do
+    cond do
+      Enum.member?(binding_nodes, node) ->
+        false
 
-  defp reassigns_deep?(%{"_type" => _} = node, name, binding_node) do
-    reassigns_here?(node, name) or
-      node
-      |> Map.delete("_type")
-      |> Enum.any?(fn {_k, v} -> reassigns_deep?(v, name, binding_node) end)
+      reassigns_here?(node, name) ->
+        true
+
+      true ->
+        node
+        |> Map.delete("_type")
+        |> Enum.any?(fn {_k, v} -> reassigns_deep?(v, name, binding_nodes) end)
+    end
   end
 
-  defp reassigns_deep?(list, name, binding_node) when is_list(list),
-    do: Enum.any?(list, &reassigns_deep?(&1, name, binding_node))
+  defp reassigns_deep?(list, name, binding_nodes) when is_list(list),
+    do: Enum.any?(list, &reassigns_deep?(&1, name, binding_nodes))
 
   defp reassigns_deep?(_, _, _), do: false
 

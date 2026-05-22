@@ -133,7 +133,11 @@ defmodule Pylixir.RuntimeHelpers.MathExt do
   # via Fermat's little theorem).
   def py_pow_mod(base, exp, mod)
       when is_integer(base) and is_integer(exp) and is_integer(mod) and exp >= 0 and mod > 0 do
-    :crypto.mod_pow(base, exp, mod) |> :crypto.bytes_to_integer()
+    # `:crypto.mod_pow` mishandles a negative base (it round-trips the
+    # term through an unsigned-binary encoding). Python reduces the
+    # base modulo `mod` first, landing the result in [0, mod), so do
+    # the same here. `Integer.mod` already gives a non-negative result.
+    :crypto.mod_pow(Integer.mod(base, mod), exp, mod) |> :crypto.bytes_to_integer()
   end
 
   # --- HELPERS END ---

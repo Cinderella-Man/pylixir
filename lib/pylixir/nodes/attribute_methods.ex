@@ -62,6 +62,9 @@ defmodule Pylixir.Nodes.AttributeMethods do
   # has integer guards so non-integer targets crash visibly.
   @int_methods ~w(bit_length)
 
+  # Methods on Python's `float` (and `int`, which also defines them).
+  @float_methods ~w(is_integer)
+
   # Methods on Python's `set` / `frozenset` — Elixir's MapSet provides
   # exact equivalents. Same ducktyping caveat: non-MapSet targets
   # crash at runtime.
@@ -88,6 +91,11 @@ defmodule Pylixir.Nodes.AttributeMethods do
 
   defp do_dispatch("bit_length", target, [], _kw, _node),
     do: {:py_int_bit_length, [], [target]}
+
+  # --- Float methods -----------------------------------------------------
+
+  defp do_dispatch("is_integer", target, [], _kw, _node),
+    do: {:py_num_is_integer, [], [target]}
 
   # --- Set methods (Python set / frozenset → Elixir MapSet) -------------
 
@@ -524,7 +532,7 @@ defmodule Pylixir.Nodes.AttributeMethods do
     raise UnsupportedNodeError,
       node_type: "Call",
       hint:
-        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods ++ @int_methods ++ @set_methods, ", ")})",
+        "method `.#{attr}()` is not supported (allowed: #{Enum.join(@dict_methods ++ @string_methods ++ @noop_methods ++ @int_methods ++ @float_methods ++ @set_methods, ", ")})",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
   end

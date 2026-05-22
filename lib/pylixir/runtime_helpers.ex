@@ -70,6 +70,19 @@ defmodule Pylixir.RuntimeHelpers do
   def py_sub(a, b) when is_boolean(b), do: py_sub(a, py_bool_to_int(b))
   # Python: `set - set` is set difference. Pylixir's set rep is MapSet.
   def py_sub(%MapSet{} = a, %MapSet{} = b), do: MapSet.difference(a, b)
+
+  # Python: `Counter - Counter` subtracts counts, keeping ONLY
+  # results that stay positive (`collections.Counter.__sub__`).
+  # `Counter` lowers to a plain frequency map; regular dict
+  # subtraction is a TypeError in Python, so a map-minus-map can only
+  # be this Counter op. Keys present only in `b` contribute nothing.
+  def py_sub(a, b) when is_map(a) and is_map(b) and not is_struct(a) and not is_struct(b) do
+    Enum.reduce(a, %{}, fn {k, va}, acc ->
+      diff = va - Map.get(b, k, 0)
+      if diff > 0, do: Map.put(acc, k, diff), else: acc
+    end)
+  end
+
   def py_sub(a, b), do: a - b
 
   def py_div(a, b) when is_boolean(a), do: py_div(py_bool_to_int(a), b)
@@ -395,7 +408,14 @@ defmodule Pylixir.RuntimeHelpers do
         Enum.map(indices, &elem(t, &1))
 
       is_binary(coll) ->
-        Enum.map_join(indices, "", &String.at(coll, &1))
+        # `Enum.map_join(indices, "", &String.at(coll, &1))` is O(n²)
+        # — `String.at` re-counts graphemes from the head every call.
+        # Materialize the graphemes into a tuple once so per-index
+        # lookups are O(1) via `elem/2`; total stays O(n + len(indices)).
+        # For the `seed_16487` string-rotation loop this is the
+        # difference between O(n²) and O(n³).
+        g = coll |> String.graphemes() |> List.to_tuple()
+        indices |> Enum.map(&elem(g, &1)) |> Enum.join("")
 
       # Alist branch MUST come before `is_tuple` (a `{:py_alist, _}`
       # tag is structurally a tuple). Python's "slice of a list is a
@@ -601,6 +621,18 @@ defmodule Pylixir.RuntimeHelpers do
   def py_append(nil, v), do: [v]
   def py_append(xs, v) when is_list(xs), do: xs ++ [v]
 
+  # `s.add(v)` ↦ `py_set_add(s, v)`. Like `py_append`, tolerate a nil
+  # receiver so `d[k].add(v)` on a `defaultdict(set)` auto-creates the
+  # set instead of crashing in `MapSet.put(nil, v)`.
+  def py_set_add(nil, v), do: MapSet.new([v])
+  def py_set_add(%MapSet{} = s, v), do: MapSet.put(s, v)
+
+  # `x.is_integer()` — Python `float`/`int` method: True when the value
+  # has no fractional part. Ints are always integral; floats compare
+  # against their floor.
+  def py_num_is_integer(x) when is_integer(x), do: true
+  def py_num_is_integer(x) when is_float(x), do: Float.floor(x) == x
+
   # === Persistent-vector (pvec) helpers ===========================
   # Used by the `xs = [default] * n` + subscript-write pattern (see
   # `Pylixir.PvecAnalysis`). Backed by Erlang's `:array` module —
@@ -643,11 +675,18 @@ defmodule Pylixir.RuntimeHelpers do
   # could be alist-shaped. Compare nodes only route through this
   # helper when at least one operand's static type is `{:py_alist,
   # _}`; everything else stays on plain `==/2`.
-  def py_eq({:py_alist, _} = a, b), do: py_iter_to_list(a) == py_iter_to_list(b)
-  def py_eq(a, {:py_alist, _} = b), do: py_iter_to_list(a) == py_iter_to_list(b)
-  def py_eq({:py_pvec, _} = a, b), do: py_iter_to_list(a) == py_iter_to_list(b)
-  def py_eq(a, {:py_pvec, _} = b), do: py_iter_to_list(a) == py_iter_to_list(b)
+  # Normalise ONLY the alist/pvec side(s). The other operand stays
+  # as-is — a scalar (`[1,2] == 5` is just `False` in Python) must
+  # not be force-fed to `py_iter_to_list` (it isn't enumerable).
+  def py_eq({:py_alist, _} = a, b), do: py_iter_to_list(a) == eq_normalize(b)
+  def py_eq(a, {:py_alist, _} = b), do: eq_normalize(a) == py_iter_to_list(b)
+  def py_eq({:py_pvec, _} = a, b), do: py_iter_to_list(a) == eq_normalize(b)
+  def py_eq(a, {:py_pvec, _} = b), do: eq_normalize(a) == py_iter_to_list(b)
   def py_eq(a, b), do: a == b
+
+  def eq_normalize({:py_alist, _} = x), do: py_iter_to_list(x)
+  def eq_normalize({:py_pvec, _} = x), do: py_iter_to_list(x)
+  def eq_normalize(x), do: x
 
   # === Type conversion ===
   def py_int(true), do: 1

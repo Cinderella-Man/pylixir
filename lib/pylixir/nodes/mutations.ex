@@ -440,7 +440,7 @@ defmodule Pylixir.Nodes.Mutations do
     do: {{:., [], [{:__aliases__, [], [:Map]}, :put_new]}, [], [target, k, default]}
 
   defp mutation_rhs("add", target, [x], _kw, _node),
-    do: {{:., [], [{:__aliases__, [], [:MapSet]}, :put]}, [], [target, x]}
+    do: {:py_set_add, [], [target, x]}
 
   defp mutation_rhs("discard", target, [x], _kw, _node),
     do: {{:., [], [{:__aliases__, [], [:MapSet]}, :delete]}, [], [target, x]}

@@ -183,6 +183,34 @@ defmodule Pylixir.RuntimeHelpersTest do
     end
   end
 
+  describe "py_sub/2 — Counter subtraction (map - map)" do
+    # `collections.Counter` lowers to a plain frequency map. Python's
+    # `Counter - Counter` subtracts counts and KEEPS ONLY positive
+    # results (negative/zero counts are dropped). Regular dict
+    # subtraction is a TypeError in Python, so a map-minus-map at
+    # runtime is unambiguously a Counter op. Without this clause
+    # py_sub fell through to `a - b` and crashed with ArithmeticError
+    # (eval-corpus seed_1726 / seed_17225).
+    test "keeps only positive counts" do
+      a = %{1 => 3, 2 => 1, 3 => 2}
+      b = %{1 => 1, 2 => 2, 4 => 5}
+      # 1: 3-1=2 (keep), 2: 1-2=-1 (drop), 3: 2-0=2 (keep), 4: only in b (ignored)
+      assert H.py_sub(a, b) == %{1 => 2, 3 => 2}
+    end
+
+    test "disjoint keys: left counts pass through, right ignored" do
+      assert H.py_sub(%{"x" => 4}, %{"y" => 9}) == %{"x" => 4}
+    end
+
+    test "identical counters → empty" do
+      assert H.py_sub(%{1 => 2, 2 => 3}, %{1 => 2, 2 => 3}) == %{}
+    end
+
+    test "empty minus empty → empty" do
+      assert H.py_sub(%{}, %{}) == %{}
+    end
+  end
+
   describe "py_floor_div/2 — Python `//` (RFC §6.1)" do
     test "int // int rounds toward negative infinity (not toward zero)" do
       assert H.py_floor_div(7, 2) == 3
@@ -369,6 +397,32 @@ defmodule Pylixir.RuntimeHelpersTest do
 
       assert elapsed_ms < 500,
              "py_slice (step=-1) on 50k-list took #{elapsed_ms}ms — expected well under 500ms"
+    end
+
+    test "py_slice on a 100k-char binary is O(n), not O(n²)" do
+      # eval-corpus `seed_16487` shape: string-rotation comparison
+      # `start[t:] + start[:t]` in a loop over n. A naive
+      # `Enum.map_join(indices, "", &String.at(s, &1))` is O(n²) per
+      # slice (String.at is O(index) on a UTF-8 binary), making the
+      # whole loop O(n³). Linearizing the slice (graphemes → tuple →
+      # elem) brings each slice to O(n).
+      s = String.duplicate("ab", 50_000)
+      {time_us, sliced} = :timer.tc(fn -> H.py_slice(s, 1, 100_000, nil) end)
+      assert byte_size(sliced) == 99_999
+      assert String.first(sliced) == "b"
+
+      elapsed_ms = div(time_us, 1000)
+
+      assert elapsed_ms < 500,
+             "py_slice on 100k-char binary took #{elapsed_ms}ms — expected well under 500ms (O(n²) String.at fallback)"
+    end
+
+    test "py_slice on a binary preserves Python semantics (negative / step)" do
+      s = "abcdef"
+      assert H.py_slice(s, 1, 4, nil) == "bcd"
+      assert H.py_slice(s, nil, nil, -1) == "fedcba"
+      assert H.py_slice(s, 0, 6, 2) == "ace"
+      assert H.py_slice(s, -2, nil, nil) == "ef"
     end
   end
 

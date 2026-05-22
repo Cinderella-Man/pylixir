@@ -17,6 +17,13 @@ print(pow(2, 10, 1000))  # 1024 mod 1000 = 24
 print(pow(3, 7, 100))    # 2187 mod 100 = 87
 print(pow(7, 0, 13))     # 1
 
+# Negative base: Python reduces the base modulo `mod` first, so the
+# result lands in [0, mod). :crypto.mod_pow mishandles a raw negative
+# base, so py_pow_mod must normalise it.
+print(pow(-1, 3, MOD))   # 998244352
+print(pow(-1, 4, MOD))   # 1
+print(pow(-5, 3, 100))   # -125 mod 100 = 75
+
 # 2-arg pow still works.
 print(pow(2, 10))
 print(pow(3, 4))

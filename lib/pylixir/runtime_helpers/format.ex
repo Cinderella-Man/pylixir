@@ -121,6 +121,20 @@ defmodule Pylixir.RuntimeHelpers.Format do
       spec == "d" ->
         {:int, 0, " "}
 
+      # `0N` — zero-pad numeric width N, no explicit type (e.g. `02`).
+      # Python treats a bare `{x:02}` like `{x:02d}` for ints. Guarded
+      # by `is_integer(value)` in `py_format_value`, so non-ints fall
+      # back to `py_str`.
+      Regex.run(~r/^0(\d+)$/, spec) ->
+        [_, n] = Regex.run(~r/^0(\d+)$/, spec)
+        {:int, String.to_integer(n), "0"}
+
+      # `N` — numeric width N, space-pad, no explicit type (e.g. `5`).
+      # Numbers are right-aligned (pad_leading), matching `{x:5d}`.
+      Regex.run(~r/^(\d+)$/, spec) ->
+        [_, n] = Regex.run(~r/^(\d+)$/, spec)
+        {:int, String.to_integer(n), " "}
+
       # `+d` / `+Nd` — always-show-sign int. Padding goes around the
       # sign+digits combo. (Doesn't yet handle `0+Nd` zero-pad-with-sign.)
       Regex.run(~r/^\+(\d*)d?$/, spec) ->

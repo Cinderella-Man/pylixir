@@ -638,13 +638,22 @@ defmodule Pylixir.Nodes.Loop do
   defp same_loop_walk(%{"_type" => type} = node, acc, fun) do
     acc = fun.(node, acc)
 
-    if type in ~w(FunctionDef AsyncFunctionDef Lambda ClassDef For AsyncFor While
-                  ListComp SetComp DictComp GeneratorExp) do
-      acc
-    else
-      node
-      |> Map.delete("_type")
-      |> Enum.reduce(acc, fn {_k, v}, a -> same_loop_walk(v, a, fun) end)
+    cond do
+      # A nested loop's `else` clause runs once after the nested loop
+      # finishes — outside its iteration — so a `break`/`continue` there
+      # targets THIS loop, not the nested one. Descend into the nested
+      # loop's `orelse` only; its body/iter/target belong to it.
+      type in ~w(For AsyncFor While) ->
+        same_loop_walk(Map.get(node, "orelse", []), acc, fun)
+
+      type in ~w(FunctionDef AsyncFunctionDef Lambda ClassDef
+                 ListComp SetComp DictComp GeneratorExp) ->
+        acc
+
+      true ->
+        node
+        |> Map.delete("_type")
+        |> Enum.reduce(acc, fn {_k, v}, a -> same_loop_walk(v, a, fun) end)
     end
   end
 

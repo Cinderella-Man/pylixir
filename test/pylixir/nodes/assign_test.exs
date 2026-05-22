@@ -126,11 +126,12 @@ defmodule Pylixir.Nodes.AssignTest do
       assert ast == {:=, [], [{{:a, [], nil}, {:b, [], nil}}, {1, 2}]}
     end
 
-    test "nested Tuple target keeps tuple pattern (no list-pattern path)" do
-      # `count, (a, b) = ...` has a nested Tuple target; the
-      # list-pattern transform only applies to fully-flat Name targets.
-      # Use a List RHS so any naive type-only check would still pick
-      # the list path — the flatness check must take precedence.
+    test "nested Tuple target over a List RHS uses an outer list pattern" do
+      # `count, (a, b) = <list>` — the OUTER level must be a list
+      # pattern (the RHS is a list at runtime); inner Tuple targets
+      # keep their tuple pattern. Emitting an outer tuple pattern
+      # would MatchError against a list. (The RHS here is a `coerce_iter`
+      # no-op since it's statically a list.)
       inner = %{"_type" => "Tuple", "elts" => [name("a"), name("b")]}
       outer_target = %{"_type" => "Tuple", "elts" => [name("count"), inner]}
       list_value = %{"_type" => "List", "elts" => [const(5), const(6)]}
@@ -140,9 +141,37 @@ defmodule Pylixir.Nodes.AssignTest do
       assert ast ==
                {:=, [],
                 [
-                  {{:count, [], nil}, {{:a, [], nil}, {:b, [], nil}}},
+                  [{:count, [], nil}, {{:a, [], nil}, {:b, [], nil}}],
                   [5, 6]
                 ]}
+    end
+
+    test "nested Tuple target over a list-of-tuples uses outer list pattern" do
+      # `(x1, y1), (x2, y2) = k_positions` where `k_positions` is a
+      # LIST of tuples (e.g. built via `.append((i, j))`). The outer
+      # destructure must be a LIST pattern (the value is a list at
+      # runtime) with inner TUPLE patterns (each element is a tuple).
+      # Emitting an outer tuple pattern `{{x1,y1},{x2,y2}}` MatchErrors
+      # against a list — the eval-corpus knight-BFS sample
+      # (seed with `(x1,y1),(x2,y2) = k_positions`).
+      src = """
+      def main():
+          ps = []
+          ps.append((0, 2))
+          ps.append((1, 5))
+          (x1, y1), (x2, y2) = ps
+          return x1 + y1 + x2 + y2
+      print(main())
+      """
+
+      out = Pylixir.transpile(src)
+      # Outer list pattern, inner tuple patterns.
+      assert out =~ "[{x1, y1}, {x2, y2}] ="
+      refute out =~ "{{x1, y1}, {x2, y2}} ="
+
+      {_, _, stdout, _} = Pylixir.TranspileHelpers.run_source(out)
+      # 0 + 2 + 1 + 5 = 8.
+      assert stdout == "8\n"
     end
 
     test "flat Name target binds every name into scope (list-pattern path)" do
