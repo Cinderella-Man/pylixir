@@ -72,6 +72,12 @@ defmodule Dataset.BuildTest do
     assert expecteds == ["10", "hello"]
   end
 
+  test "a tiny behavioral load budget still curates correctly (forces per-chunk row loads)" do
+    out = tmp("budget")
+    {:ok, _, summary} = Dataset.Build.run(base_opts(out) ++ [behavioral_load_budget: 1])
+    assert summary == %{groups: 2, kept: 2, dropped: 0}
+  end
+
   test "--limit slices the group list" do
     out = tmp("limit")
     {:ok, _, summary} = Dataset.Build.run(base_opts(out) ++ [limit: 1])

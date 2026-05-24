@@ -121,17 +121,22 @@ defmodule Dataset.Build do
     results_path = Path.join(System.tmp_dir!(), "dataset_results_#{System.unique_integer([:positive])}.bin")
     {:ok, wh} = :file.open(results_path, [:write, :binary, :raw])
 
-    {fingerprints, sources} =
+    # Accumulate an `id => {offset, len}` index of the spill as we write it, so
+    # the behavioral step can pread only the candidate rows it needs (bounded
+    # memory) instead of materializing every candidate row's testcases at once.
+    {fingerprints, sources, row_index, _bytes} =
       try do
-        Enum.reduce(0..(buckets - 1), {[], []}, fn b, acc ->
+        Enum.reduce(0..(buckets - 1), {[], [], %{}, 0}, fn b, acc ->
           # Sort each bucket by id so the on-disk row order is deterministic
           # (buckets are written in index order); survivors keep that order.
           spill_dir
           |> process_bucket(b, solutions_by_qid, qid_to_group, size_limit, select_opts, concurrency, counter, total)
           |> Enum.sort_by(& &1.id)
-          |> Enum.reduce(acc, fn result, {fps, srcs} ->
-            write_result(wh, result)
-            {[Dedup.fingerprint(result) | fps], [{result.id, result.source} | srcs]}
+          |> Enum.reduce(acc, fn result, {fps, srcs, idx, off} ->
+            {next_off, len} = write_result(wh, result, off)
+
+            {[Dedup.fingerprint(result) | fps], [{result.id, result.source} | srcs],
+             Map.put(idx, result.id, {off + 4, len}), next_off}
           end)
         end)
       after
@@ -150,7 +155,7 @@ defmodule Dataset.Build do
     sources_by_id = Map.new(sources)
     candidate_pairs = candidate_pairs(fingerprints, norm_hashes, sources_by_id, opts)
     sim_edges = source_sim_edges(candidate_pairs, sources_by_id, opts)
-    behavioral_edges = behavioral(candidate_pairs, sim_edges, results_path, opts)
+    behavioral_edges = behavioral(candidate_pairs, sim_edges, results_path, row_index, opts)
     {keep, overrides} = dedup(fingerprints, norm_hashes, sim_edges ++ behavioral_edges, opts)
 
     # Stage C — re-read survivors from disk, fold merge meta, stream to emit.
@@ -280,18 +285,72 @@ defmodule Dataset.Build do
   # (short boilerplate-similar but behaviorally distinct problems).
   defp behavioral?(opts), do: Keyword.get(opts, :behavioral, true)
 
-  defp behavioral(candidate_pairs, sim_edges, results_path, opts) do
+  defp behavioral(candidate_pairs, sim_edges, results_path, row_index, opts) do
     if behavioral?(opts) and candidate_pairs != [] do
       decided = MapSet.new(sim_edges)
       pairs = Enum.reject(candidate_pairs, &MapSet.member?(decided, &1))
-      ids = pairs |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
-      rows = load_rows(results_path, ids)
 
-      edges = Behavioral.edges(rows, pairs, behavioral_opts(opts))
+      edges = behavioral_chunks(pairs, results_path, row_index, opts)
       Logger.info("[behavioral] #{length(edges)} equivalent pairs from #{length(pairs)} candidates")
       edges
     else
       []
+    end
+  end
+
+  # Resident-testcase budget for one behavioral chunk (sum of the chunk's rows'
+  # on-disk sizes). Caps memory regardless of how many candidate pairs the gate
+  # proposes.
+  @behavioral_load_budget 256 * 1024 * 1024
+
+  # Run the behavioral check in byte-bounded chunks: each chunk loads only its
+  # candidate rows' payloads from the spill (via pread on the row index) and
+  # drops them before the next chunk. Loading *every* candidate row at once is
+  # the full-scale OOM — the content-similarity gate can cover most of the
+  # dataset, and a single row carries up to ~32 MB of testcases.
+  defp behavioral_chunks(pairs, results_path, row_index, opts) do
+    budget = Keyword.get(opts, :behavioral_load_budget, @behavioral_load_budget)
+    {:ok, fd} = :file.open(results_path, [:read, :binary, :raw])
+
+    try do
+      pairs
+      |> chunk_pairs_by_bytes(row_index, budget)
+      |> Enum.flat_map(fn chunk ->
+        ids = chunk |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
+        rows = load_rows_indexed(fd, row_index, ids)
+        Behavioral.edges(rows, chunk, behavioral_opts(opts))
+      end)
+    after
+      :file.close(fd)
+    end
+  end
+
+  # Greedily pack candidate pairs into chunks whose distinct rows' on-disk sizes
+  # sum to at most `budget` bytes (a single oversized pair still gets its own
+  # chunk). A row shared by several pairs inside a chunk is counted once.
+  defp chunk_pairs_by_bytes(pairs, row_index, budget) do
+    {chunks, cur, _ids, _bytes} =
+      Enum.reduce(pairs, {[], [], MapSet.new(), 0}, fn {a, b} = pair, {chunks, cur, ids, bytes} ->
+        add = row_bytes(row_index, ids, a) + row_bytes(row_index, ids, b)
+
+        if cur != [] and bytes + add > budget do
+          {[Enum.reverse(cur) | chunks], [pair], MapSet.new([a, b]), size_of(row_index, a) + size_of(row_index, b)}
+        else
+          {chunks, [pair | cur], ids |> MapSet.put(a) |> MapSet.put(b), bytes + add}
+        end
+      end)
+
+    Enum.reverse(if cur == [], do: chunks, else: [Enum.reverse(cur) | chunks])
+  end
+
+  defp row_bytes(row_index, ids, id) do
+    if MapSet.member?(ids, id), do: 0, else: size_of(row_index, id)
+  end
+
+  defp size_of(row_index, id) do
+    case Map.get(row_index, id) do
+      {_off, len} -> len
+      nil -> 0
     end
   end
 
@@ -303,13 +362,16 @@ defmodule Dataset.Build do
     ]
   end
 
-  # Load just the candidate rows' payloads (source + testcases) from the
-  # on-disk results spill — bounded by the candidate set, not the dataset.
-  defp load_rows(results_path, ids) do
-    results_path
-    |> stream_results()
-    |> Stream.filter(&MapSet.member?(ids, &1.id))
-    |> Map.new(fn r -> {r.id, %{source: r.source, testcases: r.testcases}} end)
+  # Load just `ids`' payloads (source + testcases) by seeking to each row's
+  # recorded offset in the spill — bounded by the id set handed in, never the
+  # whole dataset. `fd` is a read-mode handle on `results_path`.
+  defp load_rows_indexed(fd, row_index, ids) do
+    Map.new(ids, fn id ->
+      {offset, len} = Map.fetch!(row_index, id)
+      {:ok, bin} = :file.pread(fd, offset, len)
+      r = :erlang.binary_to_term(bin)
+      {id, %{source: r.source, testcases: r.testcases}}
+    end)
   end
 
   # Canonical-source hashes for the dedup source signal (Dataset.SourceNorm).
@@ -344,9 +406,13 @@ defmodule Dataset.Build do
   # Length-prefixed term_to_binary records — exact round-trip of a select
   # result, so the heavy testcase payloads live on disk between selection
   # and emit instead of resident.
-  defp write_result(handle, result) do
+  # Append a record at `offset`; return `{next_offset, payload_len}` so the
+  # caller can index the payload at `offset + 4` with length `payload_len`.
+  defp write_result(handle, result, offset) do
     bin = :erlang.term_to_binary(result)
-    :ok = :file.write(handle, <<byte_size(bin)::32, bin::binary>>)
+    len = byte_size(bin)
+    :ok = :file.write(handle, <<len::32, bin::binary>>)
+    {offset + 4 + len, len}
   end
 
   defp stream_results(path) do
