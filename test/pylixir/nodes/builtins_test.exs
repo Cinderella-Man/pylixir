@@ -125,6 +125,16 @@ defmodule Pylixir.Nodes.BuiltinsTest do
         {_, value, _, _} -> assert value == [{1, "a"}, {2, "b"}, {3, "c"}]
       end
     end
+
+    test "zip(*grid) iterates each string argument char-by-char (transpose)" do
+      # Python: list(zip("ab", "cd")) == [('a','c'), ('b','d')]. The
+      # starred form must coerce each inner string to its chars, not hand
+      # a raw binary to Enum (Enumerable is undefined for BitString).
+      case run("(list(zip(*['ab', 'cd'])))\n") do
+        :skip -> :ok
+        {_, value, _, _} -> assert value == [{"a", "c"}, {"b", "d"}]
+      end
+    end
   end
 
   describe "T25b — aggregation + functional" do

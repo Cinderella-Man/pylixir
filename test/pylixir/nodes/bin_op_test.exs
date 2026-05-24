@@ -279,5 +279,19 @@ defmodule Pylixir.Nodes.BinOpTest do
 
       assert value == 1
     end
+
+    test "LShift: True << 1 == 2" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("LShift", const(true), const(1))))
+
+      assert value == 2
+    end
+
+    test "RShift: True >> 1 == 0" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("RShift", const(true), const(1))))
+
+      assert value == 0
+    end
   end
 end

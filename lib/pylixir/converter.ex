@@ -1498,9 +1498,15 @@ defmodule Pylixir.Converter do
 
   defp unary_op_ast(%{"_type" => "USub"}, operand_ast, _node), do: {:py_sub, [], [0, operand_ast]}
 
-  defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node) do
-    {{:., [], [{:__aliases__, [], [:Bitwise]}, :bnot]}, [], [operand_ast]}
-  end
+  # Integer literal: emit the bare `Bitwise.bnot`. Otherwise the operand
+  # might be a Python bool (`~True == -2`), so coerce via `py_bool_to_int`
+  # first — `Bitwise.bnot` raises on a non-integer (mirrors USub's
+  # bool→int handling).
+  defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node) when is_integer(operand_ast),
+    do: bnot_call(operand_ast)
+
+  defp unary_op_ast(%{"_type" => "Invert"}, operand_ast, _node),
+    do: bnot_call({:py_bool_to_int, [], [operand_ast]})
 
   defp unary_op_ast(%{"_type" => "Not"}, operand_ast, _node) do
     {:!, [], [{:truthy?, [], [operand_ast]}]}
@@ -1646,8 +1652,14 @@ defmodule Pylixir.Converter do
     end
   end
 
-  defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsl, l, r)
-  defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node, _lt, _rt), do: bitwise_call(:bsr, l, r)
+  # Python's `bool` is an `int` under `<<` / `>>` too (`True << 1 == 2`).
+  # Coerce operands via `py_bool_to_int` when a boolean may be involved;
+  # otherwise emit the direct `Bitwise.bsl/bsr` (the known-int fast path).
+  defp bin_op_ast(%{"_type" => "LShift"}, l, r, _node, lt, rt),
+    do: shift_call(:bsl, l, r, lt, rt)
+
+  defp bin_op_ast(%{"_type" => "RShift"}, l, r, _node, lt, rt),
+    do: shift_call(:bsr, l, r, lt, rt)
   # Python's `|` / `&` / `^` are overloaded: bitwise on ints, set ops
   # on MapSets. Route through `py_bor` / `py_band` / `py_bxor` helpers
   # which dispatch at runtime. (LShift/RShift stay direct — there's
@@ -1674,6 +1686,21 @@ defmodule Pylixir.Converter do
 
   defp bitwise_call(fun_name, l, r) do
     {{:., [], [{:__aliases__, [], [:Bitwise]}, fun_name]}, [], [l, r]}
+  end
+
+  defp bnot_call(operand_ast) do
+    {{:., [], [{:__aliases__, [], [:Bitwise]}, :bnot]}, [], [operand_ast]}
+  end
+
+  # `Bitwise.bsl/bsr` raise on non-integers; when an operand might be a
+  # Python bool, wrap both in `py_bool_to_int` (1/0, pass-through for
+  # ints). Known-int operands skip the wrap and emit the direct call.
+  defp shift_call(fun_name, l, r, lt, rt) do
+    if bool_tainted_pair?(lt, rt) do
+      bitwise_call(fun_name, {:py_bool_to_int, [], [l]}, {:py_bool_to_int, [], [r]})
+    else
+      bitwise_call(fun_name, l, r)
+    end
   end
 
   # ---- bin_op specialization helpers ---------------------------------
@@ -2403,14 +2430,14 @@ defmodule Pylixir.Converter do
 
   defp detect_type_name_access(_), do: :no
 
-  # `zip(*xs)` is the only builtin that has a list-form lowering matching
-  # Python's star-unpack semantics — `Enum.zip(xs)` already iterates a
-  # list-of-iters in lockstep, same as `zip(*xs)`. For other in-scope
-  # names (lambdas, demoted functions), emit `apply(fn_ref, args)`.
-  # Top-level `defp`s — `Kernel.apply(__MODULE__, :name, args)`.
+  # `zip(*xs)` lowers to `py_zip_star(xs)` — `xs` is the list-of-iterables
+  # to zip in lockstep, and the helper coerces each inner element (so a
+  # string iterates char-by-char rather than crashing `Enum`). For other
+  # in-scope names (lambdas, demoted functions), emit `apply(fn_ref, args)`;
+  # top-level `defp`s — `Kernel.apply(__MODULE__, :name, args)`.
   defp emit_starred_call("zip", star_node, _node, context) do
     {arg_ast, context} = convert(star_node, context)
-    {{{:., [], [{:__aliases__, [], [:Enum]}, :zip]}, [], [arg_ast]}, context}
+    {{:py_zip_star, [], [arg_ast]}, context}
   end
 
   # `print(*xs[, sep=..., end=...])` — unpack and print. Routes to

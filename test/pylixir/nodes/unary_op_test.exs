@@ -84,6 +84,20 @@ defmodule Pylixir.Nodes.UnaryOpTest do
       assert diagnostics == []
     end
 
+    test "Invert of True is -2 (Python bool is int: ~1 == -2)" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(unary("Invert", const(true))))
+
+      assert value == -2
+    end
+
+    test "Invert of False is -1 (~0 == -1)" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(unary("Invert", const(false))))
+
+      assert value == -1
+    end
+
     test "Not of a Python-truthy value yields false" do
       {_, value, _, _} =
         TranspileHelpers.transpile_and_run(module_with(unary("Not", const(1))))

@@ -1688,6 +1688,18 @@ defmodule Pylixir.RuntimeHelpers do
   def py_iter_to_list(m) when is_map(m) and not is_struct(m), do: Map.keys(m)
   def py_iter_to_list(other), do: Enum.to_list(other)
 
+  # `zip(*xs)` — `xs` is a list of iterables to zip in lockstep. Each
+  # inner element must itself be coerced to a list first: a Python string
+  # iterates char-by-char, but a raw Elixir binary isn't Enumerable, so
+  # `Enum.zip(["ab", "cd"])` would crash. Coerce outer + each inner via
+  # `py_iter_to_list`, then zip.
+  def py_zip_star(xs) do
+    xs
+    |> py_iter_to_list()
+    |> Enum.map(fn e -> py_iter_to_list(e) end)
+    |> Enum.zip()
+  end
+
   # === Slice assignment ===
 
   # `coll[start:stop:step] = new_seq` — replace the elements at the
