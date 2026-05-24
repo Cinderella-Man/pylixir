@@ -431,12 +431,18 @@ defmodule Pylixir.LoopAnalysis do
        when method in @mutation_methods,
        do: MapSet.new([name])
 
-  # `del coll[k]` — rebinds `coll`.
+  # `del coll[k]` / `del coll[i][j]` — rebinds `coll` (the chain root).
   defp names_assigned_in(%{"_type" => "Delete", "targets" => targets}) do
     targets
     |> Enum.flat_map(fn
-      %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => name}} -> [name]
-      _ -> []
+      %{"_type" => "Subscript", "value" => value} ->
+        case root_name(value) do
+          nil -> []
+          name -> [name]
+        end
+
+      _ ->
+        []
     end)
     |> MapSet.new()
   end

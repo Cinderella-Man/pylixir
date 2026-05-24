@@ -24,6 +24,14 @@ print(pow(-1, 3, MOD))   # 998244352
 print(pow(-1, 4, MOD))   # 1
 print(pow(-5, 3, 100))   # -125 mod 100 = 75
 
+# Negative exponent (Python 3.8+): `pow(a, -1, m)` is the modular inverse
+# of `a` mod `m`, and `pow(a, -k, m)` is that inverse raised to the k-th
+# power mod `m`. Requires `a` invertible mod `m` (gcd == 1).
+print(pow(3, -1, 7))     # 5  (3*5 == 15 ≡ 1 mod 7)
+print(pow(10, -1, 17))   # 12
+print(pow(2, -3, 7))     # 1  (inverse(2,7)=4; 4**3 == 64 ≡ 1 mod 7)
+print(pow(5, -1, MOD))   # modular inverse of 5 mod the big prime
+
 # 2-arg pow still works.
 print(pow(2, 10))
 print(pow(3, 4))

@@ -42,11 +42,19 @@ defmodule Eval.Corpus do
   """
   @spec build(keyword()) :: Enumerable.t()
   def build(opts \\ []) do
-    path = Keyword.get_lazy(opts, :parquet_path, &Dataset.ensure_parquet!/0)
+    # Log only on the real run (no explicit `:parquet_path` → tests stay quiet).
+    {path, log?} =
+      case Keyword.fetch(opts, :parquet_path) do
+        {:ok, p} -> {p, false}
+        :error -> {Dataset.ensure_parquet!(), true}
+      end
+
     batch = Keyword.get(opts, :batch, @default_batch)
 
+    if log?, do: IO.puts("[corpus] reading #{Path.relative_to_cwd(path)} …")
     df = DF.from_parquet!(path, columns: ["id", "source", "testcases"])
     total = DF.n_rows(df)
+    if log?, do: IO.puts("[corpus] #{total} rows loaded; streaming (batch #{batch})")
 
     Stream.resource(
       fn -> 0 end,

@@ -1342,16 +1342,11 @@ defmodule Pylixir.ModuleAnalysis do
   def mutates_name?(%{"_type" => "For", "target" => %{"_type" => "Name", "id" => target}}, name),
     do: target == name
 
-  # `del coll[k]` — rebinds `coll`, so a top-level dict/list that's
-  # later `del`'d-from must not be promoted to a module attribute.
+  # `del coll[k]` / `del coll[i][j]` — rebinds `coll` (the chain root), so a
+  # top-level dict/list that's later `del`'d-from must not be promoted to a
+  # module attribute.
   def mutates_name?(%{"_type" => "Delete", "targets" => targets}, name) do
-    Enum.any?(targets, fn
-      %{"_type" => "Subscript", "value" => %{"_type" => "Name", "id" => target_name}} ->
-        target_name == name
-
-      _ ->
-        false
-    end)
+    Enum.any?(targets, fn target -> del_subscript_root(target) == name end)
   end
 
   # `heapq.heappush(heap, item)` / `heapq.heapify(heap)` (and bare-Name
@@ -1373,6 +1368,16 @@ defmodule Pylixir.ModuleAnalysis do
   end
 
   def mutates_name?(_, _), do: false
+
+  # Root Name id of a (possibly nested) subscript `del` target; nil for any
+  # other shape (bare `del x`, Attribute, …). Only counts when the target is
+  # a Subscript (descends through ≥1 subscript before reaching the Name).
+  defp del_subscript_root(%{"_type" => "Subscript", "value" => v}), do: subscript_chain_root(v)
+  defp del_subscript_root(_), do: nil
+
+  defp subscript_chain_root(%{"_type" => "Subscript", "value" => v}), do: subscript_chain_root(v)
+  defp subscript_chain_root(%{"_type" => "Name", "id" => id}), do: id
+  defp subscript_chain_root(_), do: nil
 
   # `x = coll.pop()` / `a, b = coll.pop()` — Converter's `single_target_assign`
   # rebinds `coll` via `{popped, coll} = py_pop_*(coll, ...)`. Mirror the

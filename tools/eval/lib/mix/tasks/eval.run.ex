@@ -57,8 +57,8 @@ defmodule Mix.Tasks.Eval.Run do
     out: :string
   ]
 
-  @default_python_timeout_ms 10_000
-  @default_elixir_timeout_ms 10_000
+  @default_python_timeout_ms 30_000
+  @default_elixir_timeout_ms 30_000
 
   @impl true
   def run(argv) do
@@ -71,6 +71,10 @@ defmodule Mix.Tasks.Eval.Run do
     Application.ensure_all_started(:ex_unit)
 
     concurrency = opts[:concurrency] || System.schedulers_online() * 2
+
+    # Immediate feedback right after compilation, before the (multi-second)
+    # cache + parquet load and the first sample land.
+    IO.puts("[eval] limit #{opts[:limit] || "all"} · concurrency #{concurrency} · loading…")
 
     # Suppress Python warnings from the tracer's `python3` subprocess —
     # pure noise during a large run.
@@ -119,15 +123,15 @@ defmodule Mix.Tasks.Eval.Run do
     {ref, limit, System.monotonic_time(:millisecond)}
   end
 
+  # Tick on every completed sample (carriage-return overwrite keeps it to a
+  # single live-updating line, so even a 10-sample run shows movement).
   defp tick({ref, limit, _start}) do
     :counters.add(ref, 1, 1)
     n = :counters.get(ref, 1)
 
-    cond do
-      rem(n, 25) == 0 and limit -> IO.write("\rprocessed: #{n}/#{limit}")
-      rem(n, 25) == 0 -> IO.write("\rprocessed: #{n}")
-      true -> :ok
-    end
+    if limit,
+      do: IO.write("\rprocessed: #{n}/#{limit}"),
+      else: IO.write("\rprocessed: #{n}")
   end
 
   defp elapsed_ms({_ref, _limit, start}),

@@ -2593,11 +2593,18 @@ defmodule Pylixir.Converter do
                 "method `.#{attr}()` is defined on multiple registered classes (#{names}); receiver-type inference is too weak to pick one — rename one of the methods or move the call into a method of the owning class",
               lineno: Map.get(node, "lineno")
 
-          true ->
+          Nodes.AttributeMethods.supported?(attr) ->
             {target_ast, context} = convert(target, context)
             {arg_asts, context} = convert_each(Map.get(node, "args", []), context)
             {kwargs, context} = convert_keywords(Map.get(node, "keywords", []), context)
             {Nodes.AttributeMethods.dispatch(attr, target_ast, arg_asts, kwargs, node), context}
+
+          true ->
+            # `attr` is neither a registered class method nor a builtin-type
+            # method → `recv.attr(args)` calls a *callable stored in the
+            # attribute* (e.g. `self.func(a, b)` where `func` was assigned in
+            # `__init__`). Read `recv.attr` as a value and invoke it.
+            emit_dynamic_call(node, context)
         end
     end
   end
@@ -2944,6 +2951,34 @@ defmodule Pylixir.Converter do
     {{:=, [], [coll_ast, {:py_delitem, [], [coll_ast, slice_ast]}]}, context}
   end
 
+  # `del a[i][j]…` — nested subscript rooted at a bare Name. Rebuild the
+  # inner collection (delete at the innermost level) and write it back
+  # through the root, mirroring nested subscript *assignment*
+  # (`build_nested_setitem/3`).
+  defp convert_del_target(
+         %{"_type" => "Subscript", "value" => %{"_type" => "Subscript"}} = target,
+         node,
+         context
+       ) do
+    case aug_nested_subscript_chain(target, []) do
+      {:ok, coll_id, slices} ->
+        {slice_asts, context} =
+          Enum.map_reduce(slices, context, fn s, ctx -> convert(s, ctx) end)
+
+        {coll_ast, context} = convert(%{"_type" => "Name", "id" => coll_id}, context)
+        context = TypeInfer.demote(context, coll_id)
+        context = bind_name(context, coll_id)
+        {{:=, [], [coll_ast, build_nested_delitem(coll_ast, slice_asts)]}, context}
+
+      :error ->
+        raise UnsupportedNodeError,
+          node_type: "Delete",
+          hint: "`del` target shape `Subscript` is not supported (subscript chain must root at a bare Name)",
+          lineno: Map.get(node, "lineno"),
+          col_offset: Map.get(node, "col_offset")
+    end
+  end
+
   defp convert_del_target(other, node, _context) do
     raise UnsupportedNodeError,
       node_type: "Delete",
@@ -2951,6 +2986,17 @@ defmodule Pylixir.Converter do
         "`del` target shape `#{Map.get(other, "_type")}` is not supported (only depth-1 subscript on a bare Name)",
       lineno: Map.get(node, "lineno"),
       col_offset: Map.get(node, "col_offset")
+  end
+
+  # `del a[i][j]` ↦ `a = py_setitem(a, i, py_delitem(py_getitem(a, i), j))`
+  # (mirrors `build_nested_setitem/3`, with `py_delitem` at the innermost).
+  defp build_nested_delitem(coll_ast, [last]) do
+    {:py_delitem, [], [coll_ast, last]}
+  end
+
+  defp build_nested_delitem(coll_ast, [s | rest]) do
+    inner_get = {:py_getitem, [], [coll_ast, s]}
+    {:py_setitem, [], [coll_ast, s, build_nested_delitem(inner_get, rest)]}
   end
 
   # `from <stdlib_mod> import <name> [as <alias>]` — delegates the

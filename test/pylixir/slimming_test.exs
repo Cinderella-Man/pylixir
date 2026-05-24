@@ -94,10 +94,13 @@ defmodule Pylixir.SlimmingTest do
       #   * `pow(2, 10, 1000)` 3-arg → return type {:int} so print
       #     emits Integer.to_string instead of py_str.
       # With all three: no py_pow, no py_str, no py_repr, no
-      # py_str_percent_format, and the output fits in ~25 lines.
+      # py_str_percent_format. The ceiling allows for `py_pow_mod`'s
+      # negative-exponent (modular-inverse) support — it statically pulls
+      # in `py_mod_inverse` + `py_ext_gcd`, since the slimmer can't prove a
+      # runtime exponent is non-negative.
       must_not_contain: ["py_str", "py_repr", "py_str_percent_format"],
       must_contain: ["Integer.pow", "Integer.to_string"],
-      max_lines: 25,
+      max_lines: 40,
       stdout: "1024\n81\n32\n24\n87\n"
     }
   }

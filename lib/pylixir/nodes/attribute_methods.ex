@@ -71,6 +71,21 @@ defmodule Pylixir.Nodes.AttributeMethods do
   @set_methods ~w(union intersection difference symmetric_difference
                   issubset issuperset isdisjoint pop popleft)
 
+  @all_methods MapSet.new(
+                 @dict_methods ++
+                   @string_methods ++
+                   @noop_methods ++ @int_methods ++ @float_methods ++ @set_methods
+               )
+
+  @doc """
+  True if `attr` names a builtin-type method handled by `dispatch/5`.
+  Lets the caller distinguish a real method call from `obj.attr(args)`
+  where `attr` is a *callable stored in an attribute* (which must instead
+  be read and invoked as a function).
+  """
+  @spec supported?(String.t()) :: boolean()
+  def supported?(attr), do: MapSet.member?(@all_methods, attr)
+
   @spec dispatch(String.t(), Macro.t(), [Macro.t()], map(), map()) :: Macro.t()
   def dispatch(attr, target_ast, arg_asts, kwargs, node) do
     do_dispatch(attr, target_ast, arg_asts, kwargs, node)

@@ -140,5 +140,32 @@ defmodule Pylixir.RuntimeHelpers.MathExt do
     :crypto.mod_pow(Integer.mod(base, mod), exp, mod) |> :crypto.bytes_to_integer()
   end
 
+  # Negative exponent (Python 3.8+): `pow(b, -1, m)` is the modular inverse
+  # of `b` mod `m`, and `pow(b, -k, m)` is that inverse to the k-th power
+  # mod `m`. Requires `b` invertible mod `m` (gcd == 1) — Python raises
+  # ValueError otherwise; we surface an ArithmeticError.
+  def py_pow_mod(base, exp, mod)
+      when is_integer(base) and is_integer(exp) and is_integer(mod) and exp < 0 and mod > 0 do
+    inv = py_mod_inverse(Integer.mod(base, mod), mod)
+    py_pow_mod(inv, -exp, mod)
+  end
+
+  # Modular inverse via the extended Euclidean algorithm. `a` is assumed
+  # already reduced into `[0, m)`.
+  def py_mod_inverse(a, m) do
+    case py_ext_gcd(a, m) do
+      {1, x, _y} -> Integer.mod(x, m)
+      _ -> raise ArithmeticError, "base is not invertible for the given modulus"
+    end
+  end
+
+  # Returns `{g, x, y}` with `a*x + b*y == g == gcd(a, b)`.
+  def py_ext_gcd(0, b), do: {b, 0, 1}
+
+  def py_ext_gcd(a, b) do
+    {g, x, y} = py_ext_gcd(Integer.mod(b, a), a)
+    {g, y - div(b, a) * x, x}
+  end
+
   # --- HELPERS END ---
 end
