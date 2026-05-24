@@ -71,14 +71,22 @@ There is **no Hex/git/path dep back into pylixir**. When extracted to its own re
 Data flows through six stages. `Dataset.Build.run/1` orchestrates 0→4; `Publish` is stage 5 (manual).
 
 ```
-Stage 0  MergeGroups   solution-qids ──> qid → group_id            (near-dup grouping)
-Stage 1  Corpus        HF shards ──> solutions_by_qid, testcases_by_qid
-         Candidates    + qid→group ──> %{group_id => group}        (regroup, dedup, size-filter)
-Stage 2  Verify        (solution × testcase) ──> kept/dropped      (5-run gate + cache)
-Stage 3  Select        group ──> {:ok, result} | :drop             (one solution, early-stop)
-Stage 4  Emit          [result] ──> out/<version>/{parquet,jsonl,provenance,card}
-Stage 5  Publish       out dir ──> hf upload                       (never automatic)
+         Corpus.solutions   all seed_sft shards ──> solutions_by_qid
+Stage 0  MergeGroups        fingerprint all testcase shards ──> qid → group_id
+         (slice groups by --qid-shard/--skip/--limit; default = all)
+Stage 1  Spill              stream all shards ──> on-disk buckets (by group, size-filtered)
+         per bucket: Candidates + qid→group ──> %{group_id => group}  (regroup, dedup, cap)
+Stage 2  Verify             (solution × testcase) ──> kept/dropped (5-run gate + cache)
+Stage 3  Select             group ──> {:ok, result} | :drop        (one solution, early-stop)
+Stage 4  Emit               [result] ──> out/<version>/{parquet,jsonl,provenance,card}
+Stage 5  Publish            out dir ──> hf upload                   (never automatic)
 ```
+
+Bounded memory at any scale: fingerprinting (hashes only) precedes testcase handling; testcases are
+**spilled to on-disk buckets keyed by group**, then processed one bucket at a time. Peak RAM ≈ one
+testcase shard (during spill) + one bucket (during processing), independent of total size — so the
+**default processes the whole dataset** (hundreds of GB) with no manual sharding. `--qid-shard` is
+optional, for splitting a run across machines.
 
 ### Module reference
 
@@ -86,11 +94,19 @@ Stage 5  Publish       out dir ──> hf upload                       (never au
   interpreter; outputs are version-sensitive). ⚠️ Do not confuse with `Dataset.Dataset`.
 - **`Dataset.Dataset`** — HF parquet ingestion. `source_repo/0`, `shard_count/1`
   (`seed_sft:20, seed_testcase:30`), `shard_path/2`, `download_shard/2`, `read_sft_shard/2`,
-  `read_testcase_shard/3` (Polars qid pushdown). All HF-specific knowledge lives here.
-- **`Dataset.Corpus`** — join + dedup. `grouped/1` → `{solutions_by_qid, testcases_by_qid, stats}`
-  (the curator's entry point); `build/1` → `{stream, stats}` (legacy per-solution stream). Keeps
-  `is_passed=true`, sha-dedups solutions, parses `inputs`/`outputs` JSON (drops function-call-style /
-  non-string rows). `:dataset_module` injection point for tests.
+  `read_testcase_shard/3` (Polars qid pushdown). All HF-specific knowledge lives here. **Downloads via
+  the `hf` CLI** (resumable, hash-verified) — a plain streaming GET silently truncates 10 GB+ LFS
+  shards into corrupt parquet.
+- **`Dataset.Corpus`** — join + dedup, **split into two passes** so the build can fingerprint before
+  loading testcases: `solutions/1` (all `seed_sft` shards → `solutions_by_qid`) and `testcases/2`
+  (all `seed_testcase` shards, qid-pushdown + optional `:size_limit` → `testcases_by_qid`). `grouped/1`
+  / `build/1` combine both (tests / small fakes). Keeps `is_passed=true`, sha-dedups solutions, parses
+  `inputs`/`outputs` JSON (drops function-call/non-string rows). **No on-disk corpus cache** — the full
+  join is too large to serialise; resumability lives in the verdict cache. `:dataset_module` injection.
+- **`Dataset.Spill`** (Stage 1) — `run/3` streams all testcase shards once and routes each
+  size-filtered testcase to an on-disk bucket file keyed by `phash2(group_id, B)` (a group's testcases
+  always co-locate); `read_bucket/2` loads one bucket back. Bounds RAM regardless of dataset size.
+  Records are length-prefixed `term_to_binary` (arbitrary bytes round-trip).
 - **`Dataset.MergeGroups`** (Stage 0) — `group/2` is pure over fingerprint maps
   `%{qid => %{sha(stdin) => MapSet<sha(expected)>}}`; `build/2` adds shard I/O. Merge predicate:
   **≥3 shared stdins AND 0 disagreements**, transitive (connected components). Only fingerprints
@@ -110,7 +126,11 @@ Stage 5  Publish       out dir ──> hf upload                       (never au
   `lookup/1`, `put/2`. Resumability backbone; entries from a different python version are ignored.
 - **`Dataset.Verify`** (Stage 2) — `verdict/3` (cached reproducibility), `verify_testcase/3`,
   `verify_solution/3` (returns shippable kept testcases). `@run_count 5`, `@timeout_ms 20_000`,
-  output cap = `max(expected) + 1 MB`.
+  output cap = `max(expected) + 1 MB`. **Perf:** `verify_testcase/3` runs **once** and gates on
+  error/timeout/correctness *before* the 5-run determinism check — a wrong answer or error costs 1 run,
+  not 5; only outputs that match a stored expected pay for determinism confirmation. (Mismatches aren't
+  cached — a resume re-runs them, 1 run each. `verdict/3` keeps the full 5-run path for the cache-hit
+  and test surface.)
 - **`Dataset.Select`** (Stage 3) — `select/2`. Caps to 32, verifies solutions in **(shortest source,
   then sha)** order, **early-stops on the first that verifies ALL**, else max-count. `:verify_fun`
   injection isolates selection logic from python in tests.
@@ -157,8 +177,10 @@ emit parquet row    id | source | solution_sha256 | testcases(JSON) | num_testca
   rarely drops a *task*.
 - **Relative output cap** `len(expected)+1 MB`. A fixed 256 KB cap would falsely drop ~9% of valid
   testcases (their legitimate expected exceeds it).
-- **Early-stop selection.** `is_passed=true` solutions are mostly correct, so the first solution that
-  verifies all capped testcases is provably optimal — collapses ~16 candidates to ~1–2.
+- **Early-stop selection + solution cap.** `is_passed=true` solutions are mostly correct, so the first
+  solution that verifies all capped testcases is provably optimal — collapses ~16 candidates to ~1–2.
+  Merged near-dup groups can pool hundreds of solutions, so candidates are capped (`:solution_cap`,
+  default 100, shortest-first) to bound the per-task cross-product.
 - **Sandbox: userns-first.** Plain `unshare -n` fails unprivileged (`Operation not permitted`);
   `--user --map-root-user --net` works. `--nproc` dropped as fork-guard (`RLIMIT_NPROC` is
   per-real-uid, system-wide → spurious failures); rely on `--as` + `--cpu` + wall-clock SIGKILL +
@@ -232,7 +254,10 @@ sandbox/e2e/contract tests pass.
 Open (need real data / external input):
 1. **HF repo name** (only for a real publish).
 2. A genuine `mix dataset.build` over downloaded shards (sandbox on) to confirm the tunable cpu/wall/mem
-   defaults by timing, and to exercise `--qid-shard` at scale.
-3. **Scaling refinement:** `Build` ties MergeGroups + Corpus to the same `--testcase-shards` (default
-   1) for fingerprint/text consistency. The plan's "fingerprint all 30 shards" ideal needs decoupling
-   them (fingerprints global, text loaded lazily per processed group).
+   defaults by timing.
+3. **Single-pass optimization (future):** the build reads all testcase shards twice (once for
+   fingerprints, once to spill). They could be fused into one pass. Not done — correctness first; the
+   two passes are sequential disk reads.
+4. **Emit holds all results in RAM** to write one parquet. The curated *output* is far smaller than the
+   input (verified subset, ≤32 testcases/task), so this is fine in practice; per-bucket parquet output
+   would remove even that bound if ever needed.

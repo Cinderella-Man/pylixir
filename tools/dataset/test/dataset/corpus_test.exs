@@ -45,11 +45,7 @@ defmodule Dataset.CorpusTest do
     end
   end
 
-  defp opts do
-    cache = Path.join(System.tmp_dir!(), "corpus_test_#{System.unique_integer([:positive])}.term.gz")
-    on_exit(fn -> File.rm(cache) end)
-    [dataset_module: FakeDataset, testcase_shards: 1, cache_path: cache]
-  end
+  defp opts, do: [dataset_module: FakeDataset]
 
   test "grouped: is_passed filter + sha dedup on solutions" do
     {solutions, _testcases, _stats} = Corpus.grouped(opts())

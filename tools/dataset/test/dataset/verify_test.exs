@@ -33,9 +33,17 @@ defmodule Dataset.VerifyTest do
     assert {:keep, "[1, 2, 3]"} = Verify.verify_testcase(src, tc("", ["[1, 2, 3]"]), @fast)
   end
 
-  test "set-iteration-order program → nondeterministic → dropped" do
+  test "set-iteration-order program → nondeterministic verdict" do
+    # verdict/3 runs the full N-run determinism check (independent of any
+    # stored expected) and exposes hash-order nondeterminism.
     src = "print(set(str(i) for i in range(20)))"
-    assert {:drop, :nondeterministic} = Verify.verify_testcase(src, tc("", ["whatever"]), @fast)
+    assert {:rejected, :nondeterministic} = Verify.verdict(src, "", @fast)
+  end
+
+  test "set-iteration-order program → dropped by verify_testcase" do
+    src = "print(set(str(i) for i in range(20)))"
+    assert {:drop, reason} = Verify.verify_testcase(src, tc("", ["whatever"]), @fast)
+    assert reason in [:mismatch, :nondeterministic]
   end
 
   test "unseeded random → nondeterministic → dropped" do

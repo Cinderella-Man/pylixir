@@ -79,6 +79,19 @@ defmodule Dataset.SelectTest do
     assert length(res.testcases) == 2
   end
 
+  test "solution cap limits how many solutions are tried (shortest-first)" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    # three solutions, none verifies all; cap to 1 → only the shortest/sha tried
+    g = group([sol("s3", "ccc"), sol("s1", "aaa"), sol("s2", "bbb")], tcs(4))
+    vf = keeper(%{"s1" => 2, "s2" => 3, "s3" => 1}, agent)
+
+    {:ok, res} = Select.select(g, verify_fun: vf, solution_cap: 1)
+
+    # only s1 (shortest/sha order) considered; s2/s3 never verified
+    assert Agent.get(agent, & &1) == ["s1"]
+    assert res.solution_sha256 == "s1"
+  end
+
   test "testcase cap limits how many are considered" do
     g = group([sol("s1", "aaa")], tcs(40))
     # keeper keeps all it's given; with cap 32 that's 32

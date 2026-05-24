@@ -21,6 +21,12 @@ defmodule Dataset.Execute do
 
   Stdin is redirected from a per-call `.stdin` tmp file (when supplied)
   or `/dev/null`. On timeout the child is SIGKILL'd.
+
+  Each run executes in a **fresh per-call working directory** that is
+  removed afterward, so a solution that writes relative output files
+  (`open("out.txt", "w")`) litters the throwaway dir, not the project
+  tree. The sandbox isolates network/resources but not the filesystem, so
+  this cwd hop is what contains stray writes.
   """
 
   alias Dataset.Sandbox
@@ -56,27 +62,28 @@ defmodule Dataset.Execute do
     output_cap = Keyword.get(opts, :output_cap)
     python = Keyword.get(opts, :python, Dataset.default_python())
 
-    tmp = tmp_path()
-    stdin_path = if stdin, do: tmp <> ".stdin", else: nil
+    workdir = work_dir()
+    script = Path.join(workdir, "main.py")
+    stdin_path = if stdin, do: Path.join(workdir, "stdin"), else: nil
 
     try do
-      File.mkdir_p!(Path.dirname(tmp))
-      File.write!(tmp, source)
+      File.mkdir_p!(workdir)
+      File.write!(script, source)
       if stdin_path, do: File.write!(stdin_path, stdin)
-      do_run_python(python, tmp, stdin_path, timeout_ms, output_cap)
+      do_run_python(python, script, stdin_path, workdir, timeout_ms, output_cap)
     after
-      File.rm(tmp)
-      if stdin_path, do: File.rm(stdin_path)
+      # Removes the script, stdin, and any files the solution wrote.
+      File.rm_rf(workdir)
     end
   end
 
   # --- Internals -------------------------------------------------------
 
-  defp do_run_python(python, tmp, stdin_path, timeout_ms, output_cap) do
+  defp do_run_python(python, script, stdin_path, workdir, timeout_ms, output_cap) do
     sh = find_executable!("sh")
 
     redirect = if stdin_path, do: sh_quote(stdin_path), else: "/dev/null"
-    inner = Sandbox.wrap(sh_quote(python) <> " " <> sh_quote(tmp))
+    inner = Sandbox.wrap(sh_quote(python) <> " " <> sh_quote(script))
     cmd = "exec " <> inner <> " < " <> redirect
 
     port =
@@ -87,6 +94,9 @@ defmodule Dataset.Execute do
           :exit_status,
           :stderr_to_stdout,
           :hide,
+          # Run in the throwaway workdir so relative file writes by the
+          # untrusted solution stay contained (paths above are absolute).
+          {:cd, workdir},
           args: ["-c", cmd],
           env: @python_env
         ]
@@ -145,10 +155,10 @@ defmodule Dataset.Execute do
     end
   end
 
-  defp tmp_path do
+  defp work_dir do
     base = Path.expand("../../tmp", __DIR__)
     unique = :erlang.unique_integer([:positive])
-    Path.join(base, "py_exec_#{System.system_time(:millisecond)}_#{unique}.py")
+    Path.join(base, "py_exec_#{System.system_time(:millisecond)}_#{unique}")
   end
 
   defp find_executable!(name) do

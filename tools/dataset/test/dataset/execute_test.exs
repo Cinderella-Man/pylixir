@@ -29,6 +29,18 @@ defmodule Dataset.ExecuteTest do
              )
   end
 
+  test "a solution's relative file writes are contained, not littered into the project" do
+    marker = "litter_#{System.unique_integer([:positive])}.out"
+    src = ~s|open("#{marker}", "w").write("x"); print("done")|
+
+    assert {:ok, "done\n"} = Execute.run_python(src, timeout_ms: 5000)
+
+    # the file must not survive in the project tree (run dir is removed)
+    project = Path.expand("../..", __DIR__)
+    found = Path.wildcard(Path.join([project, "**", marker]))
+    assert found == [], "solution leaked files into the project: #{inspect(found)}"
+  end
+
   test "reports a non-zero exit with combined output" do
     assert {:exit, 3, _out} =
              Execute.run_python("import sys; sys.exit(3)", timeout_ms: 5000)

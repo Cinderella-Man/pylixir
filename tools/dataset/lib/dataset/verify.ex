@@ -42,6 +42,13 @@ defmodule Dataset.Verify do
   shippable maps `%{stdin, expected, n_stored_outputs}` where `expected`
   is the canonical (solution's normalized) output.
 
+  **Short-circuits at the first failed testcase** — a solution that fails
+  any testcase can't be the "verifies all" winner, so we stop rather than
+  paying for the rest. The returned list therefore has `length == #(input
+  testcases)` iff the solution verified them all (what `Dataset.Select`'s
+  early-stop checks); a losing solution returns its verified *prefix*
+  (used only as an approximate count in the no-winner fallback).
+
   ## Options
     * `:run_count` (default #{@run_count})
     * `:timeout_ms` (default #{@timeout_ms})
@@ -50,15 +57,16 @@ defmodule Dataset.Verify do
   @spec verify_solution(%{source: String.t()}, [map()], keyword()) :: [map()]
   def verify_solution(%{source: source}, testcases, opts \\ []) do
     testcases
-    |> Enum.flat_map(fn tc ->
+    |> Enum.reduce_while([], fn tc, kept ->
       case verify_testcase(source, tc, opts) do
         {:keep, canonical} ->
-          [%{stdin: tc.stdin, expected: canonical, n_stored_outputs: tc.n_stored_outputs}]
+          {:cont, [%{stdin: tc.stdin, expected: canonical, n_stored_outputs: tc.n_stored_outputs} | kept]}
 
         {:drop, _reason} ->
-          []
+          {:halt, kept}
       end
     end)
+    |> Enum.reverse()
   end
 
   @doc """
@@ -68,15 +76,100 @@ defmodule Dataset.Verify do
   @spec verify_testcase(String.t(), map(), keyword()) ::
           {:keep, String.t()} | {:drop, atom()}
   def verify_testcase(source, %{stdin: stdin, expecteds: expecteds}, opts \\ []) do
+    sha = PythonCache.key(source, stdin)
     cap = output_cap(expecteds)
+    run_opts = single_run_opts(opts, stdin, cap)
+    run_count = Keyword.get(opts, :run_count, @run_count)
 
-    case verdict(source, stdin, Keyword.put(opts, :output_cap, cap)) do
-      {:reproducible, canonical} ->
-        if correct?(canonical, expecteds), do: {:keep, canonical}, else: {:drop, :mismatch}
+    case PythonCache.lookup(sha) do
+      {:hit, entry} ->
+        case decode_verdict(entry) do
+          {:reproducible, c} ->
+            keep_or_mismatch(c, expecteds)
 
-      {:rejected, reason} ->
-        {:drop, reason}
+          {:rejected, reason} ->
+            {:drop, reason}
+
+          # One prior successful run, reproducibility unconfirmed. If it
+          # already mismatches this testcase's expecteds, drop with no run;
+          # only if it matches do we pay to confirm determinism.
+          {:single, c} ->
+            if correct?(c, expecteds),
+              do: confirm(source, sha, c, run_opts, run_count),
+              else: {:drop, :mismatch}
+        end
+
+      :miss ->
+        first_run(source, sha, expecteds, run_opts, run_count)
     end
+  end
+
+  defp keep_or_mismatch(c, expecteds),
+    do: if(correct?(c, expecteds), do: {:keep, c}, else: {:drop, :mismatch})
+
+  # Run ONCE and gate on error/timeout and correctness *before* paying for
+  # the full N-run determinism check. A wrong answer (or error/timeout) is
+  # dropped after a single run — only an output that already matches a
+  # stored expected is worth confirming across the remaining runs. The
+  # single run's output is cached (`:single`) so a re-encounter / resume
+  # skips a known wrong answer with no python at all. This preserves which
+  # pairs are kept (a reproducible-but-mismatching or nondeterministic
+  # output was dropped under the old path too).
+  defp first_run(source, sha, expecteds, run_opts, run_count) do
+    case Execute.run_python(source, run_opts) do
+      :timeout ->
+        reject(sha, :timeout)
+
+      :output_exceeded ->
+        reject(sha, :output_exceeded)
+
+      {:exit, _status, _out} ->
+        reject(sha, :error)
+
+      {:ok, out} ->
+        canonical = Normalize.normalize(out)
+
+        if correct?(canonical, expecteds) do
+          confirm(source, sha, canonical, run_opts, run_count)
+        else
+          PythonCache.put(sha, encode_verdict({:single, canonical}))
+          {:drop, :mismatch}
+        end
+    end
+  end
+
+  # Confirm determinism using `canonical` as run #1 plus `run_count - 1`
+  # fresh runs; cache the upgraded verdict.
+  defp confirm(source, sha, canonical, run_opts, run_count) do
+    if reproduces?(source, run_opts, canonical, run_count - 1) do
+      PythonCache.put(sha, encode_verdict({:reproducible, canonical}))
+      {:keep, canonical}
+    else
+      PythonCache.put(sha, encode_verdict({:rejected, :nondeterministic}))
+      {:drop, :nondeterministic}
+    end
+  end
+
+  defp reject(sha, reason) do
+    PythonCache.put(sha, encode_verdict({:rejected, reason}))
+    {:drop, reason}
+  end
+
+  # The remaining `n` runs must all reproduce `canonical` exactly (any
+  # later timeout/error/variation → not reproducible).
+  defp reproduces?(_source, _run_opts, _canonical, 0), do: true
+
+  defp reproduces?(source, run_opts, canonical, n) do
+    case Execute.run_python(source, run_opts) do
+      {:ok, out} -> Normalize.normalize(out) == canonical and reproduces?(source, run_opts, canonical, n - 1)
+      _ -> false
+    end
+  end
+
+  defp single_run_opts(opts, stdin, cap) do
+    opts
+    |> Keyword.take([:python])
+    |> Keyword.merge(stdin: stdin, output_cap: cap, timeout_ms: Keyword.get(opts, :timeout_ms, @timeout_ms))
   end
 
   @doc """
@@ -90,13 +183,21 @@ defmodule Dataset.Verify do
 
     case PythonCache.lookup(sha) do
       {:hit, entry} ->
-        decode_verdict(entry)
+        case decode_verdict(entry) do
+          # `:single` is not a final verdict — recompute the full check.
+          {:single, _} -> recompute_verdict(source, stdin, sha, opts)
+          v -> v
+        end
 
       :miss ->
-        v = compute_verdict(source, stdin, opts)
-        PythonCache.put(sha, encode_verdict(v))
-        v
+        recompute_verdict(source, stdin, sha, opts)
     end
+  end
+
+  defp recompute_verdict(source, stdin, sha, opts) do
+    v = compute_verdict(source, stdin, opts)
+    PythonCache.put(sha, encode_verdict(v))
+    v
   end
 
   # --- Internals -------------------------------------------------------
@@ -154,9 +255,15 @@ defmodule Dataset.Verify do
   defp encode_verdict({:rejected, reason}),
     do: %{"status" => "rejected", "reason" => Atom.to_string(reason)}
 
+  defp encode_verdict({:single, canonical}),
+    do: %{"status" => "single", "canonical" => canonical}
+
   defp decode_verdict(%{"status" => "reproducible", "canonical" => canonical}),
     do: {:reproducible, canonical}
 
   defp decode_verdict(%{"status" => "rejected", "reason" => reason}),
     do: {:rejected, String.to_atom(reason)}
+
+  defp decode_verdict(%{"status" => "single", "canonical" => canonical}),
+    do: {:single, canonical}
 end

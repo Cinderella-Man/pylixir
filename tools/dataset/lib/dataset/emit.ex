@@ -20,6 +20,24 @@ defmodule Dataset.Emit do
   Outputs into `out/<version>/`: `data.parquet`, `data.jsonl` (the same
   rows, with `testcases`/`meta` as nested JSON for convenience),
   `provenance.json`, `dataset_card.md`.
+
+  ## Memory: streaming, never buffering the whole dataset
+
+  At full-dataset scale the curated rows (with their kept testcase
+  payloads) are tens of GB — far too large to hold resident, let alone
+  copy several times to build a parquet `DataFrame`. So emit is
+  **streaming**: `with_writer/2` opens the output once and the caller
+  feeds results in chunks (`write/2`) as each spill bucket finishes;
+  each row is appended to disk immediately. `data.parquet` is then
+  produced by a **lazy** scan of an on-disk NDJSON sidecar piped through
+  Polars' **streaming** parquet sink, so peak memory is one chunk plus a
+  Polars batch — independent of total dataset size. `emit/2` is a
+  one-shot convenience (open → write → finalize) for tests / small runs.
+
+  Row order is deterministic per caller (the build sorts each bucket by
+  `id` before writing); it is **not** a single global `id` sort, since
+  each merge-group lands in exactly one bucket and buckets are emitted in
+  index order.
   """
 
   require Explorer.DataFrame, as: DF
@@ -27,33 +45,129 @@ defmodule Dataset.Emit do
   alias Dataset.Candidates
   alias Dataset.Dataset, as: HF
 
+  # Parquet column order (also the `data.jsonl` / NDJSON field order).
+  @columns ["id", "source", "solution_sha256", "testcases", "num_testcases", "meta"]
+
+  # Default parquet compression. zstd beats snappy on this corpus (lots of
+  # repetitive Python source + I/O text) and is read transparently by
+  # pandas/pyarrow/Polars/HuggingFace. Override via `:compression`.
+  @compression {:zstd, 3}
+
+  defmodule Writer do
+    @moduledoc "Open output handles for streaming emit. See `Dataset.Emit`."
+    @enforce_keys [:out_dir, :version, :revision, :jsonl, :ndjson, :ndjson_path, :count]
+    defstruct [:out_dir, :version, :revision, :jsonl, :ndjson, :ndjson_path, :count]
+  end
+
   @doc """
-  Emit `results` (a list of `Dataset.Select` results) into `out/<version>/`.
+  Emit `results` (a list of `Dataset.Select` results) into `out/<version>/`
+  in one shot. Convenience wrapper over `with_writer/2` for tests / small
+  runs; the build uses `with_writer/2` directly to stream per bucket.
+
+  Returns `{:ok, out_dir}`.
+  """
+  @spec emit([map()], keyword()) :: {:ok, String.t()}
+  def emit(results, opts \\ []) do
+    {:ok, out_dir, _n} = with_writer(opts, fn writer -> write(writer, results) end)
+    {:ok, out_dir}
+  end
+
+  @doc """
+  Open the output, run `fun.(writer)` (which streams chunks via `write/2`),
+  then finalize — scan the NDJSON sidecar into `data.parquet` (streaming),
+  write provenance + card. On a raised error the handles are closed, the
+  sidecar removed, and the error re-raised.
+
+  Returns `{:ok, out_dir, num_rows}`.
 
   ## Options
     * `:out_dir` — full output directory (default `out/<version>`).
     * `:version` — dataset version string (default `"v0"`).
     * `:source_revision` — upstream HF revision (default `"main"`).
     * `:provenance` — extra map merged into `provenance.json`.
-
-  Returns `{:ok, out_dir}`.
+    * `:compression` — parquet codec, e.g. `:snappy` or `{:zstd, 3}`
+      (default `#{inspect(@compression)}`).
   """
-  @spec emit([map()], keyword()) :: {:ok, String.t()}
-  def emit(results, opts \\ []) do
-    version = Keyword.get(opts, :version, "v0")
-    out_dir = Keyword.get(opts, :out_dir, Path.join(default_out(), version))
-    revision = Keyword.get(opts, :source_revision, "main")
+  @spec with_writer(keyword(), (Writer.t() -> any())) :: {:ok, String.t(), non_neg_integer()}
+  def with_writer(opts, fun) when is_function(fun, 1) do
+    writer = open(opts)
+
+    try do
+      fun.(writer)
+    rescue
+      e ->
+        close_handles(writer)
+        File.rm(writer.ndjson_path)
+        reraise e, __STACKTRACE__
+    else
+      _ -> finalize(writer, opts)
+    end
+  end
+
+  @doc """
+  Append a chunk of `Dataset.Select` results to the open writer. Each row
+  is encoded and written to disk immediately (nested → `data.jsonl`,
+  flat string-columns → the NDJSON parquet sidecar); nothing is buffered.
+  """
+  @spec write(Writer.t(), [map()]) :: :ok
+  def write(%Writer{} = writer, results) do
+    Enum.each(results, fn result ->
+      row = logical_row(result, writer.revision)
+      IO.binwrite(writer.jsonl, [Jason.encode_to_iodata!(row), ?\n])
+
+      flat = %{row | "testcases" => Jason.encode!(row["testcases"]), "meta" => Jason.encode!(row["meta"])}
+      IO.binwrite(writer.ndjson, [Jason.encode_to_iodata!(flat), ?\n])
+
+      :counters.add(writer.count, 1, 1)
+    end)
+  end
+
+  # --- Streaming lifecycle ---------------------------------------------
+
+  defp open(opts) do
+    version = Keyword.get(opts, :version) || "v0"
+    # `|| default` (not Keyword.get/3 default) so an explicit `out_dir: nil`
+    # from a caller still falls back instead of crashing mkdir_p!.
+    out_dir = Keyword.get(opts, :out_dir) || Path.join(default_out(), version)
+    revision = Keyword.get(opts, :source_revision) || "main"
 
     File.mkdir_p!(out_dir)
+    ndjson_path = Path.join(out_dir, ".parquet_rows.ndjson")
 
-    rows = Enum.map(results, &logical_row(&1, revision))
+    %Writer{
+      out_dir: out_dir,
+      version: version,
+      revision: revision,
+      jsonl: File.open!(Path.join(out_dir, "data.jsonl"), [:write, :binary]),
+      ndjson: File.open!(ndjson_path, [:write, :binary]),
+      ndjson_path: ndjson_path,
+      count: :counters.new(1, [:atomics])
+    }
+  end
 
-    write_parquet(rows, Path.join(out_dir, "data.parquet"))
-    write_jsonl(rows, Path.join(out_dir, "data.jsonl"))
-    write_provenance(rows, version, revision, Keyword.get(opts, :provenance, %{}), Path.join(out_dir, "provenance.json"))
-    write_card(Path.join(out_dir, "dataset_card.md"))
+  defp finalize(writer, opts) do
+    close_handles(writer)
+    num_rows = :counters.get(writer.count, 1)
 
-    {:ok, out_dir}
+    compression = Keyword.get(opts, :compression, @compression)
+    write_parquet(writer.ndjson_path, Path.join(writer.out_dir, "data.parquet"), num_rows, compression)
+    File.rm(writer.ndjson_path)
+
+    write_provenance(
+      num_rows,
+      writer.version,
+      writer.revision,
+      Keyword.get(opts, :provenance, %{}),
+      Path.join(writer.out_dir, "provenance.json")
+    )
+
+    write_card(Path.join(writer.out_dir, "dataset_card.md"))
+    {:ok, writer.out_dir, num_rows}
+  end
+
+  defp close_handles(%Writer{} = writer) do
+    File.close(writer.jsonl)
+    File.close(writer.ndjson)
   end
 
   @doc """
@@ -66,43 +180,51 @@ defmodule Dataset.Emit do
         %{"stdin" => t.stdin, "expected" => t.expected, "n_stored_outputs" => t.n_stored_outputs}
       end)
 
+    meta = %{
+      "member_qids" => result.member_qids,
+      "alternate_solution_shas" => result.alternate_solution_shas,
+      "source_repo" => HF.source_repo(),
+      "source_revision" => revision
+    }
+
+    # Stamped by Dataset.Dedup on a row that absorbed near-duplicate rows.
+    meta =
+      case Map.get(result, :merged_row_count) do
+        nil -> meta
+        n -> Map.put(meta, "merged_row_count", n)
+      end
+
     %{
       "id" => result.id,
       "source" => result.source,
       "solution_sha256" => result.solution_sha256,
       "testcases" => testcases,
       "num_testcases" => length(testcases),
-      "meta" => %{
-        "member_qids" => result.member_qids,
-        "alternate_solution_shas" => result.alternate_solution_shas,
-        "source_repo" => HF.source_repo(),
-        "source_revision" => revision
-      }
+      "meta" => meta
     }
   end
 
   # --- Writers ---------------------------------------------------------
 
-  defp write_parquet(rows, path) do
-    df =
-      DF.new(
-        id: Enum.map(rows, & &1["id"]),
-        source: Enum.map(rows, & &1["source"]),
-        solution_sha256: Enum.map(rows, & &1["solution_sha256"]),
-        testcases: Enum.map(rows, &Jason.encode!(&1["testcases"])),
-        num_testcases: Enum.map(rows, & &1["num_testcases"]),
-        meta: Enum.map(rows, &Jason.encode!(&1["meta"]))
-      )
-
-    DF.to_parquet!(df, path)
+  # Lazy-scan the NDJSON sidecar (flat, JSON-string `testcases`/`meta`
+  # columns) and pipe it through Polars' streaming parquet sink, so the
+  # whole dataset is never resident. `select/2` pins the column order.
+  defp write_parquet(_ndjson_path, parquet_path, 0, compression) do
+    @columns
+    |> Map.new(&{&1, []})
+    |> DF.new()
+    |> DF.select(@columns)
+    |> DF.to_parquet!(parquet_path, compression: compression)
   end
 
-  defp write_jsonl(rows, path) do
-    body = rows |> Enum.map(&(Jason.encode!(&1) <> "\n")) |> IO.iodata_to_binary()
-    File.write!(path, body)
+  defp write_parquet(ndjson_path, parquet_path, _num_rows, compression) do
+    ndjson_path
+    |> DF.from_ndjson!(lazy: true)
+    |> DF.select(@columns)
+    |> DF.to_parquet!(parquet_path, streaming: true, compression: compression)
   end
 
-  defp write_provenance(rows, version, revision, extra, path) do
+  defp write_provenance(num_rows, version, revision, extra, path) do
     base = %{
       "version" => version,
       "source_repo" => HF.source_repo(),
@@ -115,7 +237,7 @@ defmodule Dataset.Emit do
       "merge_predicate" => ">=3 shared stdins, 0 disagreements, transitive (connected components)",
       "curation_size_filter_bytes" => Candidates.size_limit(),
       "testcase_cap" => 32,
-      "num_rows" => length(rows),
+      "num_rows" => num_rows,
       "generated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
     }
 

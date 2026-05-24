@@ -48,7 +48,6 @@ defmodule Dataset.BuildTest do
       no_sandbox: true,
       out_dir: out,
       cache_path: Path.join(out, "cache.jsonl"),
-      corpus_cache_path: Path.join(out, "corpus.term.gz"),
       run_count: 3,
       timeout_ms: 5000
     ]

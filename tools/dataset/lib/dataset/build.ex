@@ -5,15 +5,28 @@ defmodule Dataset.Build do
   is testable with an injected dataset module. See
   docs/12_dataset-curation-plan.md §Pipeline.
 
-  Flow: `Corpus.grouped` → `MergeGroups.build` (solution qids) →
-  `Candidates.build` → shard/skip/limit over merge-groups →
-  `Select.select` per group (concurrent) → `Emit.emit`.
+  Two-pass flow so the **whole dataset** is processed by default while
+  memory stays bounded by the slice you're building:
 
-  Resumable: the `(source, stdin)` verdict cache (`Dataset.PythonCache`)
-  means a restart skips completed verification.
+    1. `Corpus.solutions` — all `seed_sft` shards (code is small).
+    2. `MergeGroups.build` — fingerprint **all** `seed_testcase` shards
+       (hashes only) → `qid → group`.
+    3. pick the `--qid-shard`/`--skip`/`--limit` slice of merge-groups.
+    4. `Corpus.testcases` — load testcases for **only the slice's qids**
+       (across all shards) → bounded resident memory.
+    5. `Candidates.build` → `Select.select` per group (concurrent),
+       spilling chosen rows to disk while keeping only `Dataset.Dedup`
+       fingerprints resident.
+    6. `Dedup.cluster` over the fingerprints (a stricter, fanout-cap-free
+       pass on the shipped rows) → re-read survivors from disk → `Emit`.
+
+  With no slicing options the slice is the entire corpus. `--qid-shard
+  i/N` is the lever to split a run across processes/machines (and to cap
+  the resident testcase set). Resumable via the `(source, stdin)` verdict
+  cache (`Dataset.PythonCache`).
   """
 
-  alias Dataset.{Candidates, Corpus, Emit, MergeGroups, PythonCache, Sandbox, Select}
+  alias Dataset.{Behavioral, Candidates, Corpus, Dedup, Emit, MergeGroups, PythonCache, Sandbox, Select, SourceNorm, Spill}
   require Logger
 
   @doc """
@@ -21,10 +34,10 @@ defmodule Dataset.Build do
 
   ## Options
     * `:dataset_module` — default `Dataset.Dataset`.
-    * `:testcase_shards` — shards loaded for both text and fingerprints (default 1).
     * `:qid_shard` — `{i, n}` to process only merge-groups where `phash2(group_id, n) == i`.
     * `:skip`, `:limit` — slice the (sorted) group list.
     * `:run_count` (5), `:testcase_cap` (32), `:timeout_ms` (20_000), `:size_limit` (1 MB).
+    * `:dedup_min_shared` — global post-selection dedup threshold (default 2; 0 disables). See `Dataset.Dedup`.
     * `:concurrency` — Select workers (default `schedulers_online`).
     * `:no_sandbox` — skip the self-test and run python unsandboxed (trusted/test only).
     * `:cache_path` — verdict cache JSONL (default `cache/verify.jsonl`).
@@ -33,77 +46,259 @@ defmodule Dataset.Build do
   @spec run(keyword()) :: {:ok, String.t(), map()}
   def run(opts \\ []) do
     dataset = Keyword.get(opts, :dataset_module, Dataset.Dataset)
-    k = Keyword.get(opts, :testcase_shards, 1)
+    size_limit = Keyword.get(opts, :size_limit, Candidates.size_limit())
 
     configure_sandbox(opts)
     {:ok, _} = PythonCache.ensure_started(path: cache_path(opts))
     unless Keyword.get(opts, :no_sandbox, false), do: Sandbox.self_test!()
 
-    Logger.info("[build] loading corpus (testcase_shards=#{k})")
+    Logger.info("[build] loading solutions")
+    solutions_by_qid = Corpus.solutions(dataset_module: dataset)
 
-    corpus_opts =
-      [dataset_module: dataset, testcase_shards: k]
-      |> maybe_put(:cache_path, Keyword.get(opts, :corpus_cache_path))
+    Logger.info("[build] #{map_size(solutions_by_qid)} qids with solutions; fingerprinting near-dups")
+    qid_to_group = MergeGroups.build(Map.keys(solutions_by_qid), dataset_module: dataset)
 
-    {solutions_by_qid, testcases_by_qid, stats} = Corpus.grouped(corpus_opts)
+    # group_id => [member qids]
+    members_by_group =
+      Enum.reduce(qid_to_group, %{}, fn {qid, gid}, acc ->
+        Map.update(acc, gid, [qid], &[qid | &1])
+      end)
 
-    Logger.info("[build] #{stats.total_qids_with_solutions} qids with solutions; grouping near-dups")
-    qid_to_group =
-      MergeGroups.build(Map.keys(solutions_by_qid),
-        dataset_module: dataset,
-        testcase_shards: k
-      )
-
-    groups =
-      Candidates.build(solutions_by_qid, testcases_by_qid, qid_to_group,
-        size_limit: Keyword.get(opts, :size_limit, Candidates.size_limit())
-      )
-
-    selected =
-      groups
-      |> Map.values()
-      |> Enum.sort_by(& &1.group_id)
+    selected_gids =
+      members_by_group
+      |> Map.keys()
+      |> Enum.sort()
       |> apply_shard(Keyword.get(opts, :qid_shard))
       |> apply_skip_limit(Keyword.get(opts, :skip), Keyword.get(opts, :limit))
+      |> MapSet.new()
 
-    total = length(selected)
-    Logger.info("[build] selecting over #{total} merge-groups")
+    total = MapSet.size(selected_gids)
+    Logger.info("[build] spilling testcases for #{total} merge-groups to disk")
 
-    select_opts = [
-      run_count: Keyword.get(opts, :run_count, 5),
-      timeout_ms: Keyword.get(opts, :timeout_ms, 20_000),
-      testcase_cap: Keyword.get(opts, :testcase_cap, 32)
-    ]
+    {spill_dir, buckets} =
+      Spill.run(qid_to_group, selected_gids,
+        dataset_module: dataset,
+        size_limit: size_limit
+      )
 
+    select_opts =
+      [
+        run_count: Keyword.get(opts, :run_count, 5),
+        timeout_ms: Keyword.get(opts, :timeout_ms, 20_000),
+        testcase_cap: Keyword.get(opts, :testcase_cap, 32)
+      ]
+      |> then(fn o ->
+        case Keyword.get(opts, :solution_cap) do
+          nil -> o
+          cap -> Keyword.put(o, :solution_cap, cap)
+        end
+      end)
+
+    concurrency = Keyword.get(opts, :concurrency, System.schedulers_online())
     counter = :counters.new(1, [:atomics])
 
-    results =
-      selected
-      |> Task.async_stream(
-        fn group -> select_with_progress(group, select_opts, counter, total) end,
-        max_concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
-        timeout: :infinity,
-        ordered: true
-      )
-      |> Enum.flat_map(fn
-        {:ok, {:ok, result}} -> [result]
-        {:ok, :drop} -> []
+    Logger.info("[build] selecting over #{buckets} buckets")
+
+    emit_opts = [
+      version: Keyword.get(opts, :version, "v0"),
+      out_dir: Keyword.get(opts, :out_dir),
+      source_revision: Keyword.get(opts, :source_revision, "main")
+    ]
+
+    # Stage A — select, spilling full rows to disk while keeping only
+    # lightweight fingerprints (hashes) resident. Never buffer the whole
+    # dataset (the OOM at full scale; see Dataset.Emit/Dataset.Dedup).
+    results_path = Path.join(System.tmp_dir!(), "dataset_results_#{System.unique_integer([:positive])}.bin")
+    {:ok, wh} = :file.open(results_path, [:write, :binary, :raw])
+
+    {fingerprints, sources} =
+      try do
+        Enum.reduce(0..(buckets - 1), {[], []}, fn b, acc ->
+          # Sort each bucket by id so the on-disk row order is deterministic
+          # (buckets are written in index order); survivors keep that order.
+          spill_dir
+          |> process_bucket(b, solutions_by_qid, qid_to_group, size_limit, select_opts, concurrency, counter, total)
+          |> Enum.sort_by(& &1.id)
+          |> Enum.reduce(acc, fn result, {fps, srcs} ->
+            write_result(wh, result)
+            {[Dedup.fingerprint(result) | fps], [{result.id, result.source} | srcs]}
+          end)
+        end)
+      after
+        :file.close(wh)
+        Spill.cleanup(spill_dir)
+      end
+
+    # Stage B — global dedup over fingerprints only (payloads stay on disk).
+    # Canonical-source hashing (optional Python AST step) adds the source
+    # signal that catches comment/whitespace/rename-only duplicates;
+    # behavioral equivalence (optional, runs python) adds the rest.
+    norm_hashes = source_norm(sources, opts)
+    behavioral_edges = behavioral(fingerprints, norm_hashes, results_path, opts)
+    {keep, overrides} = dedup(fingerprints, norm_hashes, behavioral_edges, opts)
+
+    # Stage C — re-read survivors from disk, fold merge meta, stream to emit.
+    {:ok, out_dir, kept} =
+      Emit.with_writer(emit_opts, fn writer ->
+        try do
+          results_path
+          |> stream_results()
+          |> Stream.filter(fn r -> keep == nil or MapSet.member?(keep, r.id) end)
+          |> Stream.map(fn r -> apply_override(r, overrides) end)
+          |> Stream.chunk_every(500)
+          |> Enum.each(fn chunk -> Emit.write(writer, chunk) end)
+        after
+          File.rm(results_path)
+        end
       end)
-      |> Enum.sort_by(& &1.id)
 
-    {:ok, out_dir} =
-      Emit.emit(results,
-        version: Keyword.get(opts, :version, "v0"),
-        out_dir: Keyword.get(opts, :out_dir),
-        source_revision: Keyword.get(opts, :source_revision, "main")
-      )
-
-    summary = %{groups: total, kept: length(results), dropped: total - length(results)}
+    summary = %{groups: total, kept: kept, dropped: total - kept}
     Logger.info("[build] done: #{summary.kept} kept / #{summary.dropped} dropped → #{out_dir}")
     {:ok, out_dir, summary}
   end
 
   # --- Internals -------------------------------------------------------
+
+  # Global dedup of the selected rows (a stricter pass over the merge
+  # stage; see Dataset.Dedup). `:dedup_min_shared` (default 2) is the
+  # min shared stdins to union two rows; 0 disables dedup entirely.
+  defp dedup(fingerprints, norm_hashes, extra_edges, opts) do
+    case Keyword.get(opts, :dedup_min_shared, 2) do
+      n when n in [nil, 0] ->
+        {nil, %{}}
+
+      min_shared ->
+        {keep, overrides} =
+          Dedup.cluster(fingerprints,
+            min_shared: min_shared,
+            norm_hashes: norm_hashes,
+            extra_edges: extra_edges
+          )
+
+        Logger.info(
+          "[dedup] #{length(fingerprints)} rows → #{MapSet.size(keep)} kept " <>
+            "(#{map_size(overrides)} clusters merged, min_shared=#{min_shared})"
+        )
+
+        {keep, overrides}
+    end
+  end
+
+  # Behavioral-equivalence edges (opt-in `:behavioral`; runs python). Gates
+  # candidate pairs cheaply (Dedup.candidates), loads only those rows'
+  # payloads back from disk, then checks bidirectional reproduction.
+  defp behavioral(fingerprints, norm_hashes, results_path, opts) do
+    dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
+
+    if dedup_on and Keyword.get(opts, :behavioral, false) do
+      pairs = Dedup.candidates(fingerprints, norm_hashes: norm_hashes)
+      ids = pairs |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
+      rows = load_rows(results_path, ids)
+
+      edges = Behavioral.edges(rows, pairs, behavioral_opts(opts))
+      Logger.info("[behavioral] #{length(edges)} equivalent pairs from #{length(pairs)} candidates")
+      edges
+    else
+      []
+    end
+  end
+
+  defp behavioral_opts(opts) do
+    [
+      run_count: Keyword.get(opts, :behavioral_run_count, Keyword.get(opts, :run_count, 5)),
+      timeout_ms: Keyword.get(opts, :timeout_ms, 20_000),
+      concurrency: Keyword.get(opts, :concurrency, System.schedulers_online())
+    ]
+  end
+
+  # Load just the candidate rows' payloads (source + testcases) from the
+  # on-disk results spill — bounded by the candidate set, not the dataset.
+  defp load_rows(results_path, ids) do
+    results_path
+    |> stream_results()
+    |> Stream.filter(&MapSet.member?(ids, &1.id))
+    |> Map.new(fn r -> {r.id, %{source: r.source, testcases: r.testcases}} end)
+  end
+
+  # Canonical-source hashes for the dedup source signal (Dataset.SourceNorm).
+  # `:source_norm` mode: "struct" (default) | "reformat" | "none"/0 (off).
+  # Skipped when dedup itself is disabled.
+  defp source_norm(sources, opts) do
+    mode = Keyword.get(opts, :source_norm, "struct")
+    dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
+
+    if dedup_on and to_string(mode) not in ["none", "0", ""] do
+      hashes = SourceNorm.hashes(sources, mode: to_string(mode))
+      Logger.info("[source-norm] mode=#{mode}: hashed #{map_size(hashes)}/#{length(sources)} sources")
+      hashes
+    else
+      %{}
+    end
+  end
+
+  defp apply_override(result, overrides) do
+    case Map.get(overrides, result.id) do
+      nil ->
+        result
+
+      o ->
+        result
+        |> Map.put(:member_qids, o.member_qids)
+        |> Map.put(:alternate_solution_shas, o.alternate_solution_shas)
+        |> Map.put(:merged_row_count, o.merged_row_count)
+    end
+  end
+
+  # Length-prefixed term_to_binary records — exact round-trip of a select
+  # result, so the heavy testcase payloads live on disk between selection
+  # and emit instead of resident.
+  defp write_result(handle, result) do
+    bin = :erlang.term_to_binary(result)
+    :ok = :file.write(handle, <<byte_size(bin)::32, bin::binary>>)
+  end
+
+  defp stream_results(path) do
+    Stream.resource(
+      fn -> File.open!(path, [:read, :binary, :raw]) end,
+      fn h ->
+        case :file.read(h, 4) do
+          {:ok, <<len::32>>} ->
+            {:ok, bin} = :file.read(h, len)
+            {[:erlang.binary_to_term(bin)], h}
+
+          :eof ->
+            {:halt, h}
+        end
+      end,
+      fn h -> File.close(h) end
+    )
+  end
+
+  # Load one spilled bucket, build its candidate groups, and select
+  # concurrently. Memory is bounded by the bucket size.
+  defp process_bucket(dir, b, solutions_by_qid, qid_to_group, size_limit, select_opts, concurrency, counter, total) do
+    testcases_by_qid = Spill.read_bucket(dir, b)
+
+    if map_size(testcases_by_qid) == 0 do
+      []
+    else
+      sub_qid_to_group = Map.take(qid_to_group, Map.keys(testcases_by_qid))
+
+      solutions_by_qid
+      |> Candidates.build(testcases_by_qid, sub_qid_to_group, size_limit: size_limit)
+      |> Map.values()
+      |> Task.async_stream(
+        fn group -> select_with_progress(group, select_opts, counter, total) end,
+        max_concurrency: concurrency,
+        timeout: :infinity,
+        ordered: false
+      )
+      |> Enum.flat_map(fn
+        {:ok, {:ok, result}} -> [result]
+        {:ok, :drop} -> []
+      end)
+    end
+  end
 
   defp select_with_progress(group, opts, counter, total) do
     result = Select.select(group, opts)
@@ -133,13 +328,10 @@ defmodule Dataset.Build do
     Keyword.get(opts, :cache_path, Path.expand("../../cache/verify.jsonl", __DIR__))
   end
 
-  defp maybe_put(opts, _key, nil), do: opts
-  defp maybe_put(opts, key, val), do: Keyword.put(opts, key, val)
+  defp apply_shard(gids, nil), do: gids
 
-  defp apply_shard(groups, nil), do: groups
-
-  defp apply_shard(groups, {i, n}) do
-    Enum.filter(groups, fn g -> rem(:erlang.phash2(g.group_id, n), n) == i end)
+  defp apply_shard(gids, {i, n}) do
+    Enum.filter(gids, fn gid -> rem(:erlang.phash2(gid, n), n) == i end)
   end
 
   defp apply_skip_limit(groups, skip, limit) do

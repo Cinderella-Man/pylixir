@@ -70,7 +70,6 @@ defmodule Dataset.E2ETest do
         dataset_module: Fake,
         out_dir: out,
         cache_path: Path.join(out, "cache.jsonl"),
-        corpus_cache_path: Path.join(out, "corpus.term.gz"),
         run_count: 3,
         timeout_ms: 8000
       )

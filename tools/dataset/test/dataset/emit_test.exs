@@ -83,6 +83,14 @@ defmodule Dataset.EmitTest do
     assert prov["source_repo"] == "microsoft/rStar-Coder"
   end
 
+  test "explicit out_dir: nil falls back to out/<version> instead of crashing" do
+    {:ok, dir} = Emit.emit([result()], out_dir: nil, version: "vnil_test")
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    assert String.ends_with?(dir, Path.join("out", "vnil_test"))
+    assert File.exists?(Path.join(dir, "data.parquet"))
+  end
+
   test "dataset card credits upstream, names CC BY 4.0, states no problem statement" do
     dir = out_dir()
     Emit.emit([result()], out_dir: dir)

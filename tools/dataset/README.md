@@ -17,7 +17,8 @@ parent project.
 - Elixir `~> 1.19` / OTP 28
 - `python3.14` on `PATH` (the pinned interpreter — outputs are version-sensitive)
 - `unshare` + `prlimit` (sandbox; Linux with unprivileged user namespaces)
-- `hf` CLI + `HF_TOKEN` (only for publishing)
+- `hf` CLI (`huggingface_hub`) on `PATH` — used to download shards (resumable, hash-verified) and to
+  publish. Set `HF_TOKEN` for faster, higher-rate-limit downloads (and required for publishing).
 
 ## Setup
 
@@ -28,7 +29,8 @@ mix test
 
 ## Build a dataset
 
-Downloads rStar-Coder shards on first run, verifies under a sandbox, writes to `out/<version>/`:
+Processes the **whole dataset** — downloads rStar-Coder shards on first run, verifies under a sandbox,
+writes to `out/<version>/`:
 
 ```sh
 mix dataset.build --version v1
@@ -38,8 +40,8 @@ Common options:
 
 ```
 --version VER          output dir out/<version> (default v0)
---testcase-shards K    seed_testcase shards to load (default 1)
---qid-shard i/N        process only shard i of N merge-groups (resumable, parallelizable)
+--qid-shard i/N        process only shard i of N tasks — split a run across processes/machines
+                       and bound resident memory (optional; default = everything)
 --skip N / --limit N   slice the task list
 --runs N               runs per testcase for the determinism check (default 5)
 --testcase-cap N       max testcases per task (default 32)
@@ -50,8 +52,13 @@ Common options:
 --no-sandbox           run python unsandboxed — TRUSTED input only
 ```
 
-Work is **resumable**: a `(source, stdin)` verdict cache (`cache/`) lets a restart skip completed
-verification.
+**Scale:** the whole dataset (hundreds of GB of shards) is processed in one command — testcases are
+streamed and spilled to on-disk buckets, then processed bucket-by-bucket, so memory stays bounded at
+any size with no manual sharding.
+
+**Resumable:** a `(source, stdin)` verdict cache (`cache/`) lets a restart skip completed
+verification. `--qid-shard i/N` is optional — for splitting one run across machines:
+`for i in $(seq 0 7); do mix dataset.build --version v1 --qid-shard $i/8; done`.
 
 ## Output (`out/<version>/`)
 

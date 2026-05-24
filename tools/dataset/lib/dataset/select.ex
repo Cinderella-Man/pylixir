@@ -26,6 +26,11 @@ defmodule Dataset.Select do
   alias Dataset.Verify
 
   @testcase_cap 32
+  # Cap candidate solutions per task. Merged near-dup groups can pool
+  # hundreds of solutions; verifying them all (× testcases) is the main
+  # cost blow-up. Solutions are tried shortest-first, so a concise correct
+  # one is almost always within the cap.
+  @solution_cap 100
 
   @type result :: %{
           id: String.t(),
@@ -42,6 +47,7 @@ defmodule Dataset.Select do
 
   ## Options
     * `:testcase_cap` (default #{@testcase_cap})
+    * `:solution_cap` (default #{@solution_cap}) — max candidate solutions tried (shortest-first).
     * `:verify_fun` — `(solution, testcases, opts -> [kept])`; default
       `&Dataset.Verify.verify_solution/3`.
     * other opts are passed through to the verify function.
@@ -49,10 +55,15 @@ defmodule Dataset.Select do
   @spec select(map(), keyword()) :: {:ok, result()} | :drop
   def select(group, opts \\ []) do
     cap = Keyword.get(opts, :testcase_cap, @testcase_cap)
+    sol_cap = Keyword.get(opts, :solution_cap, @solution_cap)
     verify_fun = Keyword.get(opts, :verify_fun, &Verify.verify_solution/3)
 
     capped = Enum.take(group.testcases, cap)
-    ordered = Enum.sort_by(group.solutions, fn s -> {byte_size(s.source), s.sha} end)
+
+    ordered =
+      group.solutions
+      |> Enum.sort_by(fn s -> {byte_size(s.source), s.sha} end)
+      |> Enum.take(sol_cap)
 
     case capped do
       [] -> :drop
