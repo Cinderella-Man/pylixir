@@ -174,6 +174,97 @@ defmodule Dataset.Dedup do
     end)
   end
 
+  @doc """
+  Content-similar candidate id-pairs via **MinHash/LSH** over the sources —
+  a seed-agnostic complement to `candidates/2`. The seed-adjacency / shared-
+  stdin gate only proposes near neighbours; this surfaces same-problem
+  variants whose seed numbers are **far apart** (or merely 2 apart, outside
+  the ±1 window) and whose testcases are **disjoint**, which that gate never
+  sees. Returns the id-pairs whose estimated Jaccard over character-shingle
+  sets is `>= :min_jaccard`. Pure Elixir, no code execution.
+
+  Intended as a candidate source for the (behavioral) confirmation step, not
+  a merge signal on its own — short solutions are dominated by shared I/O
+  boilerplate, so a high shingle overlap does **not** imply the same problem.
+
+  ## Options
+    * `:min_jaccard` — true-Jaccard cutoff applied after LSH (default 0.4).
+    * `:shingle_size` — character shingle width (default 5).
+    * `:num_hashes` — MinHash signature length (default 120).
+    * `:bands` — LSH bands; rows-per-band = `num_hashes / bands` (default 40).
+      The default `120/40` (3 rows/band) gives a ~0.29 LSH threshold, i.e.
+      high recall down to Jaccard ~0.4 (~93%), matching `:min_jaccard`.
+  """
+  @spec similar_candidates(%{String.t() => String.t()}, keyword()) :: [{String.t(), String.t()}]
+  def similar_candidates(sources_by_id, opts \\ []) do
+    min_jaccard = Keyword.get(opts, :min_jaccard, 0.4)
+    shingle_size = Keyword.get(opts, :shingle_size, 5)
+    k = Keyword.get(opts, :num_hashes, 120)
+    bands = Keyword.get(opts, :bands, 40)
+    r = div(k, bands)
+    coeffs = minhash_coeffs(k)
+
+    shingles = Map.new(sources_by_id, fn {id, src} -> {id, shingle_set(src, shingle_size)} end)
+    sigs = Map.new(shingles, fn {id, sh} -> {id, minhash_sig(sh, coeffs)} end)
+
+    bands
+    |> lsh_pairs(sigs, r)
+    |> Enum.filter(fn {a, b} ->
+      jaccard(Map.fetch!(shingles, a), Map.fetch!(shingles, b)) >= min_jaccard
+    end)
+  end
+
+  # 2^31-1: shingle hashes (phash2, < 2^27) stay well inside 64-bit after a*h+b.
+  @minhash_prime 2_147_483_647
+
+  defp shingle_set(src, n) do
+    s = String.replace(src, ~r/\s+/, " ")
+    max = byte_size(s) - n
+
+    if max < 0 do
+      MapSet.new([:erlang.phash2(s)])
+    else
+      Enum.reduce(0..max, MapSet.new(), fn i, acc ->
+        MapSet.put(acc, :erlang.phash2(binary_part(s, i, n)))
+      end)
+    end
+  end
+
+  # Deterministic, state-free hash coefficients (no :rand global mutation).
+  defp minhash_coeffs(k) do
+    for i <- 1..k, do: {:erlang.phash2({:a, i}, @minhash_prime - 1) + 1, :erlang.phash2({:b, i}, @minhash_prime)}
+  end
+
+  defp minhash_sig(shingles, coeffs) do
+    list = MapSet.to_list(shingles)
+    Enum.map(coeffs, fn {a, b} -> Enum.reduce(list, @minhash_prime, fn h, m -> min(m, rem(a * h + b, @minhash_prime)) end) end)
+  end
+
+  # Group ids by each band's signature slice; ids colliding in any band pair up.
+  defp lsh_pairs(bands, sigs, r) do
+    ids = Map.keys(sigs)
+
+    0..(bands - 1)//1
+    |> Enum.reduce(MapSet.new(), fn band, acc ->
+      ids
+      |> Enum.group_by(fn id -> Enum.slice(Map.fetch!(sigs, id), band * r, r) end)
+      |> Enum.reduce(acc, fn
+        {_slice, [_only]}, acc -> acc
+        {_slice, group}, acc -> Enum.reduce(pairs(Enum.sort(group)), acc, &MapSet.put(&2, &1))
+      end)
+    end)
+    |> MapSet.to_list()
+  end
+
+  defp jaccard(a, b) do
+    inter = MapSet.intersection(a, b) |> MapSet.size()
+
+    case MapSet.size(a) + MapSet.size(b) - inter do
+      0 -> 0.0
+      union -> inter / union
+    end
+  end
+
   # Pairwise shared/disagree counts over the stdin inverted index.
   defp pair_stats(fps, n) do
     inv =

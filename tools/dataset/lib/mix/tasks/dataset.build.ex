@@ -29,9 +29,13 @@ defmodule Mix.Tasks.Dataset.Build do
                              shipped rows (default 2; 3 = merge rule, 1 = max)
       --source-norm MODE     dedup source signal via Python AST: struct (default,
                              ignores names+formatting) | reformat | none
-      --sim-threshold N      merge producer-multiplied near-dups whose sources are
-                             textually similar (Jaro >= N, default 0.8; 0 disables).
-                             Pure Elixir, runs no code.
+      --sim-threshold N      direct-merge long+similar candidate pairs (Jaro >= N,
+                             default 0.8; 0 disables). Short similar pairs instead
+                             require behavioral confirmation.
+      --sim-min-len N        min source bytes for a Jaro direct-merge (default 300)
+      --sim-min-jaccard N    MinHash/LSH content-gate cutoff for proposing candidate
+                             pairs across distant seeds (default 0.4 — wide net,
+                             behavioral confirms/vetoes; raise to cut behavioral cost)
       --no-behavioral        DISABLE behavioral-equivalence dedup (default ON): by
                              default two rows merge if each solution reproduces all
                              the other's testcases — the gold-standard signal that
@@ -68,6 +72,8 @@ defmodule Mix.Tasks.Dataset.Build do
     dedup_min_shared: :integer,
     source_norm: :string,
     sim_threshold: :float,
+    sim_min_len: :integer,
+    sim_min_jaccard: :float,
     behavioral: :boolean,
     behavioral_run_count: :integer,
     no_dedup: :boolean,

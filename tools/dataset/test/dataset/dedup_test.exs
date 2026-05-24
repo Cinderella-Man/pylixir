@@ -177,6 +177,32 @@ defmodule Dataset.DedupTest do
       assert Dedup.similar_edges([{"a", "b"}], sources, 0.5) == [{"a", "b"}]
     end
 
+    test "similar_candidates surfaces content-similar pairs regardless of seeds" do
+      base = """
+      import sys
+      def main():
+          data = sys.stdin.read().split()
+          n = int(data[0])
+          total = 0
+          for i in range(1, n + 1):
+              total += int(data[i])
+          print(total)
+      main()
+      """
+
+      sources = %{
+        # near-identical to base (only a var name + comment differ)
+        "seed_4498" => base,
+        "seed_9207" => String.replace(base, "total", "acc") <> "# variant\n",
+        # unrelated program
+        "seed_1" => "print(input()[::-1])"
+      }
+
+      pairs = Dedup.similar_candidates(sources, min_jaccard: 0.5)
+      assert {"seed_4498", "seed_9207"} in pairs
+      refute Enum.any?(pairs, fn {a, b} -> "seed_1" in [a, b] end)
+    end
+
     test "similar_edges feed cluster as extra_edges (zero testcase overlap)" do
       rs = [
         result("a", "for c in p:\n    if c not in {'8','5','3'}: x=1", [{"1\n", "A\n"}]),

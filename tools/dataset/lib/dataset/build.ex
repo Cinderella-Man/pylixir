@@ -38,10 +38,15 @@ defmodule Dataset.Build do
     * `:skip`, `:limit` — slice the (sorted) group list.
     * `:run_count` (5), `:testcase_cap` (32), `:timeout_ms` (20_000), `:size_limit` (1 MB).
     * `:dedup_min_shared` — global post-selection dedup threshold (default 2; 0 disables). See `Dataset.Dedup`.
-    * `:sim_threshold` — source-similarity (Jaro) cutoff for merging producer-multiplied
-      near-dups (default 0.8; 0 disables). Pure Elixir, no code execution. See `Dataset.Dedup.similar_edges/3`.
+    * `:sim_threshold` — Jaro cutoff for *direct* merging of long+similar candidate
+      pairs (default 0.8; 0 disables). See `Dataset.Dedup.similar_edges/3`.
+    * `:sim_min_len` — min source bytes for a Jaro direct-merge (default 300); shorter
+      similar pairs require behavioral confirmation instead.
+    * `:sim_min_jaccard` — MinHash/LSH content-gate cutoff for proposing candidate pairs
+      (default 0.4 — wide net; behavioral confirms/vetoes). See `Dataset.Dedup.similar_candidates/2`.
     * `:behavioral` — behavioral-equivalence dedup (default `true`; runs python on
-      candidate pairs, resumable via the verdict cache). See `Dataset.Behavioral`.
+      candidate pairs, resumable via the verdict cache). Confirms similarity-gated and
+      seed-gated pairs and vetoes boilerplate false matches. See `Dataset.Behavioral`.
     * `:concurrency` — Select workers (default `schedulers_online`).
     * `:no_sandbox` — skip the self-test and run python unsandboxed (trusted/test only).
     * `:cache_path` — verdict cache JSONL (default `cache/verify.jsonl`).
@@ -135,12 +140,17 @@ defmodule Dataset.Build do
       end
 
     # Stage B — global dedup over fingerprints only (payloads stay on disk).
-    # Canonical-source hashing (optional Python AST step) adds the source
-    # signal that catches comment/whitespace/rename-only duplicates;
-    # behavioral equivalence (optional, runs python) adds the rest.
+    # Candidate pairs come from two gates: the seed-adjacency / shared-stdin
+    # gate and the content-similarity (MinHash/LSH) gate (catches distant-seed,
+    # disjoint-testcase dups). Long+similar pairs merge directly on Jaro;
+    # everything else is confirmed behaviorally before merging. Canonical-source
+    # hashing (Python AST) adds the comment/whitespace/rename-only signal inside
+    # the cluster step.
     norm_hashes = source_norm(sources, opts)
-    sim_edges = source_sim(fingerprints, norm_hashes, sources, opts)
-    behavioral_edges = behavioral(fingerprints, norm_hashes, results_path, opts)
+    sources_by_id = Map.new(sources)
+    candidate_pairs = candidate_pairs(fingerprints, norm_hashes, sources_by_id, opts)
+    sim_edges = source_sim_edges(candidate_pairs, sources_by_id, opts)
+    behavioral_edges = behavioral(candidate_pairs, sim_edges, results_path, opts)
     {keep, overrides} = dedup(fingerprints, norm_hashes, sim_edges ++ behavioral_edges, opts)
 
     # Stage C — re-read survivors from disk, fold merge meta, stream to emit.
@@ -207,25 +217,55 @@ defmodule Dataset.Build do
           "transitive" => true,
           "canonical_source" => if(norm in ["none", "0", ""], do: false, else: norm),
           "source_similarity_jaro" => if(sim > 0, do: sim, else: false),
+          "source_similarity_min_len" => Keyword.get(opts, :sim_min_len, 300),
+          "content_candidate_min_jaccard" => Keyword.get(opts, :sim_min_jaccard, 0.4),
           "behavioral_equivalence" => behavioral?(opts)
         }
     end
   end
 
-  # Source-similarity edges (pure Elixir, default-on with dedup). Reuses
-  # the cheap candidate gate (Dedup.candidates — seed-adjacency + single
-  # shared stdin) then keeps pairs whose sources are textually similar
-  # (Jaro >= :sim_threshold, default 0.8). Catches producer-multiplied
-  # task variations no other signal sees, and runs no code (unlike the
-  # behavioral pass), so it cannot OOM. `:sim_threshold` 0 disables it.
-  defp source_sim(fingerprints, norm_hashes, sources, opts) do
-    dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
-    threshold = Keyword.get(opts, :sim_threshold, 0.8)
+  # Unified candidate set fed to the source-sim + behavioral steps: the
+  # seed-adjacency / shared-stdin gate (Dedup.candidates) UNION the content-
+  # similarity gate (Dedup.similar_candidates, MinHash/LSH over sources). The
+  # latter catches same-problem variants with distant/2-apart seeds and
+  # disjoint testcases that the former never proposes. Empty when dedup is off.
+  defp candidate_pairs(fingerprints, norm_hashes, sources_by_id, opts) do
+    if Keyword.get(opts, :dedup_min_shared, 2) in [nil, 0] do
+      []
+    else
+      seed = Dedup.candidates(fingerprints, norm_hashes: norm_hashes) |> Enum.map(&order/1)
 
-    if dedup_on and threshold > 0 do
-      pairs = Dedup.candidates(fingerprints, norm_hashes: norm_hashes)
-      edges = Dedup.similar_edges(pairs, Map.new(sources), threshold)
-      Logger.info("[source-sim] #{length(edges)} similar pairs (jaro>=#{threshold}) from #{length(pairs)} candidates")
+      sim =
+        sources_by_id
+        |> Dedup.similar_candidates(min_jaccard: Keyword.get(opts, :sim_min_jaccard, 0.4))
+        |> Enum.map(&order/1)
+
+      pairs = Enum.uniq(seed ++ sim)
+      Logger.info("[candidates] #{length(pairs)} pairs (#{length(seed)} seed/shared + #{length(sim)} content-similar)")
+      pairs
+    end
+  end
+
+  defp order({a, b}), do: if(a <= b, do: {a, b}, else: {b, a})
+
+  # Direct-merge edges: candidate pairs whose sources are textually similar
+  # (Jaro >= :sim_threshold) AND both long enough (:sim_min_len bytes) that the
+  # similarity can't be just shared I/O boilerplate. Short/ambiguous similar
+  # pairs are deliberately left out — they merge only if behavioral confirms
+  # equivalence (a high Jaro on a 3-line solution does not mean same problem).
+  defp source_sim_edges(candidate_pairs, sources_by_id, opts) do
+    threshold = Keyword.get(opts, :sim_threshold, 0.8)
+    min_len = Keyword.get(opts, :sim_min_len, 300)
+
+    if threshold > 0 do
+      long =
+        Enum.filter(candidate_pairs, fn {a, b} ->
+          byte_size(Map.get(sources_by_id, a, "")) >= min_len and
+            byte_size(Map.get(sources_by_id, b, "")) >= min_len
+        end)
+
+      edges = Dedup.similar_edges(long, sources_by_id, threshold)
+      Logger.info("[source-sim] #{length(edges)} direct-merge pairs (jaro>=#{threshold}, both src>=#{min_len}B) of #{length(long)} long candidates")
       edges
     else
       []
@@ -233,17 +273,17 @@ defmodule Dataset.Build do
   end
 
   # Behavioral-equivalence edges (default-on; `--no-behavioral` to skip; runs
-  # python). Gates candidate pairs cheaply (Dedup.candidates), loads only those
-  # rows' payloads back from disk, then checks bidirectional reproduction. The
-  # gold-standard signal: catches duplicates with a *genuinely different*
-  # solution (low source similarity), which `source_sim` misses.
+  # python). Confirms the candidate pairs NOT already merged by source-sim,
+  # loading only those rows' payloads from disk and checking bidirectional
+  # reproduction. The gold-standard signal: it both catches dups with a
+  # genuinely different solution and vetoes false source-similarity matches
+  # (short boilerplate-similar but behaviorally distinct problems).
   defp behavioral?(opts), do: Keyword.get(opts, :behavioral, true)
 
-  defp behavioral(fingerprints, norm_hashes, results_path, opts) do
-    dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
-
-    if dedup_on and behavioral?(opts) do
-      pairs = Dedup.candidates(fingerprints, norm_hashes: norm_hashes)
+  defp behavioral(candidate_pairs, sim_edges, results_path, opts) do
+    if behavioral?(opts) and candidate_pairs != [] do
+      decided = MapSet.new(sim_edges)
+      pairs = Enum.reject(candidate_pairs, &MapSet.member?(decided, &1))
       ids = pairs |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
       rows = load_rows(results_path, ids)
 

@@ -269,10 +269,12 @@ defmodule Dataset.Emit do
       variations (the same problem, lightly tweaked) into one task, via four
       signals: shared testcases with agreeing outputs; identical canonical
       source (AST-normalized, ignoring names/formatting); **source similarity**
-      (Jaro >= 0.8 over seed-adjacent candidates); and **behavioral
-      equivalence** (each solution reproduces all the other's testcases — also
-      catches variations written with a genuinely different solution); see
-      `provenance.json` (`post_selection_dedup`);
+      (Jaro >= 0.8 on long candidate pairs, where candidates come from both
+      seed-adjacency and MinHash/LSH content similarity, so distant-seed
+      variants are caught); and **behavioral equivalence** (each solution
+      reproduces all the other's testcases — catches variations with a
+      genuinely different solution and vetoes short boilerplate-similar
+      matches); see `provenance.json` (`post_selection_dedup`);
     * **problem statements removed** — only solution source + I/O testcases
       are shipped.
 
