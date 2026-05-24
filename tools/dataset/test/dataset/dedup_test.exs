@@ -155,4 +155,43 @@ defmodule Dataset.DedupTest do
     [{_rep, ov}] = Map.to_list(overrides)
     assert ov.merged_row_count == 3
   end
+
+  describe "similar_edges/3" do
+    test "keeps pairs with similar source, drops dissimilar" do
+      sources = %{
+        "a" => "for c in price:\n    if c not in {'8', '5', '3'}:\n        valid = False",
+        "b" => "for c in price:\n    if c not in {'3', '5', '8'}:\n        valid = False",
+        "c" => "print(sum(map(int, input().split())))"
+      }
+
+      assert Dedup.similar_edges([{"a", "b"}, {"a", "c"}], sources, 0.8) == [{"a", "b"}]
+    end
+
+    test "drops pairs with a missing source" do
+      assert Dedup.similar_edges([{"a", "b"}], %{"a" => "print(1)"}, 0.8) == []
+    end
+
+    test "threshold gates the cutoff" do
+      sources = %{"a" => "print(1)", "b" => "print(2)"}
+      assert Dedup.similar_edges([{"a", "b"}], sources, 0.99) == []
+      assert Dedup.similar_edges([{"a", "b"}], sources, 0.5) == [{"a", "b"}]
+    end
+
+    test "similar_edges feed cluster as extra_edges (zero testcase overlap)" do
+      rs = [
+        result("a", "for c in p:\n    if c not in {'8','5','3'}: x=1", [{"1\n", "A\n"}]),
+        result("b", "for c in p:\n    if c not in {'3','5','8'}: x=1", [{"9\n", "Z\n"}], sha: "shb")
+      ]
+
+      fps = Enum.map(rs, &Dedup.fingerprint/1)
+      sources = Map.new(rs, fn r -> {r.id, r.source} end)
+      edges = Dedup.similar_edges([{"a", "b"}], sources, 0.8)
+      assert edges == [{"a", "b"}]
+
+      {keep, overrides} = Dedup.cluster(fps, min_shared: 2, extra_edges: edges)
+      assert MapSet.size(keep) == 1
+      [{_rep, ov}] = Map.to_list(overrides)
+      assert ov.merged_row_count == 2
+    end
+  end
 end

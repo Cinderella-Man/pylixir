@@ -234,7 +234,8 @@ defmodule Dataset.Emit do
       "hashseed" => "unset (randomized per run)",
       "normalization" =>
         "utf8(latin1 fallback); CRLF->LF; per-line [ \\t] rstrip; drop trailing blank lines/newline; leading+internal preserved",
-      "merge_predicate" => ">=3 shared stdins, 0 disagreements, transitive (connected components)",
+      "merge_predicate_stage0_grouping" =>
+        ">=3 shared stdins, 0 disagreements, transitive (connected components)",
       "curation_size_filter_bytes" => Candidates.size_limit(),
       "testcase_cap" => 32,
       "num_rows" => num_rows,
@@ -264,8 +265,14 @@ defmodule Dataset.Emit do
       its testcases' outputs (5 runs, byte-identical after normalization);
     * outputs **re-derived and normalized** (the shipped `expected` is the
       solution's normalized stdout, not the raw stored value);
-    * **near-duplicate tasks merged** (shared testcases with agreeing
-      outputs);
+    * **near-duplicate tasks merged** — to fold producer-multiplied task
+      variations (the same problem, lightly tweaked) into one task, via four
+      signals: shared testcases with agreeing outputs; identical canonical
+      source (AST-normalized, ignoring names/formatting); **source similarity**
+      (Jaro >= 0.8 over seed-adjacent candidates); and **behavioral
+      equivalence** (each solution reproduces all the other's testcases — also
+      catches variations written with a genuinely different solution); see
+      `provenance.json` (`post_selection_dedup`);
     * **problem statements removed** — only solution source + I/O testcases
       are shipped.
 

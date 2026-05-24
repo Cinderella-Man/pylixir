@@ -145,6 +145,35 @@ defmodule Dataset.Dedup do
     |> Enum.map(fn {i, j} -> {Map.fetch!(fps, i).id, Map.fetch!(fps, j).id} end)
   end
 
+  @doc """
+  Filter `candidate_pairs` (`[{id_a, id_b}]`, typically from
+  `candidates/2`) down to the pairs whose **sources are textually
+  similar** — `String.jaro_distance/2 >= threshold`. This is the
+  pure-Elixir near-dup signal for *producer-multiplied* task variations
+  (the same problem lightly tweaked: reordered set literals, inverted
+  branches, renamed bounds), which share little/no testcase overlap and
+  whose canonical AST hash differs, so no other `Dedup` signal sees them.
+
+  Unlike `Dataset.Behavioral` it runs **no code** — just string
+  similarity over the already-gated candidate set — so it is cheap and
+  cannot OOM. `sources_by_id` maps id → source text; pairs with a missing
+  source are dropped. `threshold` default `0.8` (curated: catches tweaked
+  variants, accepting that heavily-rewritten dups slip through).
+  """
+  @spec similar_edges([{String.t(), String.t()}], %{String.t() => String.t()}, float()) ::
+          [{String.t(), String.t()}]
+  def similar_edges(candidate_pairs, sources_by_id, threshold \\ 0.8) do
+    Enum.filter(candidate_pairs, fn {a, b} ->
+      case {Map.get(sources_by_id, a), Map.get(sources_by_id, b)} do
+        {sa, sb} when is_binary(sa) and is_binary(sb) ->
+          String.jaro_distance(sa, sb) >= threshold
+
+        _ ->
+          false
+      end
+    end)
+  end
+
   # Pairwise shared/disagree counts over the stdin inverted index.
   defp pair_stats(fps, n) do
     inv =

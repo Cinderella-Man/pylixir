@@ -29,9 +29,15 @@ defmodule Mix.Tasks.Dataset.Build do
                              shipped rows (default 2; 3 = merge rule, 1 = max)
       --source-norm MODE     dedup source signal via Python AST: struct (default,
                              ignores names+formatting) | reformat | none
-      --behavioral           ALSO dedup by behavioral equivalence: merge two rows
-                             if each solution reproduces all the other's testcases
-                             (runs python on candidate pairs; slower, resumable)
+      --sim-threshold N      merge producer-multiplied near-dups whose sources are
+                             textually similar (Jaro >= N, default 0.8; 0 disables).
+                             Pure Elixir, runs no code.
+      --no-behavioral        DISABLE behavioral-equivalence dedup (default ON): by
+                             default two rows merge if each solution reproduces all
+                             the other's testcases — the gold-standard signal that
+                             catches duplicates with a genuinely different solution
+                             (runs python on candidate pairs only; slower, resumable
+                             via the verdict cache)
       --behavioral-run-count N  determinism runs for behavioral checks (default: --runs)
       --no-dedup             skip the post-selection dedup pass entirely
       --solution-cap N       max candidate solutions tried per task, shortest-first (default 100)
@@ -61,6 +67,7 @@ defmodule Mix.Tasks.Dataset.Build do
     testcase_cap: :integer,
     dedup_min_shared: :integer,
     source_norm: :string,
+    sim_threshold: :float,
     behavioral: :boolean,
     behavioral_run_count: :integer,
     no_dedup: :boolean,

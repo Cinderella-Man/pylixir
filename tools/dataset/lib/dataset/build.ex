@@ -38,6 +38,10 @@ defmodule Dataset.Build do
     * `:skip`, `:limit` — slice the (sorted) group list.
     * `:run_count` (5), `:testcase_cap` (32), `:timeout_ms` (20_000), `:size_limit` (1 MB).
     * `:dedup_min_shared` — global post-selection dedup threshold (default 2; 0 disables). See `Dataset.Dedup`.
+    * `:sim_threshold` — source-similarity (Jaro) cutoff for merging producer-multiplied
+      near-dups (default 0.8; 0 disables). Pure Elixir, no code execution. See `Dataset.Dedup.similar_edges/3`.
+    * `:behavioral` — behavioral-equivalence dedup (default `true`; runs python on
+      candidate pairs, resumable via the verdict cache). See `Dataset.Behavioral`.
     * `:concurrency` — Select workers (default `schedulers_online`).
     * `:no_sandbox` — skip the self-test and run python unsandboxed (trusted/test only).
     * `:cache_path` — verdict cache JSONL (default `cache/verify.jsonl`).
@@ -102,7 +106,8 @@ defmodule Dataset.Build do
     emit_opts = [
       version: Keyword.get(opts, :version, "v0"),
       out_dir: Keyword.get(opts, :out_dir),
-      source_revision: Keyword.get(opts, :source_revision, "main")
+      source_revision: Keyword.get(opts, :source_revision, "main"),
+      provenance: %{"post_selection_dedup" => dedup_provenance(opts)}
     ]
 
     # Stage A — select, spilling full rows to disk while keeping only
@@ -134,8 +139,9 @@ defmodule Dataset.Build do
     # signal that catches comment/whitespace/rename-only duplicates;
     # behavioral equivalence (optional, runs python) adds the rest.
     norm_hashes = source_norm(sources, opts)
+    sim_edges = source_sim(fingerprints, norm_hashes, sources, opts)
     behavioral_edges = behavioral(fingerprints, norm_hashes, results_path, opts)
-    {keep, overrides} = dedup(fingerprints, norm_hashes, behavioral_edges, opts)
+    {keep, overrides} = dedup(fingerprints, norm_hashes, sim_edges ++ behavioral_edges, opts)
 
     # Stage C — re-read survivors from disk, fold merge meta, stream to emit.
     {:ok, out_dir, kept} =
@@ -184,13 +190,59 @@ defmodule Dataset.Build do
     end
   end
 
-  # Behavioral-equivalence edges (opt-in `:behavioral`; runs python). Gates
-  # candidate pairs cheaply (Dedup.candidates), loads only those rows'
-  # payloads back from disk, then checks bidirectional reproduction.
+  # Records the actual post-selection dedup config used (for provenance).
+  defp dedup_provenance(opts) do
+    case Keyword.get(opts, :dedup_min_shared, 2) do
+      n when n in [nil, 0] ->
+        %{"enabled" => false}
+
+      min_shared ->
+        sim = Keyword.get(opts, :sim_threshold, 0.8)
+        norm = Keyword.get(opts, :source_norm, "struct") |> to_string()
+
+        %{
+          "enabled" => true,
+          "min_shared_stdins" => min_shared,
+          "zero_disagreements" => true,
+          "transitive" => true,
+          "canonical_source" => if(norm in ["none", "0", ""], do: false, else: norm),
+          "source_similarity_jaro" => if(sim > 0, do: sim, else: false),
+          "behavioral_equivalence" => behavioral?(opts)
+        }
+    end
+  end
+
+  # Source-similarity edges (pure Elixir, default-on with dedup). Reuses
+  # the cheap candidate gate (Dedup.candidates — seed-adjacency + single
+  # shared stdin) then keeps pairs whose sources are textually similar
+  # (Jaro >= :sim_threshold, default 0.8). Catches producer-multiplied
+  # task variations no other signal sees, and runs no code (unlike the
+  # behavioral pass), so it cannot OOM. `:sim_threshold` 0 disables it.
+  defp source_sim(fingerprints, norm_hashes, sources, opts) do
+    dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
+    threshold = Keyword.get(opts, :sim_threshold, 0.8)
+
+    if dedup_on and threshold > 0 do
+      pairs = Dedup.candidates(fingerprints, norm_hashes: norm_hashes)
+      edges = Dedup.similar_edges(pairs, Map.new(sources), threshold)
+      Logger.info("[source-sim] #{length(edges)} similar pairs (jaro>=#{threshold}) from #{length(pairs)} candidates")
+      edges
+    else
+      []
+    end
+  end
+
+  # Behavioral-equivalence edges (default-on; `--no-behavioral` to skip; runs
+  # python). Gates candidate pairs cheaply (Dedup.candidates), loads only those
+  # rows' payloads back from disk, then checks bidirectional reproduction. The
+  # gold-standard signal: catches duplicates with a *genuinely different*
+  # solution (low source similarity), which `source_sim` misses.
+  defp behavioral?(opts), do: Keyword.get(opts, :behavioral, true)
+
   defp behavioral(fingerprints, norm_hashes, results_path, opts) do
     dedup_on = Keyword.get(opts, :dedup_min_shared, 2) not in [nil, 0]
 
-    if dedup_on and Keyword.get(opts, :behavioral, false) do
+    if dedup_on and behavioral?(opts) do
       pairs = Dedup.candidates(fingerprints, norm_hashes: norm_hashes)
       ids = pairs |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
       rows = load_rows(results_path, ids)
