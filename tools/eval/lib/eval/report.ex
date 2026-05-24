@@ -3,44 +3,37 @@ defmodule Eval.Report do
   Persist an `Eval.run/1` accumulator to disk under
   `reports/run-<ISO8601>/`:
 
-    * `summary.md` — human-readable per-run summary. Includes a hint
-      line when `testcase_shard_missing > 0` (passing solutions whose
-      testcases live in a shard not loaded under the current
-      `--testcase-shards K`).
+    * `summary.md` — human-readable per-run summary.
     * `summary.json` — machine-readable counts. Carries
-      `schema_version: 3` plus `totals.testcases_run`,
-      `totals.testcases_passed`, `totals.testcase_shard_missing`.
+      `schema_version: 4` plus `totals.testcases_run` /
+      `totals.testcases_passed` / `totals.equivalent`.
     * `failures/<bucket-slug>/<n>.py` — first samples per bucket so
       maintainers can copy promising ones into `test/fixtures/python/`.
     * `mismatches/<fingerprint>/<n>.{py,ex,summary.md}` plus per-failing-
-      testcase `<n>.testcase_<idx>.{stdin,expected,python,elixir,diff}.txt`
-      — output-mismatch and python-disagrees-expected samples with
-      enough detail to triage without re-running the harness.
+      testcase `<n>.testcase_<idx>.{stdin,expected,elixir,diff}.txt` —
+      output-mismatch samples with enough detail to triage without
+      re-running the harness.
   """
 
   alias Eval.Bucket
 
-  @schema_version 3
+  @schema_version 4
 
   @doc """
   Write the report. Returns the absolute path to the run directory.
 
   ## Options
-
     * `:out` — explicit output directory. Defaults to
       `reports/run-<ISO8601>/`.
-    * `:comparison_mode` — currently always `:executed`. Embedded in
-      `summary.json` for forward-compatibility with future modes.
   """
   @spec write(Eval.accumulator(), keyword()) :: Path.t()
   def write(accumulator, opts \\ []) do
     run_dir = opts[:out] || default_run_dir()
-    comparison_mode = opts[:comparison_mode] || :executed
 
     File.mkdir_p!(run_dir)
 
-    write_json(run_dir, accumulator, comparison_mode)
-    write_markdown(run_dir, accumulator, comparison_mode)
+    write_json(run_dir, accumulator)
+    write_markdown(run_dir, accumulator)
     write_failure_samples(run_dir, accumulator)
     write_mismatch_samples(run_dir, accumulator)
     write_ok_samples(run_dir, accumulator)
@@ -64,12 +57,11 @@ defmodule Eval.Report do
 
   # --- summary.json ----------------------------------------------------
 
-  defp write_json(run_dir, acc, comparison_mode) do
+  defp write_json(run_dir, acc) do
     derived = derived_totals(acc)
 
     payload = %{
       schema_version: @schema_version,
-      comparison_mode: Atom.to_string(comparison_mode),
       totals: Map.merge(acc.totals, derived),
       counts:
         for {key, n} <- acc.counts, into: %{} do
@@ -82,7 +74,7 @@ defmodule Eval.Report do
 
   # --- summary.md ------------------------------------------------------
 
-  defp write_markdown(run_dir, acc, comparison_mode) do
+  defp write_markdown(run_dir, acc) do
     sorted = Enum.sort_by(acc.counts, fn {_k, n} -> -n end)
     total = acc.totals.processed
     derived = derived_totals(acc)
@@ -92,24 +84,18 @@ defmodule Eval.Report do
 
     behavior_rows = bucket_rows(sorted, total, &behavior_bucket?/1)
     compile_rows = bucket_rows(sorted, total, &compile_stage_bucket?/1)
-    python_rows = bucket_rows(sorted, total, &python_bucket?/1)
-
-    shard_hint = testcase_shard_hint(acc.totals)
 
     body = """
     # Pylixir eval run
 
     | metric | value |
     | --- | --- |
-    | comparison mode | `#{comparison_mode}` |
     | processed | #{total} |
     | behavioral equivalence | #{headline_count} (#{headline_pct}%) |
     | equivalent (`:ok` + `:ok_empty_output`) | #{derived.equivalent} |
-    | python preflight failures | #{derived.python_failed} |
-    | nondeterministic | #{derived.nondeterministic} |
     | testcases run | #{acc.totals.testcases_run} |
     | testcases passed | #{acc.totals.testcases_passed} |
-    #{shard_hint}
+
     ## Behavior buckets
 
     | bucket | count | share |
@@ -122,27 +108,12 @@ defmodule Eval.Report do
     | --- | --- | --- |
     #{compile_rows}
 
-    ## Python preflight buckets
-
-    | bucket | count | share |
-    | --- | --- | --- |
-    #{python_rows}
-
     Per-bucket failure samples are in `failures/<bucket-slug>/`.
     Mismatch samples are in `mismatches/<fingerprint>/`.
     """
 
     File.write!(Path.join(run_dir, "summary.md"), body)
   end
-
-  defp testcase_shard_hint(%{testcase_shard_missing: 0}), do: ""
-
-  defp testcase_shard_hint(%{testcase_shard_missing: n}) do
-    "\n> #{n} passing solutions have testcases in seed_testcase shards not loaded " <>
-      "(current: see config; total available: 30). Pass `--testcase-shards K'` to include more.\n"
-  end
-
-  defp testcase_shard_hint(_), do: ""
 
   defp bucket_rows(sorted, total, predicate) do
     rows =
@@ -158,7 +129,6 @@ defmodule Eval.Report do
   defp behavior_bucket?(:ok), do: true
   defp behavior_bucket?(:ok_empty_output), do: true
   defp behavior_bucket?({:output_mismatch, _}), do: true
-  defp behavior_bucket?({:python_disagrees_expected, _}), do: true
   defp behavior_bucket?({:elixir_runtime_error, _}), do: true
   defp behavior_bucket?(:elixir_timeout), do: true
   defp behavior_bucket?(_), do: false
@@ -167,32 +137,12 @@ defmodule Eval.Report do
   defp compile_stage_bucket?(:parse_error), do: true
   defp compile_stage_bucket?({:compile_error, _}), do: true
   defp compile_stage_bucket?({:internal, _}), do: true
+  defp compile_stage_bucket?({:example_conflict, _}), do: true
   defp compile_stage_bucket?(_), do: false
-
-  defp python_bucket?(:python_syntax_error), do: true
-  defp python_bucket?(:python_import_error), do: true
-  defp python_bucket?({:python_error, _}), do: true
-  defp python_bucket?(:python_timeout), do: true
-  defp python_bucket?(:nondeterministic_observed), do: true
-  defp python_bucket?(_), do: false
 
   defp derived_totals(acc) do
     counts = acc.counts
-
-    equivalent = (counts[:ok] || 0) + (counts[:ok_empty_output] || 0)
-
-    python_failed =
-      Enum.reduce(counts, 0, fn {key, n}, sum ->
-        if python_bucket?(key), do: sum + n, else: sum
-      end)
-
-    nondeterministic = counts[:nondeterministic_observed] || 0
-
-    %{
-      equivalent: equivalent,
-      python_failed: python_failed,
-      nondeterministic: nondeterministic
-    }
+    %{equivalent: (counts[:ok] || 0) + (counts[:ok_empty_output] || 0)}
   end
 
   defp format_pct(_n, 0), do: "0.0"
@@ -212,7 +162,6 @@ defmodule Eval.Report do
         bucket_key == :ok -> :ok
         bucket_key == :ok_empty_output -> :ok
         match?({:output_mismatch, _}, bucket_key) -> :ok
-        match?({:python_disagrees_expected, _}, bucket_key) -> :ok
         true -> write_bucket_entries(failures_root, bucket_key, entries)
       end
     end)
@@ -236,8 +185,7 @@ defmodule Eval.Report do
   defp write_mismatch_samples(run_dir, acc) do
     mismatch_buckets =
       Enum.filter(acc.samples, fn {key, entries} ->
-        entries != [] and
-          (match?({:output_mismatch, _}, key) or match?({:python_disagrees_expected, _}, key))
+        entries != [] and match?({:output_mismatch, _}, key)
       end)
 
     if mismatch_buckets != [] do
@@ -260,7 +208,6 @@ defmodule Eval.Report do
   end
 
   defp bucket_fingerprint({:output_mismatch, fp}), do: fp
-  defp bucket_fingerprint({:python_disagrees_expected, fp}), do: fp
 
   defp write_mismatch_entry(dir, padded, bucket_key, entry) do
     File.write!(Path.join(dir, "#{padded}.py"), entry.source)
@@ -295,11 +242,6 @@ defmodule Eval.Report do
     File.write!(Path.join(dir, "#{base}.stdin.txt"), meta[:stdin] || "")
     File.write!(Path.join(dir, "#{base}.expected.txt"), meta[:expected] || "")
 
-    case meta[:python_stdout] do
-      nil -> :ok
-      stdout -> File.write!(Path.join(dir, "#{base}.python.txt"), stdout)
-    end
-
     case meta[:elixir_stdout] do
       nil -> :ok
       stdout -> File.write!(Path.join(dir, "#{base}.elixir.txt"), stdout)
@@ -314,10 +256,8 @@ defmodule Eval.Report do
   defp tc_meta({:ok, m}), do: m
   defp tc_meta({:ok_empty, m}), do: m
   defp tc_meta({:output_mismatch, _, m}), do: m
-  defp tc_meta({:python_disagrees_expected, _, m}), do: m
   defp tc_meta({:elixir_runtime_error, _, m}), do: m
   defp tc_meta({:elixir_timeout, m}), do: m
-  defp tc_meta({:python_failed, _, m}), do: m
 
   defp build_testcase_summary(bucket_key, entry, per_tc) do
     rows =
@@ -344,16 +284,10 @@ defmodule Eval.Report do
   defp tc_label({:ok_empty, _}), do: ":ok_empty"
   defp tc_label({:output_mismatch, fp, _}), do: "{:output_mismatch, #{inspect(fp)}}"
 
-  defp tc_label({:python_disagrees_expected, fp, _}),
-    do: "{:python_disagrees_expected, #{inspect(fp)}}"
-
   defp tc_label({:elixir_runtime_error, mod, _}),
     do: "{:elixir_runtime_error, #{inspect(mod)}}"
 
   defp tc_label({:elixir_timeout, _}), do: ":elixir_timeout"
-
-  defp tc_label({:python_failed, kind, _}),
-    do: "{:python_failed, #{inspect(kind)}}"
 
   defp sanitize_fp(fp) do
     fp
@@ -364,11 +298,10 @@ defmodule Eval.Report do
 
   # --- ok samples ------------------------------------------------------
   #
-  # `--save-ok N` populates `accumulator.samples[:ok]` (capped by N).
-  # For each entry, write the Python source and the generated Elixir
-  # side-by-side under `reports/<ts>/ok/`. Pair well with `mix
-  # eval.show` for one-off pretty-print. Skipped silently when no OK
-  # samples were collected (the default, since `--save-ok` defaults to 0).
+  # `--save-ok N` populates `accumulator.samples[:ok]` (capped by N). For
+  # each entry, write the Python source and the generated Elixir
+  # side-by-side under `reports/<ts>/ok/`. Skipped silently when no OK
+  # samples were collected (the default).
   defp write_ok_samples(run_dir, acc) do
     entries = Map.get(acc.samples, :ok, []) ++ Map.get(acc.samples, :ok_empty_output, [])
 
@@ -390,10 +323,6 @@ defmodule Eval.Report do
           src -> File.write!(ex_path, src)
         end
 
-        # Also write the first testcase's stdin/expected so reviewers
-        # can spot-check the `:ok` claim:
-        #   python3.14 reports/.../ok/001.py < ok/001.testcase_0.stdin.txt
-        #     | diff - ok/001.testcase_0.expected.txt
         write_ok_first_testcase(ok_dir, padded, entry)
       end)
     end
@@ -426,9 +355,9 @@ defmodule Eval.Report do
   end
 
   defp build_sample_file(bucket_key, entry) do
-    # Comment-prefix every line of the inspect so multi-line metadata
-    # stays as valid Python (the failure-sample file is meant to be
-    # re-runnable through CPython / Pylixir without manual editing).
+    # Comment-prefix every line of the inspect so multi-line metadata stays
+    # valid Python (the failure-sample file is meant to be re-runnable
+    # through CPython / Pylixir without manual editing).
     metadata_lines =
       entry.metadata
       |> inspect(pretty: true, limit: :infinity)

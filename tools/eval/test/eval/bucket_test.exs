@@ -49,7 +49,7 @@ defmodule Eval.BucketTest do
     end
   end
 
-  describe "executed_testcases — worst-of aggregation" do
+  describe "executed_testcases — worst-of aggregation (2-way)" do
     test "all-:ok per-testcases produce :ok bucket" do
       per_tc = [{:ok, %{}}, {:ok, %{}}]
 
@@ -71,13 +71,12 @@ defmodule Eval.BucketTest do
     test ":elixir_runtime_error beats everything below it" do
       per_tc = [
         {:ok, %{}},
-        {:python_disagrees_expected, "fp", %{}},
         {:output_mismatch, "fp2", %{}},
         {:elixir_runtime_error, RuntimeError, %{message: "boom"}}
       ]
 
       assert {{:elixir_runtime_error, RuntimeError}, meta} = classify_executed(per_tc)
-      assert meta.failing_index == 3
+      assert meta.failing_index == 2
       assert meta.message == "boom"
     end
 
@@ -91,76 +90,26 @@ defmodule Eval.BucketTest do
       assert meta.failing_index == 1
     end
 
-    test ":python_failed bucket wins over :output_mismatch" do
+    test ":output_mismatch beats :ok" do
       per_tc = [
-        {:output_mismatch, "fp", %{}},
-        {:python_failed, :timeout, %{}}
-      ]
-
-      assert {:python_timeout, meta} = classify_executed(per_tc)
-      assert meta.failing_index == 1
-    end
-
-    test ":output_mismatch beats :python_disagrees_expected" do
-      per_tc = [
-        {:python_disagrees_expected, "py_fp", %{}},
-        {:output_mismatch, "mm_fp", %{diff_summary: "boom"}}
+        {:ok, %{}},
+        {:output_mismatch, "mm_fp", %{diff_summary: "boom", expected: "1\n", elixir_stdout: "2\n"}}
       ]
 
       assert {{:output_mismatch, "mm_fp"}, meta} = classify_executed(per_tc)
       assert meta.diff_summary == "boom"
       assert meta.failing_index == 1
     end
-
-    test ":python_disagrees_expected beats :ok" do
-      per_tc = [
-        {:ok, %{}},
-        {:python_disagrees_expected, "py_fp", %{diff_summary: "py != expected"}}
-      ]
-
-      assert {{:python_disagrees_expected, "py_fp"}, meta} = classify_executed(per_tc)
-      assert meta.diff_summary == "py != expected"
-    end
-  end
-
-  describe "4-way truth table — bucket reachability" do
-    # The 4-way classification happens in `Eval.classify_4way/4` (the
-    # per-testcase callback). These tests assert that each of the four
-    # output shapes flows through to a unique sample-level bucket.
-
-    test "py ✓ ex ✓ → :ok" do
-      assert {:ok, _} = classify_executed([{:ok, %{}}])
-    end
-
-    test "py ✓ ex ✗ → {:output_mismatch, fp}" do
-      assert {{:output_mismatch, "fp"}, _} =
-               classify_executed([{:output_mismatch, "fp", %{}}])
-    end
-
-    test "py ✗ ex ✓ → {:python_disagrees_expected, fp}" do
-      assert {{:python_disagrees_expected, "fp"}, _} =
-               classify_executed([{:python_disagrees_expected, "fp", %{}}])
-    end
-
-    test "py ✗ ex ✗ → {:output_mismatch, fp} (ex-vs-py diff dominates)" do
-      # This case is the same shape as py-✓-ex-✗ at this layer because
-      # `Eval.classify_4way` already collapsed it to `:output_mismatch`
-      # before producing the per-tc tuple.
-      assert {{:output_mismatch, "fp"}, _} =
-               classify_executed([{:output_mismatch, "fp", %{}}])
-    end
   end
 
   describe "slug/1" do
-    test "produces filesystem-safe strings for new + old buckets" do
+    test "produces filesystem-safe strings" do
       assert Bucket.slug({:unsupported, "ClassDef"}) == "unsupported--ClassDef"
       assert Bucket.slug(:parse_error) == "parse_error"
       assert Bucket.slug({:compile_error, "weird /msg with spaces"}) =~ "compile_error--"
-
-      assert Bucket.slug({:python_disagrees_expected, "Hello World!"}) =~
-               "python_disagrees_expected--Hello_World_"
-
       assert Bucket.slug({:output_mismatch, "foo bar"}) =~ "output_mismatch--foo_bar"
+      assert Bucket.slug({:elixir_runtime_error, RuntimeError}) =~ "elixir_runtime_error--"
+      assert Bucket.slug(:elixir_timeout) == "elixir_timeout"
     end
   end
 

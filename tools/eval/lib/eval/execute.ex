@@ -1,16 +1,7 @@
 defmodule Eval.Execute do
   @moduledoc """
-  Execute a Python source via the CPython binary, execute the
-  transpiled Elixir's `py_main/0`, and compare their stdout.
-
-  ## Python execution
-
-  Spawns `python3` (resolved via `PYLIXIR_PYTHON`, default `python3`)
-  through `sh -c`. Stdin is redirected either from a per-call `.stdin`
-  tmp file (when `:stdin` is supplied) or from `/dev/null`. On timeout
-  the direct child PID is SIGKILL'd. Process descendants spawned by
-  the sample (rare in this corpus) may briefly leak before BEAM exit
-  reaps them.
+  Execute the transpiled Elixir's `py_main/0` and compare its stdout to
+  the dataset's verified `expected`.
 
   ## Elixir execution
 
@@ -20,34 +11,22 @@ defmodule Eval.Execute do
   `py_stdin_readline/0`) consume it. `Task.yield/2` enforces the
   wall-clock budget; `Task.shutdown(:brutal_kill)` aborts a hung run.
   The `{:pylixir_exit, code}` throw used by Pylixir's translated
-  `sys.exit()` codegen (see `lib/pylixir/converter.ex:3038-3041`) is
-  caught and treated as a clean exit.
+  `sys.exit()` codegen is caught and treated as a clean exit.
 
   ## Output comparison
 
-  Two flavours:
+  `compare/2` normalizes both sides with **exactly** the dataset's
+  canonical normalizer (`tools/dataset` `Dataset.Normalize`) before
+  byte-comparing — because the shipped `expected` was produced by that
+  normalizer. The rule: decode UTF-8 (latin-1 fallback) → `CRLF→LF` →
+  strip per-line trailing `[ \\t]` → drop trailing blank lines + final
+  newline; **leading and internal spacing is preserved**, so genuinely
+  different output still differs. Mismatches carry a first-divergent-line
+  fingerprint plus a human-readable summary saved to the report.
 
-    * `compare_outputs/2` — strict byte-equal after `\\r\\n → \\n`
-      normalization. Used for the Python ⟷ Elixir leg.
-    * `compare_lenient/2` — additionally trims trailing newlines. Used
-      for the Python ⟷ dataset-`expected` leg (dataset noise tolerated).
-
-  Mismatches carry a first-divergent-line fingerprint plus a
-  human-readable summary string saved to the report.
+  Python is no longer executed here for comparison — the dataset's
+  `expected` is the verified, deterministic CPython output.
   """
-
-  # `Port.open(... env: ...)` requires charlists, not binaries, on the
-  # current Erlang/OTP. Binary values raise `ArgumentError: invalid
-  # option in list`.
-  @python_env [
-    {~c"PYTHONHASHSEED", ~c"0"},
-    {~c"PYTHONWARNINGS", ~c"ignore"}
-  ]
-
-  @type python_result ::
-          {:ok, stdout :: binary()}
-          | {:exit, status :: non_neg_integer(), output :: binary()}
-          | :timeout
 
   @type elixir_result ::
           {:ok, stdout :: binary()}
@@ -62,51 +41,16 @@ defmodule Eval.Execute do
   # --- Public API ------------------------------------------------------
 
   @doc """
-  Run `source` under CPython with PYTHONHASHSEED=0. Returns
-  `{:ok, stdout}` on a 0 exit, `{:exit, status, output}` on a non-zero
-  exit (stdout+stderr combined), or `:timeout` if it exceeded
-  `:timeout_ms`.
-
-  ## Options
-
-    * `:timeout_ms` (required) — wall-clock budget.
-    * `:stdin` — string content to feed on stdin. Written to a sibling
-      `.stdin` tmp file and redirected via shell `< file`. Default is
-      to redirect `< /dev/null` (preserves the pre-testcase behaviour
-      for stdin-less corpora).
-  """
-  @spec run_python(String.t(), keyword()) :: python_result()
-  def run_python(source, opts) when is_binary(source) do
-    timeout_ms = Keyword.fetch!(opts, :timeout_ms)
-    stdin = Keyword.get(opts, :stdin)
-
-    tmp = tmp_path()
-    stdin_path = if stdin, do: tmp <> ".stdin", else: nil
-
-    try do
-      File.mkdir_p!(Path.dirname(tmp))
-      File.write!(tmp, source)
-      if stdin_path, do: File.write!(stdin_path, stdin)
-      do_run_python(tmp, stdin_path, timeout_ms)
-    after
-      File.rm(tmp)
-      if stdin_path, do: File.rm(stdin_path)
-    end
-  end
-
-  @doc """
-  Invoke `module.py_main()` and return its captured stdout. The
-  caller is responsible for ensuring the module is loaded and that
-  this is called from inside the `CompilePool` slot that owns its
-  alias (so the module isn't purged mid-run).
+  Invoke `module.py_main()` and return its captured stdout. The caller is
+  responsible for ensuring the module is loaded and that this is called
+  from inside the `CompilePool` slot that owns its alias (so the module
+  isn't purged mid-run).
 
   ## Options
 
     * `:stdin` — string fed to `module.py_main()` via
-      `ExUnit.CaptureIO.capture_io(stdin, fn -> ... end)`. The
-      runtime-helper stdin readers (`Pylixir.RuntimeHelpers.py_input/0`
-      et al) are GL-swap friendly, so concurrent workers don't bleed
-      input. When `nil` (default), no stdin is supplied.
+      `ExUnit.CaptureIO.capture_io(stdin, fn -> ... end)`. When `nil`
+      (default), no stdin is supplied.
   """
   @spec run_elixir(module(), pos_integer(), keyword()) :: elixir_result()
   def run_elixir(module, timeout_ms, opts \\ []) do
@@ -146,137 +90,53 @@ defmodule Eval.Execute do
   end
 
   @doc """
-  Strict comparison for the Python ⟷ Elixir leg. Two stdout strings
-  must be byte-equal after `\\r\\n → \\n` normalization. Returns
-  `:equal_empty` when both sides are empty (after trimming trailing
-  newlines), `:equal` otherwise on a match, or `{:differ, fingerprint,
-  summary}` on a mismatch.
+  Compare an actual stdout against the dataset's `expected`, both
+  normalized with the canonical normalizer (see moduledoc). Returns
+  `:equal_empty` when both sides normalize to empty, `:equal` on a match,
+  or `{:differ, fingerprint, summary}` on a mismatch.
   """
-  @spec compare_outputs(String.t(), String.t()) :: compare_result()
-  def compare_outputs(python_stdout, elixir_stdout) do
-    p = normalize(python_stdout)
-    e = normalize(elixir_stdout)
+  @spec compare(String.t(), String.t()) :: compare_result()
+  def compare(expected, actual) do
+    e = normalize(expected)
+    a = normalize(actual)
 
     cond do
-      p == e and empty?(p) -> :equal_empty
-      p == e -> :equal
-      true -> diff(p, e)
-    end
-  end
-
-  @doc """
-  Lenient comparison for the Python ⟷ dataset-`expected` leg. After
-  `\\r\\n → \\n` normalization, **all** trailing newlines are trimmed
-  from both sides before byte-comparing — the dataset's `outputs`
-  field carries inconsistent trailing whitespace that shouldn't drive
-  bucket assignment. Same return shape as `compare_outputs/2`.
-  """
-  @spec compare_lenient(String.t(), String.t()) :: compare_result()
-  def compare_lenient(actual, expected) do
-    a = lenient_normalize(actual)
-    e = lenient_normalize(expected)
-
-    cond do
-      a == e and a == "" -> :equal_empty
-      a == e -> :equal
+      e == a and a == "" -> :equal_empty
+      e == a -> :equal
       true -> diff(e, a)
     end
   end
 
-  # --- Internals -------------------------------------------------------
+  # --- Normalizer (verbatim copy of tools/dataset Dataset.Normalize) ---
 
-  defp do_run_python(tmp, stdin_path, timeout_ms) do
-    sh = find_executable!("sh")
-    py = python_cmd()
-
-    redirect = if stdin_path, do: sh_quote(stdin_path), else: "/dev/null"
-    cmd = "exec " <> sh_quote(py) <> " " <> sh_quote(tmp) <> " < " <> redirect
-
-    port =
-      Port.open(
-        {:spawn_executable, sh},
-        [
-          :binary,
-          :exit_status,
-          :stderr_to_stdout,
-          :hide,
-          args: ["-c", cmd],
-          env: @python_env
-        ]
-      )
-
-    drain_port(port, timeout_ms, [])
-  end
-
-  defp drain_port(port, timeout_ms, acc) do
-    receive do
-      {^port, {:data, data}} ->
-        drain_port(port, timeout_ms, [acc, data])
-
-      {^port, {:exit_status, 0}} ->
-        {:ok, IO.iodata_to_binary(acc)}
-
-      {^port, {:exit_status, status}} ->
-        {:exit, status, IO.iodata_to_binary(acc)}
-    after
-      timeout_ms ->
-        kill_port(port)
-        :timeout
-    end
-  end
-
-  defp kill_port(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, pid} ->
-        System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
-
-      _ ->
-        :ok
-    end
-
-    try do
-      Port.close(port)
-    rescue
-      ArgumentError -> :ok
-    end
-
-    drain_remaining_messages(port)
-  end
-
-  defp drain_remaining_messages(port) do
-    receive do
-      {^port, _} -> drain_remaining_messages(port)
-    after
-      50 -> :ok
-    end
-  end
-
-  defp python_cmd, do: System.get_env("PYLIXIR_PYTHON") || "python3"
-
-  defp tmp_path do
-    base = Path.expand("../../tmp", __DIR__)
-    unique = :erlang.unique_integer([:positive])
-    Path.join(base, "py_exec_#{System.system_time(:millisecond)}_#{unique}.py")
-  end
-
-  defp find_executable!(name) do
-    case System.find_executable(name) do
-      nil -> raise "executable not found on PATH: #{name}"
-      path -> path
-    end
-  end
-
-  defp sh_quote(s), do: "'" <> String.replace(s, "'", "'\\''") <> "'"
-
-  defp normalize(s), do: String.replace(s, "\r\n", "\n")
-
-  defp lenient_normalize(s) do
-    s
-    |> normalize()
+  @doc """
+  Canonical output normalizer — identical to the dataset's, so the
+  comparison sees `expected` and the Elixir stdout on the same footing.
+  """
+  @spec normalize(binary()) :: String.t()
+  def normalize(bin) when is_binary(bin) do
+    bin
+    |> to_utf8()
+    |> String.replace("\r\n", "\n")
+    |> String.split("\n")
+    |> Enum.map(&rstrip_spaces_tabs/1)
+    |> Enum.join("\n")
     |> String.trim_trailing("\n")
   end
 
-  defp empty?(s), do: String.trim_trailing(s, "\n") == ""
+  # Valid UTF-8 passes through; otherwise reinterpret raw bytes as latin-1
+  # (every byte → a codepoint), which always yields valid UTF-8.
+  defp to_utf8(bin) do
+    if String.valid?(bin) do
+      bin
+    else
+      :unicode.characters_to_binary(bin, :latin1)
+    end
+  end
+
+  defp rstrip_spaces_tabs(line), do: String.replace(line, ~r/[ \t]+$/, "")
+
+  # --- Diff / fingerprint ----------------------------------------------
 
   defp diff(expected, actual) do
     exp_lines = String.split(expected, "\n")

@@ -237,4 +237,47 @@ defmodule Pylixir.Nodes.BinOpTest do
       assert_in_delta value, 2.0, 1.0e-9
     end
   end
+
+  describe "end-to-end — bitwise ops coerce booleans (Python bool is int)" do
+    # Python treats `bool` as `int` in `& | ^` just as in arithmetic
+    # (`True ^ 1 == 0`). The bitwise helpers must coerce booleans the way
+    # `py_add` does, instead of handing `true`/`false` to `Bitwise.*`
+    # (which raises ArithmeticError).
+    test "BitXor: True ^ 1 == 0" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("BitXor", const(true), const(1))))
+
+      assert value == 0
+    end
+
+    test "BitXor: False ^ 1 == 1" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("BitXor", const(false), const(1))))
+
+      assert value == 1
+    end
+
+    test "BitAnd: True & 3 == 1" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("BitAnd", const(true), const(3))))
+
+      assert value == 1
+    end
+
+    test "BitOr: False | 5 == 5" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(module_with(binop("BitOr", const(false), const(5))))
+
+      assert value == 5
+    end
+
+    test "BitXor: True ^ False == 1 (both operands boolean)" do
+      {_, value, _, _} =
+        TranspileHelpers.transpile_and_run(
+          module_with(binop("BitXor", const(true), const(false)))
+        )
+
+      assert value == 1
+    end
+  end
 end

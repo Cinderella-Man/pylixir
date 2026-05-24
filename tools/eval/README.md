@@ -1,10 +1,10 @@
 # pylixir-eval
 
-Maintainer-only harness that runs Pylixir against a large Python corpus
-(`microsoft/rStar-Coder`), transpiles each sample to Elixir,
-executes both under their respective runtimes, and buckets the diffs so
-the next failure to fix is obvious. Sibling Mix project — kept out of the
-published `pylixir` Hex package so it doesn't drag in HTTP / dataset deps.
+Maintainer-only harness that runs Pylixir against a curated, verified
+Python corpus, transpiles each sample to Elixir, runs it, and buckets the
+diffs against the dataset's verified output so the next failure to fix is
+obvious. Sibling Mix project — kept out of the published `pylixir` Hex
+package so it doesn't drag in HTTP / dataset deps.
 
 Run from `tools/eval/`:
 
@@ -25,50 +25,51 @@ mix eval.diag  path/to/file.py   # recover dropped `Code.compile_quoted/1` diagn
   id: "seed_20188--1885810c",
   source: "n = int(input())\nprint(n * 2)\n",
   testcases: [
-    %{stdin: "3\n", expected: "6\n"},
-    %{stdin: "10\n", expected: "20\n"}
+    %{stdin: "3\n", expected: "6"},
+    %{stdin: "10\n", expected: "20"}
   ]
 }
 ```
 
-`Eval.Corpus.build/1` produces these by joining the `seed_sft` (source)
-and `seed_testcase` (stdin/expected output) parquet shards under
-`cache/parquet/`. First run streams from HuggingFace; subsequent runs
-serve from disk.
+`Eval.Corpus.build/1` streams these straight from the curated dataset
+[`CinderellaMan/rstar-coder-verified-io-deduped`](https://huggingface.co/datasets/CinderellaMan/rstar-coder-verified-io-deduped)
+— one `data.parquet` whose rows are already joined, deduped, and verified
+(`expected` is the deterministic, normalized CPython output). First run
+downloads it to `cache/data.parquet`; subsequent runs read from disk
+(delete the file to refresh).
 
 **Tests aren't unit tests against Pylixir — they're data-in / data-out.**
 Per sample, per testcase, the harness runs:
 
-1. CPython on `source` with `stdin`, cached by `sha256(source <> "\0" <> stdin)`.
-2. Transpile `source` → Elixir, compile, invoke `py_main` with the same stdin.
-3. Compare three strings — `expected`, `python_stdout`, `elixir_stdout` —
-   with a 4-way truth table (see `Eval`'s module doc). The worst per-testcase
+1. Transpile `source` → Elixir, compile, invoke `py_main` with `stdin`.
+2. Compare the Elixir stdout to the dataset's `expected` under the
+   canonical normalizer (`Eval.Execute.compare/2`). The worst per-testcase
    outcome becomes the sample's bucket.
+
+(CPython is run only to capture trace envelopes for example-guided
+transpilation, cached in `cache/python_traces.jsonl`.)
 
 Bucket keys look like `:ok`, `{:unsupported, "Call"}`,
 `{:output_mismatch, "1"}`, `{:elixir_runtime_error, MatchError}`,
-`:elixir_timeout`, `:python_timeout`, etc. Full ladder is in
-`lib/eval/bucket.ex`.
+`:elixir_timeout`, etc. Full ladder is in `lib/eval/bucket.ex`.
 
 ## Outputs
 
 ```
 cache/
-  parquet/seed_sft/…             # HF dataset shards (streamed lazily)
-  parquet/seed_testcase/…
-  python.jsonl                   # cached CPython outcomes, keyed by sha
-  corpus_v1.term.gz              # serialized joined corpus
+  data.parquet                   # curated dataset (downloaded once; rm to refresh)
+  python_traces.jsonl            # cached CPython tracer envelopes (example inference)
 
 reports/run-<ISO8601>/
   summary.md                     # human bucket table + headline metrics
-  summary.json                   # same numbers, machine-readable (diffable run-to-run)
+  summary.json                   # same numbers, machine-readable (schema_version 4)
   failures/<bucket-slug>/NNN.py  # first K samples per failing transpile/compile bucket,
                                  # with `# sample id:`, `# bucket:`, `# metadata:` header
   mismatches/<fingerprint>/      # one dir per output-mismatch fingerprint, each containing
     NNN.py                       #   the Python source
     NNN.ex                       #   the Elixir Pylixir emitted
     NNN.summary.md               #   per-testcase outcome table
-    NNN.testcase_<i>.{stdin,expected,python,elixir,diff}.txt
+    NNN.testcase_<i>.{stdin,expected,elixir,diff}.txt
   ok/                            # only when --save-ok N: N (.py, .ex) before/after pairs
 
 baselines/*.csv                  # hand-curated reference numbers for regression checks

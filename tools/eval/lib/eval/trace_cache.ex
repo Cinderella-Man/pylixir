@@ -1,9 +1,8 @@
 defmodule Eval.TraceCache do
   @moduledoc """
-  Side-car cache of CPython tracer envelopes (docs/09 step 8.1). Keyed
-  by the same SHA256 as `Eval.PythonCache` (i.e., `sha256(source <>
-  "\\0" <> stdin)`) so a lookup can be paired with the stdout entry in
-  `python.jsonl` without re-running CPython.
+  Side-car cache of CPython tracer envelopes (docs/09 step 8.1). Keyed by
+  `key/2` = `sha256(source <> "\\0" <> stdin)`, so a `(source, stdin)`
+  pair maps to its trace envelope without re-running the tracer.
 
   ## Storage
 
@@ -42,6 +41,13 @@ defmodule Eval.TraceCache do
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: @name)
+  end
+
+  @doc "Cache key for a `(source, stdin)` pair: `sha256(source <> 0 <> stdin)`."
+  @spec key(String.t(), String.t()) :: sha()
+  def key(source, stdin) when is_binary(source) and is_binary(stdin) do
+    :crypto.hash(:sha256, source <> <<0>> <> stdin)
+    |> Base.encode16(case: :lower)
   end
 
   @spec lookup(sha()) :: {:hit, envelope()} | :miss

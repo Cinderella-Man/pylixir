@@ -1,64 +1,45 @@
 defmodule Mix.Tasks.Eval.Run do
-  @shortdoc "Run Pylixir against seed_sft + seed_testcase and write a report"
+  @shortdoc "Run Pylixir against the curated dataset and write a report"
 
   @moduledoc """
-  Build the joined `seed_sft` + `seed_testcase` corpus, run each
-  passing solution against its full testcase set under CPython and
-  Pylixir, classify per-testcase outcomes (4-way truth table) and roll
-  up to a per-sample bucket, then write a report under
-  `reports/run-<ISO8601>/`.
+  Stream the curated `data.parquet` corpus (see `Eval.Dataset` /
+  `Eval.Corpus`), transpile each solution to Elixir, run it per testcase,
+  classify each per-testcase outcome (2-way: Elixir stdout vs the
+  dataset's verified `expected`) and roll up to a per-sample bucket, then
+  write a report under `reports/run-<ISO8601>/`.
 
   ## Usage
 
       mix eval.run [--limit N] [--skip N] [--concurrency K]
                    [--samples-per-bucket K] [--save-ok N]
-                   [--testcase-shards K]
                    [--python-timeout MS] [--elixir-timeout MS]
-                   [--no-python-cache] [--rebuild-python-cache]
+                   [--no-examples] [--max-examples N]
                    [--out DIR]
 
-  ## Behavioral equivalence
+  ## Behaviour
 
-  Each sample comes from `seed_sft` (Python solutions with
-  `is_passed=True`) joined with its testcases from `seed_testcase` by
-  `question_id`. For every `(source, stdin)` pair, the harness runs
-  CPython (twice on first sight, for a determinism check) and caches
-  the stdout in `cache/python.jsonl` (content-addressed by
-  `sha256(source <> "\\0" <> stdin)`). Warm-cache runs skip CPython.
+  Each sample is a row of the curated dataset: a Python `source` and its
+  `testcases` (`stdin` + the verified, normalized `expected`). The
+  transpiled Elixir's `py_main/0` is invoked with each `stdin` and its
+  stdout is compared to `expected` under the canonical normalizer
+  (`Eval.Execute.compare/2`); a mismatch is an `:output_mismatch` (a
+  Pylixir bug). The sample's bucket is the worst-of across its testcases
+  (see `Eval.Bucket`).
 
-  The transpiled Elixir's `py_main/0` is then invoked with the same
-  stdin and its stdout is compared:
-
-    * Python ⟷ dataset `expected` — lenient (trailing-newline tolerant).
-    * Elixir ⟷ Python — strict (byte-equal modulo CRLF).
-
-  The per-testcase outcome lands in a 4-way classification (see
-  `Eval.Bucket`); the sample's bucket is the worst-of across its
-  testcase set.
+  CPython is invoked only to capture trace envelopes for example-guided
+  transpilation, cached in `cache/python_traces.jsonl` (`Eval.TraceCache`);
+  `--python-timeout` is that tracer's wall-clock budget.
 
   ## Examples
 
-      # Smoke test on 5 samples
-      mix eval.run --limit 5
-
-      # Full pass with a custom concurrency cap
+      mix eval.run --limit 5                 # smoke test
       mix eval.run --limit 10000 --concurrency 12
-
-      # Load 3 seed_testcase shards (≈ 4.5 GB resident map)
-      mix eval.run --limit 200 --testcase-shards 3
-
-      # Skip the first 1000 samples (resume / jump ahead)
-      mix eval.run --skip 1000 --limit 500
+      mix eval.run --skip 1000 --limit 500   # resume / jump ahead
 
   ## Caching
 
-  Parquet shards land in `cache/parquet/<config>/`. The joined corpus
-  is memoised at `cache/corpus_v1.term.gz`; invalidated automatically
-  if `--testcase-shards K` changes or any parquet shard is refreshed.
-
-  Python preflight results are cached at `cache/python.jsonl`.
-  `--no-python-cache` bypasses; `--rebuild-python-cache` truncates and
-  rewrites.
+  The dataset is downloaded once to `cache/data.parquet` (delete it to
+  refresh). Tracer envelopes are cached at `cache/python_traces.jsonl`.
   """
 
   use Mix.Task
@@ -69,19 +50,15 @@ defmodule Mix.Tasks.Eval.Run do
     concurrency: :integer,
     samples_per_bucket: :integer,
     save_ok: :integer,
-    testcase_shards: :integer,
     python_timeout: :integer,
     elixir_timeout: :integer,
-    no_python_cache: :boolean,
-    rebuild_python_cache: :boolean,
     no_examples: :boolean,
     max_examples: :integer,
     out: :string
   ]
 
-  @default_python_timeout_ms 3_000
-  @default_elixir_timeout_ms 5_000
-  @default_testcase_shards 1
+  @default_python_timeout_ms 10_000
+  @default_elixir_timeout_ms 10_000
 
   @impl true
   def run(argv) do
@@ -89,35 +66,24 @@ defmodule Mix.Tasks.Eval.Run do
 
     Mix.Task.run("app.start")
 
-    # `ExUnit.CaptureIO` lives in `:ex_unit`. Starting the app does
-    # NOT boot the test runner — `ExUnit.start/1` does. We only need
-    # the module loadable from `Eval.Execute.run_elixir/3`.
+    # `ExUnit.CaptureIO` lives in `:ex_unit`; we need the module loadable
+    # from `Eval.Execute.run_elixir/3`.
     Application.ensure_all_started(:ex_unit)
 
     concurrency = opts[:concurrency] || System.schedulers_online() * 2
 
-    # Suppress Python warnings (e.g. `SyntaxWarning: invalid escape
-    # sequence`) from `Pylixir.python_ast/1`'s `python3` subprocess.
-    # They leak through `System.cmd(..., stderr_to_stdout: false)` to
-    # this task's terminal, can't be acted on, and aren't recorded in
-    # the per-sample bucket — pure noise during a 10k-sample run.
-    # `PYTHONWARNINGS` propagates to every child python process.
+    # Suppress Python warnings from the tracer's `python3` subprocess —
+    # pure noise during a large run.
     System.put_env("PYTHONWARNINGS", "ignore")
 
     # CompilePool slot is held for compile + Σ(testcase Elixir runs) +
-    # purge. Sizing to `concurrency` keeps Task.async_stream workers
-    # from blocking on slot checkout.
+    # purge. Sizing to `concurrency` keeps workers from blocking on slot
+    # checkout.
     Eval.CompilePool.ensure_started(size: concurrency)
-
-    Eval.PythonCache.ensure_started(
-      path: default_python_cache_path(),
-      no_cache: opts[:no_python_cache] || false,
-      rebuild: opts[:rebuild_python_cache] || false
-    )
 
     Eval.TraceCache.ensure_started(
       path: default_trace_cache_path(),
-      no_cache: opts[:no_python_cache] || false
+      no_cache: opts[:no_examples] || false
     )
 
     eval_opts = [
@@ -126,7 +92,6 @@ defmodule Mix.Tasks.Eval.Run do
       concurrency: concurrency,
       samples_per_bucket: opts[:samples_per_bucket],
       save_ok: opts[:save_ok],
-      testcase_shards: opts[:testcase_shards] || @default_testcase_shards,
       python_timeout_ms: opts[:python_timeout] || @default_python_timeout_ms,
       elixir_timeout_ms: opts[:elixir_timeout] || @default_elixir_timeout_ms,
       no_examples: opts[:no_examples] || false,
@@ -138,16 +103,13 @@ defmodule Mix.Tasks.Eval.Run do
 
     accumulator = Eval.run(eval_opts)
 
-    run_dir = Eval.Report.write(accumulator, out: opts[:out], comparison_mode: :executed)
+    run_dir = Eval.Report.write(accumulator, out: opts[:out])
 
     IO.puts("")
     IO.puts("report: #{run_dir}")
     IO.puts("elapsed: #{format_elapsed(elapsed_ms(progress))}")
     print_top_buckets(accumulator)
   end
-
-  defp default_python_cache_path,
-    do: Path.join([File.cwd!(), "cache", "python.jsonl"])
 
   defp default_trace_cache_path,
     do: Path.join([File.cwd!(), "cache", "python_traces.jsonl"])
@@ -171,10 +133,6 @@ defmodule Mix.Tasks.Eval.Run do
   defp elapsed_ms({_ref, _limit, start}),
     do: System.monotonic_time(:millisecond) - start
 
-  # Format an elapsed-ms count as `Xm Ys` for runs ≥ 1 minute, `Y.Zs`
-  # for shorter runs. Sub-minute fractional precision helps when
-  # iterating on small `--limit` smoke tests; rounded seconds are
-  # plenty for the 10k-sample full-run case.
   defp format_elapsed(ms) when ms < 60_000,
     do: "#{:erlang.float_to_binary(ms / 1000, decimals: 1)}s"
 
@@ -209,10 +167,7 @@ defmodule Mix.Tasks.Eval.Run do
 
       %{run: tc_run, passed: tc_passed} = Map.get(tc_counts, key, %{run: 0, passed: 0})
 
-      tc_summary =
-        if tc_run == 0,
-          do: "—",
-          else: "#{tc_passed}/#{tc_run}"
+      tc_summary = if tc_run == 0, do: "—", else: "#{tc_passed}/#{tc_run}"
 
       IO.puts(
         "  #{String.pad_trailing(slug, 50)} #{String.pad_leading(Integer.to_string(n), 8)}  #{String.pad_leading(share <> "%", 5)}   #{tc_summary}"

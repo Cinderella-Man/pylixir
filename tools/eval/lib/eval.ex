@@ -2,10 +2,10 @@ defmodule Eval do
   @moduledoc """
   Orchestrates the dataset evaluation pipeline:
 
-      Eval.Corpus.build/1                          # joined seed_sft + seed_testcase
+      Eval.Corpus.build/1                          # curated data.parquet stream
         ↳ Task.async_stream(&attempt/2)
             ↳ Pylixir.transpile  →  Compile.check_and_execute_testcases
-                ↳ per testcase: Python preflight (cached) + Elixir run + 4-way classify
+                ↳ per testcase: Elixir run + 2-way classify vs `expected`
             ↳ Eval.Bucket.classify/2 (worst-of rollup)
                 ↳ accumulator that holds counts + first K samples per bucket
 
@@ -13,41 +13,35 @@ defmodule Eval do
 
   ## Per-testcase semantics
 
-  Each sample carries a list of `%{stdin, expected}` testcases drawn
-  from `seed_testcase`. For each testcase, we run CPython with that
-  stdin (cached by `sha256(source <> \"\\0\" <> stdin)`) and compare:
+  Each sample carries a list of `%{stdin, expected}` testcases. `expected`
+  is the dataset's **verified, deterministic, normalized CPython output**,
+  so there is no Python to run for ground truth — we compare the Elixir
+  `py_main/0` stdout directly against `expected` under the canonical
+  normalizer (`Eval.Execute.compare/2`):
 
-    * Python actual ⟷ dataset expected — lenient (trailing-newline
-      tolerant). A mismatch flags the *sample*, not Pylixir.
-    * Elixir actual ⟷ Python actual — strict (byte-equal modulo CRLF).
-      A mismatch flags Pylixir.
+    * equal → `:ok` / `:ok_empty`
+    * differ → `:output_mismatch` (a Pylixir bug)
+
+  CPython is still invoked once per example (cached in `Eval.TraceCache`)
+  to capture the trace envelope that guides `Pylixir.transpile/2`.
 
   Per-sample bucket is the worst-of across all testcases. See
   `Eval.Bucket` for the severity ladder and bucket keys.
   """
 
-  alias Eval.{Bucket, Compile, Corpus, Execute, PythonCache, TraceCache}
+  alias Eval.{Bucket, Compile, Corpus, Execute, TraceCache}
 
   @type accumulator :: %{
           counts: %{Bucket.bucket_key() => non_neg_integer()},
-          # Per-bucket sub-counts: how many testcases were observed for
-          # samples that landed in this bucket, and how many of those
-          # testcases passed. Lets the run summary show e.g.
-          # `ok: 58 samples / 1247 testcases passed` instead of forcing
-          # the reader to divide the global totals manually.
           testcase_counts: %{
-            Bucket.bucket_key() => %{
-              run: non_neg_integer(),
-              passed: non_neg_integer()
-            }
+            Bucket.bucket_key() => %{run: non_neg_integer(), passed: non_neg_integer()}
           },
           samples: %{Bucket.bucket_key() => [sample_entry()]},
           totals: %{
             processed: non_neg_integer(),
             transpiled: non_neg_integer(),
             testcases_run: non_neg_integer(),
-            testcases_passed: non_neg_integer(),
-            testcase_shard_missing: non_neg_integer()
+            testcases_passed: non_neg_integer()
           }
         }
 
@@ -59,53 +53,39 @@ defmodule Eval do
           | {:concurrency, pos_integer()}
           | {:samples_per_bucket, pos_integer()}
           | {:save_ok, non_neg_integer()}
-          | {:testcase_shards, pos_integer()}
           | {:python_timeout_ms, pos_integer()}
           | {:elixir_timeout_ms, pos_integer()}
           | {:on_sample, (map() -> any())}
           | {:samples, Enumerable.t()}
-          | {:corpus_stats, map()}
           | {:no_examples, boolean()}
           | {:max_examples, pos_integer()}
         ]
 
-  # Dropped from 2× — at 2× schedulers, the `seed_13048`-shape pvec
-  # hot loops compete for cores hard enough that their per-process
-  # wall time can balloon past the elixir timeout under any external
-  # CPU contention (editor, browser, concurrent `mix test`). 1× keeps
-  # each scheduler fed without oversubscription. Trade-off: eval runs
-  # take ~2× wall time, acceptable for a maintainer-only harness.
+  # See the original note: 1× schedulers keeps each fed without
+  # oversubscription; eval runs take ~2× wall time, acceptable here.
   @default_concurrency_multiplier 1
   @default_samples_per_bucket 10
+  # The tracer (example inference) budget — CPython's only remaining role.
   @default_python_timeout_ms 10_000
-  # Bumped from 10s — `seed_13048`-shape pvec hot loops sit at
-  # ~1.8s single-process, which even at 1×-schedulers can tip over
-  # 10s under external CPU contention. 30s absorbs the noise while
-  # still flagging genuine algorithmic regressions.
   @default_elixir_timeout_ms 30_000
 
   @spec run(opts()) :: accumulator()
   def run(opts \\ []) do
-    {enumerable, corpus_stats} =
+    enumerable =
       case Keyword.fetch(opts, :samples) do
-        {:ok, samples} ->
-          {samples, Keyword.get(opts, :corpus_stats, %{})}
-
-        :error ->
-          testcase_shards = Keyword.get(opts, :testcase_shards, 1)
-          Corpus.build(testcase_shards: testcase_shards)
+        {:ok, samples} -> samples
+        :error -> Corpus.build()
       end
 
-    enumerable = apply_limit_skip(enumerable, opts)
-    process(enumerable, Keyword.put(opts, :corpus_stats, corpus_stats))
+    enumerable
+    |> apply_limit_skip(opts)
+    |> process(opts)
   end
 
   @doc """
   Run the classification pipeline against any enumerable of corpus
-  records (`%{id: _, source: _, testcases: _}`).
-
-  Exposed so tests can drive the harness without booting the real
-  corpus build.
+  records (`%{id: _, source: _, testcases: _}`). Exposed so tests can
+  drive the harness without booting the real corpus.
   """
   @spec process(Enumerable.t(), opts()) :: accumulator()
   def process(enumerable, opts \\ []) do
@@ -113,13 +93,11 @@ defmodule Eval do
       opts[:concurrency] || System.schedulers_online() * @default_concurrency_multiplier
 
     samples_per_bucket = opts[:samples_per_bucket] || @default_samples_per_bucket
-    # `--save-ok N` overrides the cap *only for the :ok bucket* — the
-    # showcase workflow wants more clean transpiles than failures.
+    # `--save-ok N` overrides the cap *only for the :ok bucket*.
     save_ok = opts[:save_ok] || 0
     on_sample = opts[:on_sample] || fn _ -> :ok end
     python_timeout = opts[:python_timeout_ms] || @default_python_timeout_ms
     elixir_timeout = opts[:elixir_timeout_ms] || @default_elixir_timeout_ms
-    corpus_stats = opts[:corpus_stats] || %{}
 
     attempt_opts = [
       python_timeout_ms: python_timeout,
@@ -136,8 +114,7 @@ defmodule Eval do
         processed: 0,
         transpiled: 0,
         testcases_run: 0,
-        testcases_passed: 0,
-        testcase_shard_missing: Map.get(corpus_stats, :testcase_shard_missing, 0)
+        testcases_passed: 0
       }
     }
 
@@ -148,12 +125,6 @@ defmodule Eval do
       ordered: false,
       timeout: :infinity
     )
-    # `on_sample` fires per *completed* job, not per record entering
-    # the pipeline. `Task.async_stream` pulls records eagerly to keep
-    # its worker pool full, so under low concurrency the input
-    # enumeration finishes long before the last few slow jobs do —
-    # ticking on input would show "100/100 processed" while five
-    # `seed_13048` workers are still grinding.
     |> Stream.each(on_sample)
     |> Enum.reduce(initial, fn
       {:ok, {sample, bucket_key, metadata}}, acc ->
@@ -188,20 +159,17 @@ defmodule Eval do
 
   defp run_attempt(source, testcases, opts) do
     elixir_timeout = Keyword.fetch!(opts, :elixir_timeout_ms)
-    python_timeout = Keyword.fetch!(opts, :python_timeout_ms)
-
-    # Pre-warm the python and trace caches in one pass so the library's
-    # transpile call can read trace_events from the cache instead of
-    # re-running the tracer per example (docs/09 step 8.1).
+    trace_timeout = Keyword.fetch!(opts, :python_timeout_ms)
     no_examples = Keyword.get(opts, :no_examples, false)
     max_examples = Keyword.get(opts, :max_examples, 3)
 
+    # Pre-warm the trace cache so the library's transpile call can read
+    # trace_events from the cache instead of re-running the tracer per
+    # example.
     unless no_examples do
       testcases
       |> Enum.take(max_examples)
-      |> Enum.each(fn %{stdin: stdin} ->
-        prewarm_caches(source, stdin, python_timeout)
-      end)
+      |> Enum.each(fn %{stdin: stdin} -> prewarm_trace(source, stdin, trace_timeout) end)
     end
 
     examples = examples_from_testcases(source, testcases, opts)
@@ -214,7 +182,7 @@ defmodule Eval do
           elixir_source,
           testcases,
           elixir_timeout,
-          fn module, tc -> testcase_outcome(module, tc, source, opts) end
+          fn module, tc -> testcase_outcome(module, tc, elixir_timeout) end
         )
 
       case result do
@@ -229,7 +197,7 @@ defmodule Eval do
     end
   end
 
-  # --- Per-testcase classification (4-way truth table) -----------------
+  # --- Per-testcase classification (2-way: Elixir vs expected) ---------
 
   defp examples_from_testcases(source, testcases, opts) do
     if Keyword.get(opts, :no_examples, false) do
@@ -240,316 +208,69 @@ defmodule Eval do
       testcases
       |> Enum.take(max)
       |> Enum.flat_map(fn %{stdin: stdin, expected: expected} ->
-        sha = PythonCache.key(source, stdin)
+        sha = TraceCache.key(source, stdin)
 
         case TraceCache.lookup(sha) do
           {:hit, envelope} ->
             [%{stdin: stdin, stdout: expected, trace_events: envelope}]
 
           :miss ->
-            # Cache miss after the pre-warm pass means the tracer
-            # failed (timeout / crash); drop this example so seed/4
-            # doesn't re-invoke the tracer pointlessly.
+            # Cache miss after the pre-warm pass means the tracer failed
+            # (timeout / crash); drop this example.
             []
         end
       end)
     end
   end
 
-  defp testcase_outcome(module, %{stdin: stdin, expected: expected}, source, opts) do
-    python_timeout = Keyword.fetch!(opts, :python_timeout_ms)
-    elixir_timeout = Keyword.fetch!(opts, :elixir_timeout_ms)
-
-    case python_outcome(source, stdin, python_timeout) do
-      {:python_ok, py_stdout} ->
-        run_elixir_and_classify(module, stdin, expected, py_stdout, elixir_timeout)
-
-      {:python_failed, kind, meta} ->
-        {:python_failed, kind, Map.merge(meta, %{stdin: stdin, expected: expected})}
-    end
-  end
-
-  defp run_elixir_and_classify(module, stdin, expected, py_stdout, elixir_timeout) do
+  defp testcase_outcome(module, %{stdin: stdin, expected: expected}, elixir_timeout) do
     case Execute.run_elixir(module, elixir_timeout, stdin: stdin) do
       {:ok, ex_stdout} ->
-        classify_4way(ex_stdout, py_stdout, expected, stdin)
+        classify_2way(ex_stdout, expected, stdin)
 
       {:raised, exception} ->
         {:elixir_runtime_error, exception_module(exception),
-         %{
-           message: exception_message(exception),
-           stdin: stdin,
-           expected: expected,
-           python_stdout: py_stdout
-         }}
+         %{message: exception_message(exception), stdin: stdin, expected: expected}}
 
       :timeout ->
-        {:elixir_timeout,
-         %{stdin: stdin, expected: expected, python_stdout: py_stdout}}
+        {:elixir_timeout, %{stdin: stdin, expected: expected}}
     end
   end
 
-  # 4-way truth table:
-  #   py == expected | ex == py | tc_outcome
-  #   ✓              | ✓        | :ok / :ok_empty
-  #   ✓              | ✗        | {:output_mismatch, fp, _}
-  #   ✗              | ✓        | {:python_disagrees_expected, fp, _}
-  #   ✗              | ✗        | {:output_mismatch, fp, _}  (ex-vs-py dominates)
-  defp classify_4way(ex_stdout, py_stdout, expected, stdin) do
-    py_vs_expected = Execute.compare_lenient(py_stdout, expected)
-    ex_vs_py = Execute.compare_outputs(py_stdout, ex_stdout)
+  defp classify_2way(ex_stdout, expected, stdin) do
+    base = %{stdin: stdin, expected: expected, elixir_stdout: ex_stdout}
 
-    base = %{
-      stdin: stdin,
-      expected: expected,
-      python_stdout: py_stdout,
-      elixir_stdout: ex_stdout
-    }
-
-    case {match_ok?(py_vs_expected), match_ok?(ex_vs_py)} do
-      {true, true} ->
-        if ex_vs_py == :equal_empty,
-          do: {:ok_empty, base},
-          else: {:ok, base}
-
-      {true, false} ->
-        {:differ, fp, summary} = ex_vs_py
-        {:output_mismatch, fp, Map.put(base, :diff_summary, summary)}
-
-      {false, true} ->
-        {:differ, fp, summary} = py_vs_expected
-        {:python_disagrees_expected, fp, Map.put(base, :diff_summary, summary)}
-
-      {false, false} ->
-        {:differ, fp, summary} = ex_vs_py
-        {:output_mismatch, fp, Map.put(base, :diff_summary, summary)}
+    case Execute.compare(expected, ex_stdout) do
+      :equal_empty -> {:ok_empty, base}
+      :equal -> {:ok, base}
+      {:differ, fp, summary} -> {:output_mismatch, fp, Map.put(base, :diff_summary, summary)}
     end
   end
 
-  defp match_ok?(:equal), do: true
-  defp match_ok?(:equal_empty), do: true
-  defp match_ok?({:differ, _, _}), do: false
+  # --- Trace prewarm (example inference; CPython's only role) ----------
 
-  # --- Python preflight (per (source, stdin)) --------------------------
+  # Populate `Eval.TraceCache` (trace envelope) for one `(source, stdin)`.
+  # The dataset's solutions are deterministic, so a single tracer run
+  # suffices — no determinism double-check. The example's stdout comes
+  # from the dataset's `expected`, not the tracer.
+  defp prewarm_trace(source, stdin, timeout_ms) do
+    sha = TraceCache.key(source, stdin)
 
-  defp python_outcome(source, stdin, timeout_ms) do
-    sha = PythonCache.key(source, stdin)
+    if TraceCache.lookup(sha) == :miss do
+      case Pylixir.ExampleInference.run_tracer_with_stdout(source, stdin,
+             trace_timeout_ms: timeout_ms
+           ) do
+        {:ok, {_tracer_stdout, envelope}} ->
+          TraceCache.put(sha, envelope)
 
-    case PythonCache.lookup(sha) do
-      {:hit, entry} ->
-        entry_to_outcome(entry)
-
-      :miss ->
-        # Pre-warm path may have already populated both caches; double
-        # check the python entry before paying for another CPython
-        # invocation.
-        prewarm_caches(source, stdin, timeout_ms)
-
-        case PythonCache.lookup(sha) do
-          {:hit, entry} -> entry_to_outcome(entry)
-          :miss -> entry_to_outcome(%{"outcome" => "nondeterministic"})
-        end
+        {:error, _reason} ->
+          # Cache a "tracer failed" marker so subsequent runs skip the
+          # retry. Treated as an empty trace downstream.
+          TraceCache.put(sha, %{"events" => [], "uncaught" => nil, "truncated" => false})
+      end
     end
-  end
 
-  # Populate `Eval.PythonCache` (stdout) and `Eval.TraceCache` (trace
-  # envelope) for one `(source, stdin)` pair. Folds the tracer run and
-  # CPython preflight into a single CPython invocation when the tracer
-  # succeeds; falls back to the two-CPython determinism check when the
-  # tracer crashes / times out.
-  #
-  # Side-car semantics (resolution 5): the `python.jsonl` cache may
-  # already have a hit (legacy stdout-only entry); in that case we
-  # still need to lazily populate `python_traces.jsonl`.
-  defp prewarm_caches(source, stdin, timeout_ms) do
-    sha = PythonCache.key(source, stdin)
-    python_hit? = PythonCache.lookup(sha) != :miss
-    trace_hit? = TraceCache.lookup(sha) != :miss
-
-    cond do
-      python_hit? and trace_hit? ->
-        :ok
-
-      python_hit? ->
-        # Stdout is cached; only the tracer needs to run.
-        case Pylixir.ExampleInference.run_tracer_with_stdout(source, stdin,
-               trace_timeout_ms: timeout_ms
-             ) do
-          {:ok, {_tracer_stdout, envelope}} ->
-            TraceCache.put(sha, envelope)
-
-          {:error, _reason} ->
-            # Cache a "tracer failed" marker so subsequent eval runs
-            # skip the retry. Treated as an empty trace downstream.
-            TraceCache.put(sha, %{"events" => [], "uncaught" => nil, "truncated" => false})
-        end
-
-      true ->
-        run_and_cache_both(source, stdin, timeout_ms, sha)
-    end
-  end
-
-  defp run_and_cache_both(source, stdin, timeout_ms, sha) do
-    case Pylixir.ExampleInference.run_tracer_with_stdout(source, stdin,
-           trace_timeout_ms: timeout_ms
-         ) do
-      {:ok, {tracer_stdout, envelope}} ->
-        # Confirm determinism via a second plain CPython run.
-        case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
-          {:ok, ^tracer_stdout} ->
-            PythonCache.put(sha, %{"outcome" => "ok", "stdout" => tracer_stdout})
-            TraceCache.put(sha, envelope)
-
-          {:ok, _other} ->
-            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
-
-          {:exit, _code, _output} ->
-            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
-
-          :timeout ->
-            PythonCache.put(sha, %{"outcome" => "nondeterministic"})
-        end
-
-      {:error, _reason} ->
-        entry = run_python_twice(source, stdin, timeout_ms)
-        PythonCache.put(sha, entry)
-    end
-  end
-
-  # Two consecutive Python runs determine whether the sample is
-  # deterministic. If both succeed with identical stdout → cache the
-  # stdout. Any divergence (different output, second-run failure
-  # after first-run success, etc.) becomes `:nondeterministic`. A
-  # first-run failure short-circuits without a second run.
-  defp run_python_twice(source, stdin, timeout_ms) do
-    case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
-      {:ok, stdout1} ->
-        case Execute.run_python(source, timeout_ms: timeout_ms, stdin: stdin) do
-          {:ok, ^stdout1} ->
-            %{"outcome" => "ok", "stdout" => stdout1}
-
-          {:ok, _other} ->
-            %{"outcome" => "nondeterministic"}
-
-          {:exit, _code, _output} ->
-            %{"outcome" => "nondeterministic"}
-
-          :timeout ->
-            %{"outcome" => "nondeterministic"}
-        end
-
-      {:exit, code, output} ->
-        {kind, extra} = parse_python_failure(output)
-
-        Map.merge(
-          %{
-            "outcome" => kind,
-            "exit_code" => code,
-            "stderr_tail" => last_chars(output, 1024)
-          },
-          extra
-        )
-
-      :timeout ->
-        %{"outcome" => "timeout"}
-    end
-  end
-
-  defp entry_to_outcome(%{"outcome" => "ok", "stdout" => stdout}),
-    do: {:python_ok, stdout}
-
-  defp entry_to_outcome(%{"outcome" => "syntax_error"} = e),
-    do: {:python_failed, :syntax_error, %{stderr_tail: e["stderr_tail"]}}
-
-  defp entry_to_outcome(%{"outcome" => "import_error"} = e),
-    do:
-      {:python_failed, :import_error,
-       %{missing_module: e["missing_module"], stderr_tail: e["stderr_tail"]}}
-
-  defp entry_to_outcome(%{"outcome" => "error"} = e),
-    do:
-      {:python_failed, {:error, e["exception_class"] || "Unknown"},
-       %{
-         exception_class: e["exception_class"],
-         exit_code: e["exit_code"],
-         stderr_tail: e["stderr_tail"]
-       }}
-
-  defp entry_to_outcome(%{"outcome" => "timeout"}),
-    do: {:python_failed, :timeout, %{}}
-
-  defp entry_to_outcome(%{"outcome" => "nondeterministic"}),
-    do: {:python_failed, :nondeterministic, %{}}
-
-  # Defensive: unknown / malformed cache entries fall through as
-  # `:error` so the run continues. Should be rare given the schema
-  # filter on cache load.
-  defp entry_to_outcome(_),
-    do: {:python_failed, {:error, "Unknown"}, %{exception_class: "Unknown"}}
-
-  # Parse the *last* non-empty line of a Python traceback to determine
-  # the exception class. Lines like `SyntaxError: invalid syntax` or
-  # `ModuleNotFoundError: No module named 'numpy'` are routed to
-  # dedicated buckets; everything else lands in `{:python_error, Class}`.
-  defp parse_python_failure(stderr) do
-    last_line =
-      stderr
-      |> String.split("\n", trim: true)
-      |> List.last()
-
-    case last_line do
-      nil ->
-        {"error", %{"exception_class" => "Unknown"}}
-
-      line ->
-        cond do
-          syntax_class?(line) ->
-            class = extract_class(line) || "SyntaxError"
-            {"syntax_error", %{"exception_class" => class}}
-
-          import_class?(line) ->
-            class = extract_class(line) || "ImportError"
-
-            {"import_error",
-             %{"exception_class" => class, "missing_module" => extract_missing_module(line)}}
-
-          true ->
-            class = extract_class(line) || "Unknown"
-            {"error", %{"exception_class" => class}}
-        end
-    end
-  end
-
-  defp syntax_class?(line) do
-    String.starts_with?(line, "SyntaxError:") or
-      String.starts_with?(line, "IndentationError:") or
-      String.starts_with?(line, "TabError:")
-  end
-
-  defp import_class?(line) do
-    String.starts_with?(line, "ImportError:") or
-      String.starts_with?(line, "ModuleNotFoundError:")
-  end
-
-  defp extract_class(line) do
-    case Regex.run(~r/^([A-Z][A-Za-z0-9_]*):/, line) do
-      [_, class] -> class
-      nil -> nil
-    end
-  end
-
-  defp extract_missing_module(line) do
-    case Regex.run(~r/No module named ['"]([^'"]+)['"]/, line) do
-      [_, mod] -> mod
-      nil -> nil
-    end
-  end
-
-  defp last_chars(s, n) when byte_size(s) <= n, do: s
-
-  defp last_chars(s, n) do
-    skip = byte_size(s) - n
-    binary_part(s, skip, n)
+    :ok
   end
 
   # --- Exception helpers -----------------------------------------------
@@ -563,9 +284,7 @@ defmodule Eval do
 
   # --- Accumulator helpers ---------------------------------------------
 
-  defp count_passed(per_tc) do
-    Enum.count(per_tc, &tc_passed?/1)
-  end
+  defp count_passed(per_tc), do: Enum.count(per_tc, &tc_passed?/1)
 
   defp tc_passed?({:ok, _}), do: true
   defp tc_passed?({:ok_empty, _}), do: true

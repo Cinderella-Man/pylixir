@@ -6,15 +6,15 @@ ExUnit.start()
 # without going through the Mix task entry point.
 Eval.CompilePool.ensure_started()
 
-# `Eval.process/2` always goes through the per-testcase Python path,
-# which calls `Eval.PythonCache.lookup/1`. Boot with an in-memory-only
-# cache (no_cache: true) on a unique tmp path so test runs don't bleed
-# state into each other or into the real cache file.
-Eval.PythonCache.ensure_started(
+# Trace envelopes (example inference) are cached in `Eval.TraceCache`.
+# Boot an in-memory-only cache (no_cache: true) so test runs don't bleed
+# state or touch the real cache file. (Tests that pass `no_examples: true`
+# never hit it; this keeps the example path available for the others.)
+Eval.TraceCache.ensure_started(
   path:
     Path.join(
       System.tmp_dir!(),
-      "pylixir_eval_test_python_cache_#{System.unique_integer([:positive])}.jsonl"
+      "pylixir_eval_test_trace_cache_#{System.unique_integer([:positive])}.jsonl"
     ),
   no_cache: true
 )

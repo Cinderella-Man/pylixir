@@ -1452,15 +1452,24 @@ defmodule Pylixir.RuntimeHelpers do
   # so dispatch at runtime. `MapSet` covers the set case; everything
   # else routes to `Bitwise.band/2` etc. (Erlang's BIFs raise loudly
   # on truly unsupported types — matching Python's TypeError shape.)
+  # Python's `bool` is an `int`, so `True ^ 1 == 0`, `True & 3 == 1`, etc.
+  # Coerce booleans to 1/0 before the Bitwise BIFs (which raise on
+  # non-integers) — mirroring `py_add`'s boolean handling.
   def py_band(%MapSet{} = a, %MapSet{} = b), do: MapSet.intersection(a, b)
+  def py_band(a, b) when is_boolean(a), do: py_band(py_bool_to_int(a), b)
+  def py_band(a, b) when is_boolean(b), do: py_band(a, py_bool_to_int(b))
   def py_band(a, b), do: Bitwise.band(a, b)
 
   def py_bor(%MapSet{} = a, %MapSet{} = b), do: MapSet.union(a, b)
+  def py_bor(a, b) when is_boolean(a), do: py_bor(py_bool_to_int(a), b)
+  def py_bor(a, b) when is_boolean(b), do: py_bor(a, py_bool_to_int(b))
   def py_bor(a, b), do: Bitwise.bor(a, b)
 
   def py_bxor(%MapSet{} = a, %MapSet{} = b),
     do: MapSet.union(MapSet.difference(a, b), MapSet.difference(b, a))
 
+  def py_bxor(a, b) when is_boolean(a), do: py_bxor(py_bool_to_int(a), b)
+  def py_bxor(a, b) when is_boolean(b), do: py_bxor(a, py_bool_to_int(b))
   def py_bxor(a, b), do: Bitwise.bxor(a, b)
 
   # === itertools.combinations ===
