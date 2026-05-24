@@ -18,10 +18,13 @@ defmodule Dataset.Dedup do
     * **≥ `:min_shared` shared stdins with zero disagreeing outputs**.
 
   The zero-disagreement requirement already excludes coincidental
-  trivial-input collisions, so — unlike the merge stage — there is no
-  fanout cap (the survivor set is small and 32-capped, so pair counting is
-  bounded). `min_shared: 2` is the curated default ("L2"); `1` is maximal;
-  `3` matches the merge rule.
+  trivial-input collisions. As in the merge stage, an stdin shared by more
+  than `@max_fanout` rows is skipped when enumerating pairs: an
+  ultra-common input (e.g. `""`) can't form a meaningful agreeing cluster
+  and would otherwise explode the pair count quadratically (the OOM at full
+  scale — per-row testcase capping does *not* bound this; per-stdin fanout
+  does). `min_shared: 2` is the curated default ("L2"); `1` is maximal; `3`
+  matches the merge rule.
 
   Per cluster the **representative** is the row with the most testcases
   (ties: shortest source, then `id`); the dropped rows' `member_qids` and
@@ -31,6 +34,13 @@ defmodule Dataset.Dedup do
   testcase payloads) so it stays memory-cheap regardless of dataset size;
   the build keeps the full rows on disk and re-reads only the survivors.
   """
+
+  # Skip an stdin shared by more rows than this when enumerating pairs:
+  # ultra-common inputs (e.g. "") would explode the pair count quadratically
+  # and can't form a meaningful agreeing cluster. Mirrors
+  # `Dataset.MergeGroups`'s cap (the post-selection survivor set is small,
+  # but a single trivial stdin can still be shared by thousands of rows).
+  @max_fanout 64
 
   @type fingerprint :: %{
           id: String.t(),
@@ -204,12 +214,24 @@ defmodule Dataset.Dedup do
     r = div(k, bands)
     coeffs = minhash_coeffs(k)
 
-    shingles = Map.new(sources_by_id, fn {id, src} -> {id, shingle_set(src, shingle_size)} end)
-    sigs = Map.new(shingles, fn {id, sh} -> {id, minhash_sig(sh, coeffs)} end)
+    # Build the 120-int signatures one source at a time: each source's shingle
+    # set (≈5× the source, expanded into a set of ints — the real memory hog)
+    # is consumed by `minhash_sig` and dropped before the next, so the shingle
+    # sets never all coexist. Signatures are ~1 KB each.
+    sigs = Map.new(sources_by_id, fn {id, src} -> {id, minhash_sig(shingle_set(src, shingle_size), coeffs)} end)
 
-    bands
-    |> lsh_pairs(sigs, r)
-    |> Enum.filter(fn {a, b} ->
+    pairs = lsh_pairs(bands, sigs, r)
+
+    # Exact-Jaccard verification, recomputing shingle sets only for the ids that
+    # actually appear in a candidate pair (a small subset of all sources) — so
+    # peak resident shingle memory is bounded by the candidate set, never N.
+    shingles =
+      pairs
+      |> Enum.flat_map(fn {a, b} -> [a, b] end)
+      |> MapSet.new()
+      |> Map.new(fn id -> {id, shingle_set(Map.fetch!(sources_by_id, id), shingle_size)} end)
+
+    Enum.filter(pairs, fn {a, b} ->
       jaccard(Map.fetch!(shingles, a), Map.fetch!(shingles, b)) >= min_jaccard
     end)
   end
@@ -274,9 +296,11 @@ defmodule Dataset.Dedup do
         end)
       end)
 
-    Enum.reduce(inv, {%{}, MapSet.new()}, fn
-      {_stdin, [_only]}, acc -> acc
-      {stdin, idxs}, acc -> tally(Enum.sort(idxs), stdin, fps, acc)
+    Enum.reduce(inv, {%{}, MapSet.new()}, fn {stdin, idxs}, acc ->
+      case length(idxs) do
+        n when n < 2 or n > @max_fanout -> acc
+        _ -> tally(Enum.sort(idxs), stdin, fps, acc)
+      end
     end)
   end
 

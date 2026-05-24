@@ -23,9 +23,16 @@ defmodule Dataset.PythonCache do
   """
 
   use GenServer
+  require Logger
 
   @name __MODULE__
   @table __MODULE__.Cache
+
+  # Skip cache lines larger than this on load. A single entry should be a
+  # verdict over one bounded output (capped at expected + ~1 MB by the
+  # producers); anything vastly larger is a pre-cap runaway-output artifact
+  # whose Jason.decode alone can take minutes and stall startup silently.
+  @max_entry_bytes 16 * 1024 * 1024
 
   @type sha :: String.t()
   @type entry :: %{required(String.t()) => any()}
@@ -130,17 +137,32 @@ defmodule Dataset.PythonCache do
 
   defp load_existing(path, current_pyver) do
     if File.exists?(path) do
-      path
-      |> File.stream!()
-      |> Enum.each(fn line ->
-        case Jason.decode(String.trim_trailing(line)) do
-          {:ok, %{"sha256" => sha, "python_version" => ^current_pyver} = entry} ->
-            :ets.insert(@table, {sha, entry})
+      Logger.info("[cache] loading #{path}")
 
-          _ ->
-            :ok
-        end
-      end)
+      {loaded, skipped} =
+        path
+        |> File.stream!()
+        |> Enum.reduce({0, 0}, fn line, {loaded, skipped} ->
+          # Guard on raw line size *before* decoding: a pathological multi-GB
+          # line (a pre-cap runaway output) would otherwise burn minutes in
+          # Jason.decode at startup. Skip it — the verdict will be recomputed.
+          if byte_size(line) > @max_entry_bytes do
+            {loaded, skipped + 1}
+          else
+            case Jason.decode(String.trim_trailing(line)) do
+              {:ok, %{"sha256" => sha, "python_version" => ^current_pyver} = entry} ->
+                :ets.insert(@table, {sha, entry})
+                next = loaded + 1
+                if rem(next, 50_000) == 0, do: Logger.info("[cache] #{next} entries loaded")
+                {next, skipped}
+
+              _ ->
+                {loaded, skipped}
+            end
+          end
+        end)
+
+      Logger.info("[cache] loaded #{loaded} entries#{if skipped > 0, do: " (skipped #{skipped} oversized)", else: ""}")
     end
   end
 end

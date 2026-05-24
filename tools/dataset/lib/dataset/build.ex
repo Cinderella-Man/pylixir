@@ -312,13 +312,28 @@ defmodule Dataset.Build do
     budget = Keyword.get(opts, :behavioral_load_budget, @behavioral_load_budget)
     {:ok, fd} = :file.open(results_path, [:read, :binary, :raw])
 
+    chunks = chunk_pairs_by_bytes(pairs, row_index, budget)
+    base_opts = behavioral_opts(opts)
+    total = length(pairs)
+
+    # One shared counter + total across all chunks, so the per-pair progress is
+    # global (`[behavioral] 5000/32600 pairs`) instead of restarting on each of
+    # the ~180 byte-budget chunks. Behavioral.edges suppresses its own header
+    # when handed a `:counter`.
+    counter = :counters.new(1, [:atomics])
+
+    Logger.info(
+      "[behavioral] checking #{total} candidate pairs across #{length(chunks)} chunks " <>
+        "(concurrency #{Keyword.fetch!(base_opts, :concurrency)})"
+    )
+
+    chunk_opts = Keyword.merge(base_opts, counter: counter, total: total)
+
     try do
-      pairs
-      |> chunk_pairs_by_bytes(row_index, budget)
-      |> Enum.flat_map(fn chunk ->
+      Enum.flat_map(chunks, fn chunk ->
         ids = chunk |> Enum.flat_map(fn {a, b} -> [a, b] end) |> MapSet.new()
         rows = load_rows_indexed(fd, row_index, ids)
-        Behavioral.edges(rows, chunk, behavioral_opts(opts))
+        Behavioral.edges(rows, chunk, chunk_opts)
       end)
     after
       :file.close(fd)

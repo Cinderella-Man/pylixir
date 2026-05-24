@@ -24,6 +24,14 @@ defmodule Dataset.Behavioral do
   alias Dataset.Verify
   require Logger
 
+  # Headroom over the compared `expected` for the per-testcase output cap
+  # (mirrors Dataset.Verify's @output_headroom). Any stdout larger than the
+  # expected output is already a mismatch, so capping here is semantically
+  # free — and it stops a solution that loops/prints unboundedly on a
+  # *foreign* stdin from accumulating GBs of output in memory (the source of
+  # the behavioral-stage OOM and the multi-GB cache entries that bloat it).
+  @output_headroom 1024 * 1024
+
   @doc """
   Behavioral edges among `pairs` (`[{id_a, id_b}]`), computed concurrently.
   `rows_by_id` maps id → `%{source, testcases}` (testcases as shipped:
@@ -39,9 +47,17 @@ defmodule Dataset.Behavioral do
           [{String.t(), String.t()}]
   def edges(rows_by_id, pairs, opts \\ []) do
     concurrency = Keyword.get(opts, :concurrency, System.schedulers_online())
-    total = length(pairs)
-    Logger.info("[behavioral] checking #{total} candidate pairs (concurrency #{concurrency})")
-    counter = :counters.new(1, [:atomics])
+
+    # Progress can be driven across many byte-budget chunks (see
+    # `Dataset.Build`): when the caller passes a shared `:counter` and `:total`,
+    # we report *global* progress and skip the per-chunk header. Called
+    # standalone (e.g. tests), it self-counts and logs its own header.
+    total = Keyword.get(opts, :total, length(pairs))
+    counter = Keyword.get_lazy(opts, :counter, fn -> :counters.new(1, [:atomics]) end)
+
+    unless Keyword.has_key?(opts, :counter) do
+      Logger.info("[behavioral] checking #{total} candidate pairs (concurrency #{concurrency})")
+    end
 
     pairs
     |> Task.async_stream(
@@ -52,7 +68,7 @@ defmodule Dataset.Behavioral do
             else: nil
 
         n = :counters.add(counter, 1, 1) && :counters.get(counter, 1)
-        if rem(n, 250) == 0, do: Logger.info("[behavioral] #{n}/#{total} pairs")
+        if rem(n, 250) == 0 or n == total, do: Logger.info("[behavioral] #{n}/#{total} pairs")
         result
       end,
       max_concurrency: concurrency,
@@ -83,7 +99,12 @@ defmodule Dataset.Behavioral do
   # verdict's canonical). Stops at the first miss.
   defp reproduces_all?(verdict_fun, source, testcases, run_opts) do
     Enum.all?(testcases, fn tc ->
-      case verdict_fun.(source, tc.stdin, run_opts) do
+      # Cap stdout at the compared expected (+ headroom): a larger output can
+      # never match, so the cap only kills runaway producers, never a real
+      # reproduction. Without it a foreign stdin can drive unbounded output.
+      opts = Keyword.put(run_opts, :output_cap, byte_size(tc.expected) + @output_headroom)
+
+      case verdict_fun.(source, tc.stdin, opts) do
         {:reproducible, canonical} -> canonical == tc.expected
         _ -> false
       end
